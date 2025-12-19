@@ -20,12 +20,38 @@ TEST_ROLE_ID = 1402290127627091979
 # --- Helper: Comment Validator ---
 def is_valid_comment(content: str) -> bool:
     if not content: return False
-    # 禁止 Discord 表情代码 <a:name:id> 或 <:name:id>
+    
+    # 1. 禁止 Discord 表情代码 <a:name:id> 或 <:name:id>
     if re.search(r'<a?:.+?:\d+>', content):
         return False
-    # 去除链接后检查长度
-    content_no_link = re.sub(r'http\S+', '', content).strip()
-    return len(content_no_link) > 5
+        
+    # 2. 去除链接、空格、换行
+    content_clean = re.sub(r'http\S+', '', content).strip()
+    content_clean = re.sub(r'\s+', '', content_clean) # 去除所有空白字符
+    
+    # 3. 基础长度检查 (>5)
+    if len(content_clean) <= 5:
+        return False
+
+    # 4. 禁止纯数字/纯符号
+    if content_clean.isdigit(): 
+        return False
+    
+    # 5. 连续重复字符检查
+    if re.search(r'(.)\1{4,}', content_clean):
+        return False
+
+    # 6. 字符多样性检查 (核心防刷逻辑)
+    # 计算有多少种不同的字符。
+    # "111111" -> 只有 '1' -> 1种
+    # "ababab" -> 只有 'a','b' -> 2种
+    # "可以可以" -> '可','以' -> 2种
+    # "谢谢楼主分享" -> 6种 -> 通过
+    # 阈值建议设为 4，意味着至少要有 4 个不同的字
+    if len(set(content_clean)) < 4:
+        return False
+        
+    return True
 
 # --- Shared Logic Helpers (共用逻辑 - 移至全局) ---
 # 这些函数必须在类定义之外，以便所有 View 和 Modal 都能调用
@@ -138,9 +164,12 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     # =====================================================
     if "comment" in unlock_type:
         has_commented = False
+        
+        # 创建一个 Object 来代表面板消息
         panel_snowflake = discord.Object(id=target_message_id)
 
         try:
+            # 扫描面板之后的消息
             async for msg in interaction.channel.history(after=panel_snowflake, limit=None):
                 if msg.author.id == interaction.user.id:
                     if is_valid_comment(msg.content):
@@ -152,11 +181,12 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
         if not has_commented:
             return False, (
                 "💬 **评论未达标！**\n"
-                "我们需要您在 **本下载面板下方** 发送一条新评论才能解锁哦！\n"
-                "要求：\n"
-                "1. 字数必须 **大于 5 个字**（不含链接）。\n"
-                "2. **禁止使用任何表情符号**。\n"
-                "3. 请发表有意义的内容，拒绝灌水。"
+                "请在 **本下载面板下方** 发送一条有意义的新评论。\n"
+                "❌ **拒绝以下内容**：\n"
+                "- 字数过少 (需 >5 字)\n"
+                "- 纯表情 / 纯数字 / 纯标点\n"
+                "- 刷屏复读机 (如：啊啊啊啊、111111、顶顶顶)\n"
+                "✅ **推荐**：说说你对这个资源的看法~"
             )
 
     return True, "passed"
