@@ -153,7 +153,6 @@ class ProtectionDraftView(ui.View):
             )
             await db.commit()
         
-        # 【修改】：不再传入ID，View 是动态的
         await final_msg.edit(view=DownloadView(self.bot))
         await dm.send(content=f"保护贴已发布！\n跳转链接：{final_msg.jump_url}")
         await interaction.followup.send("✅ 发布成功！", ephemeral=True)
@@ -162,24 +161,35 @@ class ProtectionDraftView(ui.View):
 
 class PasswordUnlockModal(ui.Modal, title="请输入口令"):
     password_input = ui.TextInput(label="口令", placeholder="请输入...", max_length=50)
-    def __init__(self, correct_password, item_row, view_ref): 
+    
+    # 接收 view_ref 以调用 check_requirements
+    def __init__(self, correct_password, item_row, view_ref, unlock_type): 
         super().__init__()
         self.c = correct_password
         self.row = item_row 
         self.v = view_ref
+        self.ut = unlock_type
     
     async def on_submit(self, i: discord.Interaction):
+        # 1. 验证口令
         if i.data['components'][0]['components'][0]['value'].strip() != self.c: 
             return await i.response.send_message("❌ 口令错误！", ephemeral=True)
         
+        # 2. 立即 Defer（防止后续耗时操作超时）
         await i.response.defer(ephemeral=True, thinking=True)
+        
+        # 3. 执行点赞/评论检测 (耗时操作放在 Defer 之后)
+        success, msg = await self.v.check_requirements(i, self.ut, self.row['owner_id'])
+        if not success:
+            return await i.followup.send(msg, ephemeral=True)
+
         try:
             file_data = json.loads(self.row['storage_urls'])
         except Exception as e:
             return await i.followup.send(f"❌ 数据损坏: {e}", ephemeral=True)
 
+        # 4. 下载并发送
         file_results = await self.v.fetch_files(file_data)
-        
         if file_results: 
             self.v.record_download(i.user, self.row)
             await i.followup.send(content="🔓 口令正确！文件给你：", files=self.v.make_discord_files(file_results), ephemeral=True)
@@ -187,11 +197,9 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
         else: 
             await i.followup.send("❌ 文件下载失败（可能源文件已过期），请联系作者。", ephemeral=True)
 
-# --- Download View (Refactored for Persistence) ---
+# --- Download View ---
 
 class DownloadView(ui.View):
-    # 【核心修改】：__init__ 不再接收 message_id 和 unlock_type
-    # 这些信息将在点击按钮时动态获取，确保 View 可以被 main.py 里的通用 Listener 正确处理
     def __init__(self, bot):
         super().__init__(timeout=None)
         self.bot = bot
@@ -241,12 +249,66 @@ class DownloadView(ui.View):
         try: await user.send(content="这是您刚刚下载的附件备份：", files=files)
         except: pass
 
+    # 【新增】：将耗时的检测逻辑剥离
+    async def check_requirements(self, interaction, unlock_type, owner_id):
+        # 1. 身份特权检测
+        has_test_role = False
+        if isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID):
+            has_test_role = True
+        
+        is_owner = (interaction.user.id == owner_id)
+        if is_owner and has_test_role: is_owner = False 
+
+        if is_owner: return True, "owner" # 特权直接通过
+
+        # 2. 每日下载限制
+        today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
+            download_count = (await cursor.fetchone())[0]
+        if download_count >= DAILY_DOWNLOAD_LIMIT:
+            return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
+
+        # 3. 点赞检测
+        target_msg = None
+        try:
+            async for msg in interaction.channel.history(limit=1, oldest_first=True):
+                target_msg = msg; break
+        except: pass
+        
+        if not target_msg: return False, "❌ 无法定位首楼，请联系管理员。"
+
+        reacted = False
+        for r in target_msg.reactions:
+            async for u in r.users():
+                if u.id == interaction.user.id: reacted = True; break
+            if reacted: break
+        
+        if not reacted:
+            return False, f"🛑 请先对 **[帖子首楼]({target_msg.jump_url})** 点赞才能继续下载唷！"
+
+        # 4. 评论检测
+        if "comment" in unlock_type:
+            has_commented = False
+            try:
+                # 扫描当前面板消息之后的消息
+                async for msg in interaction.channel.history(after=interaction.message, limit=100):
+                    if msg.author.id == interaction.user.id:
+                        if is_valid_comment(msg.content):
+                            has_commented = True; break
+            except: pass
+            
+            if not has_commented:
+                return False, "💬 检测不到您的有效评论捏！\n请先在 **当前帖子底部** 发送一条评论（字数>5），然后再点击按钮。"
+
+        return True, "passed"
+
     @ui.button(label="获取附件", style=discord.ButtonStyle.primary, emoji="🎁", custom_id="dl_btn_v4")
     async def download_btn(self, interaction: discord.Interaction, button: ui.Button):
-        # 【核心修改】：从交互中动态获取 Message ID
         message_id = interaction.message.id
         
-        # 1. 数据库检查
+        # 1. 快速读取数据库 (通常很快)
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
             row = await (await db.execute("SELECT * FROM protected_items WHERE message_id = ?", (message_id,))).fetchone()
@@ -261,75 +323,53 @@ class DownloadView(ui.View):
             except:
                 return await interaction.response.send_message("❌ 数据库记录损坏。", ephemeral=True)
             
-            # 动态获取 unlock_type
             unlock_type = row['unlock_type']
-        
-        # --- 身份/频率限制 ---
-        has_test_role = False
-        if isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID):
-            has_test_role = True
-        
-        is_owner = (interaction.user.id == row['owner_id'])
-        if is_owner and has_test_role: is_owner = False 
+            owner_id = row['owner_id']
 
-        if not is_owner:
-            today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            async with get_db() as db:
-                db.row_factory = aiosqlite.Row
-                cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
-                download_count = (await cursor.fetchone())[0]
-            if download_count >= DAILY_DOWNLOAD_LIMIT:
-                return await interaction.response.send_message(f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。", ephemeral=True)
-        else:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            file_results = await self.fetch_files(file_data)
-            if file_results:
-                await interaction.followup.send(content="👑 主人请拿好：", files=self.make_discord_files(file_results), ephemeral=True)
-            else:
-                await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
-            return
-
-        target_msg = None
-        try:
-            async for msg in interaction.channel.history(limit=1, oldest_first=True):
-                target_msg = msg; break
-        except: pass
-        
-        if not target_msg: 
-            return await interaction.response.send_message("❌ 无法定位首楼，请联系管理员。", ephemeral=True)
-
-        reacted = False
-        for r in target_msg.reactions:
-            async for u in r.users():
-                if u.id == interaction.user.id: reacted = True; break
-            if reacted: break
-        
-        if not reacted:
-            return await interaction.response.send_message(f"🛑 请先对 **[帖子首楼]({target_msg.jump_url})** 点赞才能继续下载唷！", ephemeral=True)
-
-        if "comment" in unlock_type:
-            has_commented = False
-            try:
-                async for msg in interaction.channel.history(after=interaction.message, limit=100):
-                    if msg.author.id == interaction.user.id:
-                        if is_valid_comment(msg.content):
-                            has_commented = True; break
-            except: pass
-            
-            if not has_commented:
-                return await interaction.response.send_message(
-                    "💬 检测不到您的有效评论捏！\n请先在 **当前帖子底部** 发送一条评论（字数>5），然后再点击按钮。", ephemeral=True
-                )
-
-        remaining = DAILY_DOWNLOAD_LIMIT - (download_count + 1)
-        status_msg = f"本次下载后，今日剩余: {remaining}/{DAILY_DOWNLOAD_LIMIT}"
-        optional_tip = "\n*(提示：如果喜欢这个资源，也可以顺手给本下载面板点个赞哦~)*"
+        # --- 2. 核心分支逻辑 ---
+        # 如果需要密码，必须立刻弹出 Modal (不能先 Defer)
+        # 如果不需要密码，必须立刻 Defer (防止耗时检测导致超时)
 
         if "password" in unlock_type:
-            await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self))
+            # 拥有者特权检查 (简单版，不查 DB 频率，因为拥有者无需频率限制)
+            # 如果是拥有者且不是测试员，直接跳过密码
+            has_test_role = False
+            if isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID):
+                has_test_role = True
+            
+            # 真正的拥有者直接下载，不弹窗
+            if interaction.user.id == owner_id and not has_test_role:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                file_results = await self.fetch_files(file_data)
+                if file_results:
+                    await interaction.followup.send(content="👑 主人请拿好：", files=self.make_discord_files(file_results), ephemeral=True)
+                return
+
+            # 普通用户 -> 弹窗 (把检测任务交给 Modal 的 on_submit)
+            await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self, unlock_type))
+        
         else:
+            # 无需密码 -> 立即 Defer
             await interaction.response.defer(ephemeral=True, thinking=True)
+            
+            # 然后再做耗时的 API 检测
+            success, msg = await self.check_requirements(interaction, unlock_type, owner_id)
+            if not success:
+                return await interaction.followup.send(msg, ephemeral=True)
+
+            # 通过 -> 下载发送
             file_results = await self.fetch_files(file_data)
+            
+            # 计算剩余次数用于展示
+            today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            async with get_db() as db:
+                cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
+                cnt = (await cursor.fetchone())[0]
+            remaining = DAILY_DOWNLOAD_LIMIT - (cnt + 1)
+            
+            status_msg = f"本次下载后，今日剩余: {remaining}/{DAILY_DOWNLOAD_LIMIT}"
+            optional_tip = "\n*(提示：如果喜欢这个资源，也可以顺手给本下载面板点个赞哦~)*"
+
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！文件给你：\n{status_msg}{optional_tip}", files=self.make_discord_files(file_results), ephemeral=True)
                 await self.send_dm_backup(interaction.user, file_results)
@@ -396,7 +436,6 @@ class ProtectionCog(commands.Cog):
         for row in rows:
             try:
                 msg = await interaction.channel.fetch_message(row['message_id'])
-                # 【修改】：不再传入参数
                 new_view = DownloadView(self.bot)
                 await msg.edit(view=new_view)
                 success_count += 1
