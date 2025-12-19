@@ -337,23 +337,28 @@ class ProtectionCog(commands.Cog):
             except: pass
         return active
 
-    @app_commands.command(name="获取附件", description="私密查看当前帖子内所有受保护的文件清单及获取入口")
-    async def get_attachments(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        posts = await self._get_active_posts(interaction.channel)
-        if not posts: return await interaction.followup.send("🔍 当前频道没有发现活跃的受保护附件。", ephemeral=True)
+    @app_commands.command(name="获取附件", description="私密查看本贴内所有附件及下载入口")
+    async def get_attachments(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        posts = await self._get_active(i.channel)
+        if not posts: return await i.followup.send("🔍 没找到活跃的保护附件。", ephemeral=True)
 
-        embed = discord.Embed(title=f"📦 发现 {len(posts)} 组保护附件", description="这是本频道所有受保护的内容，点击下方按钮可直接验证获取。", color=0x87ceeb)
-        for post in posts[:10]:
+        embed = discord.Embed(title=f"📦 本贴共有 {len(posts)} 组附件", color=0x87ceeb)
+        for p in posts[:10]:
             try:
-                files = json.loads(post['storage_urls'])
-                file_list = "\n".join([f"- `📄 {f['filename']}`" for f in files])
-            except: file_list = "无法读取列表"
+                files = json.loads(p['storage_urls'])
+                file_str = "\n".join([f"- `📄 {f['filename']}`" for f in files])
+            except: file_str = "解析失败"
             
-            cond = get_requirement_text(post['unlock_type'])
-            embed.add_field(name=f"📌 {post['title']}", value=f"**文件清单:**\n{file_list}\n**条件:** {cond}\n[🔗 跳转到帖子]({f'https://discord.com/channels/{interaction.guild_id}/{interaction.channel.id}/{post["message_id"]}'})", inline=False)
-
-        await interaction.followup.send(embed=embed, view=EphemeralDownloadView(self.bot, posts), ephemeral=True)
+            jump_url = f"https://discord.com/channels/{i.guild_id}/{i.channel.id}/{p['message_id']}"
+            cond = get_requirement_text(p['unlock_type'])
+            
+            embed.add_field(
+                name=f"📌 {p['title']}", 
+                value=f"**文件:**\n{file_str}\n**条件:** {cond}\n[🔗 点击跳转到该位置]({jump_url})", 
+                inline=False
+            )
+        await i.followup.send(embed=embed, view=EphemeralDownloadView(self.bot, posts), ephemeral=True)
 
     @app_commands.command(name="管理附件", description="管理我发布的保护贴")
     async def manage_attachments(self, interaction: discord.Interaction):
