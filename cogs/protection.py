@@ -388,15 +388,15 @@ class DownloadView(ui.View):
                 await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
         asyncio.create_task(_update())
 
-def get_requirement_text(unlock_type, password=None):
-    mapping = {
-        "like": "👍 需要 [点赞首楼]",
-        "like_comment": "👍💬 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情）]",
-        "like_password": "👍🔐 需要 [点赞首楼 + 输入下载口令]",
-        "like_comment_password": "👍💬🔐 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情） + 下载口令]"
-    }
-    text = mapping.get(unlock_type, "未知条件")
-    return text
+    def get_requirement_text(unlock_type, password=None):
+        mapping = {
+            "like": "👍 需要 [点赞首楼]",
+            "like_comment": "👍💬 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情）]",
+            "like_password": "👍🔐 需要 [点赞首楼 + 输入下载口令]",
+            "like_comment_password": "👍💬🔐 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情） + 下载口令]"
+        }
+        text = mapping.get(unlock_type, "未知条件")
+        return text
 
 class EphemeralDownloadView(ui.View):
     """在 /获取附件 命令中弹出的快捷视图"""
