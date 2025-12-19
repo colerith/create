@@ -388,6 +388,73 @@ class DownloadView(ui.View):
                 await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
         asyncio.create_task(_update())
 
+def get_requirement_text(unlock_type, password=None):
+    mapping = {
+        "like": "👍 需要 [点赞首楼]",
+        "like_comment": "👍💬 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情）]",
+        "like_password": "👍🔐 需要 [点赞首楼 + 输入下载口令]",
+        "like_comment_password": "👍💬🔐 需要 [点赞首楼 + 在帖子内发布新的评论（>5个字且非表情） + 下载口令]"
+    }
+    text = mapping.get(unlock_type, "未知条件")
+    return text
+
+class EphemeralDownloadView(ui.View):
+    """在 /获取附件 命令中弹出的快捷视图"""
+    def __init__(self, bot, items_rows):
+        super().__init__(timeout=300)
+        self.bot = bot
+        # 为每个受保护项创建一个按钮
+        for row in items_rows:
+            btn = ui.Button(
+                label=f"验证并获取: {row['title']}"[:80],
+                style=discord.ButtonStyle.success,
+                emoji="📥",
+                custom_id=f"quick_dl_{row['message_id']}"
+            )
+            btn.callback = self.create_callback(row)
+            self.add_item(btn)
+
+    def create_callback(self, row):
+        async def callback(interaction: discord.Interaction):
+            dv = DownloadView(self.bot)
+            await self.handle_direct_download(interaction, row)
+        return callback
+
+    async def handle_direct_download(self, interaction, row):
+        # 这里提取了原 DownloadView.download_btn 的核心逻辑
+        dv = DownloadView(self.bot)
+        unlock_type = row['unlock_type']
+        owner_id = row['owner_id']
+        file_data = json.loads(row['storage_urls'])
+
+        if "password" in unlock_type:
+            # 权限检查（拥有者特权）
+            has_test_role = False
+            if isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID):
+                has_test_role = True
+            
+            if interaction.user.id == owner_id and not has_test_role:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                file_results = await dv.fetch_files(file_data)
+                if file_results:
+                    await interaction.followup.send(content="👑 主人请拿好：", files=dv.make_discord_files(file_results), ephemeral=True)
+                return
+            
+            # 普通用户弹出密码框
+            await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, dv, unlock_type))
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            success, msg = await dv.check_requirements(interaction, unlock_type, owner_id)
+            if not success:
+                return await interaction.followup.send(msg, ephemeral=True)
+
+            file_results = await dv.fetch_files(file_data)
+            if file_results:
+                dv.record_download(interaction.user, row)
+                await interaction.followup.send(content="✅ 验证成功！文件已准备就绪：", files=dv.make_discord_files(file_results), ephemeral=True)
+                await dv.send_dm_backup(interaction.user, file_results)
+            else:
+                await interaction.followup.send("❌ 文件下载失败，请联系作者。", ephemeral=True)
 # --- Delete View & Cog ---
 class DeleteConfirmView(ui.View):
     def __init__(self, message_id): super().__init__(timeout=60); self.message_id = message_id
@@ -467,15 +534,48 @@ class ProtectionCog(commands.Cog):
             embed.add_field(name="详细记录", value=log_text[:1024], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="附件列表", description="查看本频道所有活跃的保护贴")
-    async def list_attachments(self, interaction: discord.Interaction):
+    @app_commands.command(name="获取附件", description="获取本帖子里所有受保护的附件列表及下载入口")
+    async def get_attachments(self, interaction: discord.Interaction):
+        """原 /附件列表 的升级版"""
         await interaction.response.defer(ephemeral=True)
+        
+        # 获取本频道的受保护项
         posts = await self._get_active_posts(interaction.channel)
-        if not posts: return await interaction.followup.send("本频道还没有活跃的保护贴。", ephemeral=True)
-        embed = discord.Embed(title=f"📁 {interaction.channel.name} 的保护附件列表", color=0x87ceeb)
-        for post in posts[:25]:
-            ts = discord.utils.format_dt(datetime.fromisoformat(post['created_at']), 'R'); embed.add_field(name=f"📄 {post['title']}", value=f"下载: {post['download_count']}次 | 发布于: {ts}\n[🔗 点击跳转](https://discord.com/channels/{interaction.guild_id}/{interaction.channel.id}/{post['message_id']})", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        if not posts:
+            return await interaction.followup.send("🔍 当前位置没有发现受保护的附件。", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"📦 发现 {len(posts)} 组受保护附件",
+            description="点击下方按钮验证条件并获取文件：",
+            color=0xffb7c5
+        )
+
+        for post in posts[:10]: # 限制显示前10组，防止 Embed 过长
+            try:
+                files_info = json.loads(post['storage_urls'])
+                file_list_str = "\n".join([f"📄 `{f.get('filename', '未知文件')}`" for f in files_info])
+            except:
+                file_list_str = "无法读取文件列表"
+
+            req_text = get_requirement_text(post['unlock_type'], post['password'])
+            
+            embed.add_field(
+                name=f"📌 {post['title']}",
+                value=(
+                    f"**文件内容：**\n{file_list_str}\n"
+                    f"**获取条件：**\n{req_text}\n"
+                    f"**累计下载：** `{post['download_count']}` 次\n"
+                    f"**跳转原贴：** [点击此处](https://discord.com/channels/{interaction.guild_id}/{interaction.channel.id}/{post['message_id']})"
+                ),
+                inline=False
+            )
+
+        embed.set_footer(text="请确保您已满足上述条件后再点击获取按钮。")
+        
+        # 使用专门的快捷视图
+        view = EphemeralDownloadView(self.bot, posts[:10])
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="管理附件", description="管理我发布的保护贴")
     async def manage_attachments(self, interaction: discord.Interaction):
