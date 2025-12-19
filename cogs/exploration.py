@@ -313,8 +313,6 @@ class ExplorationCog(commands.Cog):
         self.bot.add_view(SearchMethodView())
         self.daily_task.start()
     
-    admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
-
     async def cog_unload(self):
         self.daily_task.cancel()
 
@@ -370,7 +368,7 @@ class ExplorationCog(commands.Cog):
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
 
-    @admin_group.command(name="更新日报", description="强制刷新并重发本频道的日报面板")
+    @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道的日报面板")
     async def manual_daily_report(self, interaction: discord.Interaction):
         if interaction.user.id != ADMIN_USER_ID and not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message(chimidan_text("你没有权限操作这个命令捏！"), ephemeral=True)
@@ -386,7 +384,7 @@ class ExplorationCog(commands.Cog):
             view = PaginatorView(threads, title=f"📅 {date_str} 日报 (预览)", is_daily=True)
             await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
-    @admin_group.command(name="更新搜索面板", description="清理旧面板并发送新的持久化搜索面板")
+    @app_commands.command(name="更新搜索面板", description="[管理] 清理旧面板并发送新的搜索面板")
     async def refresh_search_panel(self, interaction: discord.Interaction):
         if interaction.user.id != ADMIN_USER_ID:
             return await interaction.response.send_message(chimidan_text("你没有权限操作这个命令捏！"), ephemeral=True)
