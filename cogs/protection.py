@@ -98,54 +98,65 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     if download_count >= DAILY_DOWNLOAD_LIMIT:
         return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # 3. 定位原始消息
-    target_msg = None
-    try:
-        target_msg = await interaction.channel.fetch_message(target_message_id)
-    except:
-        return False, "❌ 无法定位原始帖子，请检查帖子是否已被删除。"
-
-    # 4. 点赞检测
-    reacted = False
+    # =====================================================
+    # 3. 定位【点赞目标】 (帖子首楼)
+    # =====================================================
+    op_msg = None
     
-    # --- Debug 调试代码 (排查完后可删除) ---
-    print(f"正在检查消息: {target_msg.id}")
-    print(f"当前用户 ID: {interaction.user.id}")
-    # -------------------------------------
+    # 尝试寻找帖子的首楼（第一条消息）
+    if isinstance(interaction.channel, discord.Thread):
+        try:
+            if interaction.channel.starter_message:
+                op_msg = interaction.channel.starter_message
+            else:
+                async for msg in interaction.channel.history(limit=1, oldest_first=True):
+                    op_msg = msg
+                    break
+        except: pass
 
-    for r in target_msg.reactions:
-        # r.users() 默认 limit 是 100，如果赞很多，需要设为 None
+    if not op_msg:
+        try:
+            op_msg = await interaction.channel.fetch_message(target_message_id)
+        except:
+            return False, "❌ 无法定位原始帖子，请检查帖子是否已被删除。"
+
+    # =====================================================
+    # 4. 执行【点赞检测】 (针对 op_msg / 首楼)
+    # =====================================================
+    reacted = False
+    for r in op_msg.reactions:
         async for u in r.users(limit=None): 
-            # print(f"检测到点赞用户: {u.id} - {u.name}") # 极其详细的调试
             if u.id == interaction.user.id: 
-                reacted = True
-                break
+                reacted = True; break
         if reacted: break
     
     if not reacted:
-        # 这里建议把 jump_url 打印出来，确保链接是对的
-        return False, f"🛑 您还没点赞呢！\n请点击这里跳转到首楼：👉 **[点我去点赞]({target_msg.jump_url})** \n（点赞后请再次点击按钮）"
+        return False, f"🛑 您还没点赞呢！\n请点击这里跳转到 **[帖子首楼]({op_msg.jump_url})** 给作者点个赞吧！👍\n（点完赞后请再次点击按钮）"
 
-    # ...
-
-    # 5. 评论检测 (严格校验)
+    # =====================================================
+    # 5. 执行【评论检测】 (针对 面板消息 之后的新评论)
+    # =====================================================
     if "comment" in unlock_type:
         has_commented = False
+        panel_snowflake = discord.Object(id=target_message_id)
+
         try:
-            # 扫描帖子后的消息
-            async for msg in interaction.channel.history(after=target_msg, limit=100):
+            async for msg in interaction.channel.history(after=panel_snowflake, limit=None):
                 if msg.author.id == interaction.user.id:
                     if is_valid_comment(msg.content):
-                        has_commented = True; break
-        except: pass
+                        has_commented = True
+                        break
+        except Exception as e:
+            print(f"Comment check error: {e}")
         
         if not has_commented:
             return False, (
                 "💬 **评论未达标！**\n"
-                "请回复本贴，要求如下：\n"
+                "我们需要您在 **本下载面板下方** 发送一条新评论才能解锁哦！\n"
+                "要求：\n"
                 "1. 字数必须 **大于 5 个字**（不含链接）。\n"
-                "2. **禁止使用任何表情符号**（包括 Discord 自带表情代码）。\n"
-                "3. 请勿灌水，发送有意义的内容。"
+                "2. **禁止使用任何表情符号**。\n"
+                "3. 请发表有意义的内容，拒绝灌水。"
             )
 
     return True, "passed"
