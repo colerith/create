@@ -255,8 +255,6 @@ class RecommendCog(commands.Cog):
         self.bot.loop.create_task(init_recommend_db())
         self.daily_recommend_task.start()
 
-    admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
-
     async def cog_unload(self):
         self.daily_recommend_task.cancel()
 
@@ -348,7 +346,7 @@ class RecommendCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # --- 手动调试命令 ---
-    @admin_group.command(name="更新推荐面板", description="强制刷新并重发今日推荐")
+    @app_commands.command(name="更新推荐面板", description="[管理] 强制刷新并重发今日推荐")
     async def manual_recommend(self, interaction: discord.Interaction):
         is_admin = interaction.user.guild_permissions.administrator
         is_tester = False
