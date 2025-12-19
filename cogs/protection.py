@@ -530,6 +530,15 @@ class ProtectionCog(commands.Cog):
         self.bot = bot
         self.ctx_menu = app_commands.ContextMenu(name="转为保护附件", callback=self.convert_to_protected)
         self.bot.tree.add_command(self.ctx_menu)
+
+    # === 定义命令分组 ===
+    # 贴主专用的命令组
+    maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
+    # 用户个人的命令组
+    user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
+    # 管理员维护组
+    admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
+
     async def cog_unload(self):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
     
@@ -549,7 +558,7 @@ class ProtectionCog(commands.Cog):
             async with get_db() as db: await db.executemany("DELETE FROM protected_items WHERE message_id = ?", [(i,) for i in ids_to_clean]); await db.commit()
         return active_posts
 
-    @app_commands.command(name="修复本频道面板", description="[管理员/作者] 刷新本频道所有旧面板，使其适配新逻辑")
+    @admin_group.command(name="修复面板", description="刷新本频道所有旧面板，使其适配新逻辑")
     async def fix_panels(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with get_db() as db:
@@ -568,7 +577,7 @@ class ProtectionCog(commands.Cog):
             except: fail_count += 1
         await interaction.followup.send(f"✅ 修复完成！\n成功刷新: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
 
-    @app_commands.command(name="我今天下载了什么", description="查询今日下载历史和剩余次数")
+    @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")
     async def my_downloads_today(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -592,7 +601,7 @@ class ProtectionCog(commands.Cog):
             embed.add_field(name="详细记录", value=log_text[:1024], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="获取附件", description="显示本频道最近的5个受保护附件列表")
+    @user_group.command(name="获取附件", description="显示本频道最近的5个受保护附件列表")
     async def get_attachments_list(self, interaction: discord.Interaction):
         # 1. 查询最近 5 条记录
         async with get_db() as db:
@@ -613,7 +622,7 @@ class ProtectionCog(commands.Cog):
         
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="管理附件", description="管理我发布的保护贴")
+    @maker_group.command(name="管理附件", description="查看和管理我发布的保护贴及附件")
     async def manage_attachments(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         posts = await self._get_active_posts(interaction.channel, owner_id=interaction.user.id)
@@ -636,7 +645,7 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.update_dashboard(interaction)
 
-    @app_commands.command(name="设置附件保护", description="上传文件并创建保护贴")
+    @maker_group.command(name="设置附件保护", description="上传文件并创建保护贴")
     @app_commands.describe(file1="附件1", file2="附件2", file3="附件3", file4="附件4", file5="附件5", file6="附件6", file7="附件7", file8="附件8", file9="附件9", file10="附件10")
     async def create_protection(self, interaction: discord.Interaction, file1: discord.Attachment, file2: discord.Attachment=None, file3: discord.Attachment=None, file4: discord.Attachment=None, file5: discord.Attachment=None, file6: discord.Attachment=None, file7: discord.Attachment=None, file8: discord.Attachment=None, file9: discord.Attachment=None, file10: discord.Attachment=None):
         attachments = [f for f in [file1, file2, file3, file4, file5, file6, file7, file8, file9, file10] if f]
