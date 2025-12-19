@@ -10,8 +10,11 @@ from database import get_db
 
 # === 配置 ===
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
-TARGET_KEYWORD = "角色卡" # 频道名需包含此关键词
-# 每日推荐发送的目标频道ID
+
+# 【修改】支持的关键词列表
+TARGET_KEYWORDS = ["角色卡", "预设", "美化", "工具", "小剧场", "世界书"]
+
+# 每日推荐发送的目标频道ID列表
 DAILY_RECOMMEND_CHANNEL_ID = [1450863242179121162, 1450863444373798922, 1451245427444814047]
 
 # 测试员身份组 ID (无视抽卡限制)
@@ -59,8 +62,9 @@ async def mark_user_drawn(user_id: int):
 # ==========================================
 
 def get_card_forums(guild: discord.Guild):
-    """获取所有包含关键词的论坛频道"""
-    return [c for c in guild.forums if TARGET_KEYWORD in c.name]
+    """【修改】获取所有包含目标关键词的论坛频道"""
+    # 只要频道名包含列表中的任意一个关键词，就纳入池子
+    return [c for c in guild.forums if any(keyword in c.name for keyword in TARGET_KEYWORDS)]
 
 async def get_random_thread_pool(guild: discord.Guild, specific_channel_id=None):
     """获取符合条件的帖子池 (排除置顶帖)"""
@@ -94,19 +98,13 @@ async def fetch_thread_details(thread: discord.Thread):
         # --- 简介处理逻辑 ---
         if starter.content:
             raw_text = starter.content
-            
-            # 1. 按行分割
             lines = raw_text.split('\n')
-            
-            # 2. 限制行数 (例如最大8行)
             MAX_LINES = 8
             if len(lines) > MAX_LINES:
-                # 取前N行，并添加省略标记
                 display_text = "\n".join(lines[:MAX_LINES]) + "\n..."
             else:
                 display_text = raw_text
                 
-            # 3. 限制总字数 (例如最大300字，防止单行过长)
             if len(display_text) > 300:
                 display_text = display_text[:300] + "..."
                 
@@ -120,7 +118,6 @@ async def fetch_thread_details(thread: discord.Thread):
     
     tags = [tag.name for tag in thread.applied_tags] if thread.applied_tags else ["无标签"]
     
-    # 获取作者信息
     owner = thread.owner
     author_name = owner.display_name if owner else "未知作者"
     author_mention = owner.mention if owner else "未知作者"
@@ -146,11 +143,12 @@ class GachaControlView(ui.View):
     def __init__(self, guild_forums):
         super().__init__(timeout=None)
         self.selected_channel_id = None
-        options = [discord.SelectOption(label="🌐 全部分区 (默认)", value="all", description="从所有角色卡分区抽取")]
-        for forum in guild_forums[:24]:
+        # 下拉菜单选项：全部分区 + 各个匹配到的分区
+        options = [discord.SelectOption(label="🌐 全部分区 (默认)", value="all", description="从所有资源分区随机抽取")]
+        for forum in guild_forums[:24]: # 下拉菜单上限25个选项
             options.append(discord.SelectOption(label=f"📂 {forum.name}", value=str(forum.id)))
             
-        self.channel_select = ui.Select(placeholder="[可选] 筛选特定卡池...", options=options, min_values=1, max_values=1, row=0)
+        self.channel_select = ui.Select(placeholder="[可选] 筛选特定资源池...", options=options, min_values=1, max_values=1, row=0)
         self.channel_select.callback = self.on_select_change
         self.add_item(self.channel_select)
 
@@ -166,34 +164,28 @@ class GachaControlView(ui.View):
         await interaction.response.edit_message(content=f"🎯 当前卡池已锁定：**{pool_name}**\n请点击下方按钮开始抽取！(注意：每天只能抽一次哦)", view=self)
 
     async def execute_draw(self, interaction: discord.Interaction, count: int):
-        # --- 测试员检测 ---
         is_tester = False
         if isinstance(interaction.user, discord.Member):
             if interaction.user.get_role(TEST_ROLE_ID):
                 is_tester = True
         
-        # 1. 检查今日次数 (如果不是测试员)
         if not is_tester:
             if await check_user_drawn_today(interaction.user.id):
                 return await interaction.response.send_message("🔮 您今天已经感应过缘分啦，请明天再来吧！", ephemeral=True)
         
         await interaction.response.defer(ephemeral=True)
         
-        # 2. 获取池子
         threads = await get_random_thread_pool(interaction.guild, self.selected_channel_id)
         if not threads:
             return await interaction.followup.send("🏜️ 当前选择的卡池里空空如也... (或是只有置顶帖)", ephemeral=True)
             
         if len(threads) < count: count = len(threads)
             
-        # 3. 随机抽取
         drawn_threads = random.sample(threads, count)
         
-        # 4. 记录数据库 (如果不是测试员)
         if not is_tester:
             await mark_user_drawn(interaction.user.id)
         
-        # 5. 生成结果 Embed
         embeds = []
         if count == 1:
             t = drawn_threads[0]
@@ -205,7 +197,6 @@ class GachaControlView(ui.View):
                 color=0xffd700, 
                 url=info['url']
             )
-            # 使用作者头像
             embed.set_author(name=info['author_name'], icon_url=info['author_avatar'])
             
             embed.add_field(name="📂 分区", value=info['category'], inline=True)
@@ -246,7 +237,7 @@ class DailyRecommendView(ui.View):
     @ui.button(label="🔮 抽取今日缘分", style=discord.ButtonStyle.primary, custom_id="daily_gacha_open_btn")
     async def open_gacha(self, interaction: discord.Interaction, button: ui.Button):
         forums = get_card_forums(interaction.guild)
-        if not forums: return await interaction.response.send_message("本服务器没有配置【角色卡】相关频道，无法抽卡。", ephemeral=True)
+        if not forums: return await interaction.response.send_message("本服务器没有配置相关资源频道，无法抽卡。", ephemeral=True)
         view = GachaControlView(forums)
         await interaction.response.send_message(
             "🎴 **抽卡控制台已启动**\n请选择想要抽取的卡池（默认全部），然后点击抽卡按钮。\n*每天仅限抽取一次哦！*", 
@@ -272,7 +263,8 @@ class RecommendCog(commands.Cog):
         try:
             async for msg in channel.history(limit=20):
                 if msg.author == self.bot.user and msg.embeds:
-                    if "每日精选角色" in msg.embeds[0].title:
+                    # 【修改】这里只要标题包含 "每日精选" 就匹配，兼容旧的 "每日精选角色"
+                    if "每日精选" in msg.embeds[0].title:
                         await msg.delete()
                         await asyncio.sleep(0.5)
         except Exception as e: print(f"Cleanup error: {e}")
@@ -286,7 +278,8 @@ class RecommendCog(commands.Cog):
         # 1. 获取数据
         pool = await get_random_thread_pool(channel.guild)
         if not pool:
-            error_embed = discord.Embed(title="📅 每日推荐", description="今天还没有找到任何角色卡捏...", color=0x99aab5)
+            # 如果池子空了，发个提示
+            error_embed = discord.Embed(title="📅 每日推荐", description="今天资源库里空空如也捏...", color=0x99aab5)
             if mode == "reset":
                 await self._cleanup_old_messages(channel)
                 await channel.send(embed=error_embed)
@@ -298,13 +291,12 @@ class RecommendCog(commands.Cog):
         # 2. 构建 Embed
         date_str = datetime.now(TZ_SHANGHAI).strftime("%m月%d日")
         
-        # 【修改】Embed 结构优化
+        # 【修改】标题去掉了“角色”二字
         embed = discord.Embed(
-            title=f"📅 {date_str} · 每日精选角色", 
+            title=f"📅 {date_str} · 每日精选", 
             description=f"### [{info['title']}]({info['url']})\n👤 作者: {info['author_mention']}\n\n{info['intro']}",
             color=0xff69b4
         )
-        # 使用帖子作者的头像
         embed.set_author(name=info['author_name'], icon_url=info['author_avatar'])
         
         embed.add_field(name="📂 所属分区", value=info['category'], inline=True)
@@ -324,7 +316,8 @@ class RecommendCog(commands.Cog):
             try:
                 async for msg in channel.history(limit=20):
                     if msg.author == self.bot.user and msg.embeds:
-                        if "每日精选角色" in msg.embeds[0].title:
+                        # 兼容检查
+                        if "每日精选" in msg.embeds[0].title:
                             target_msg = msg
                             break
                 
@@ -340,17 +333,20 @@ class RecommendCog(commands.Cog):
     @tasks.loop(time=time(hour=0, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_recommend_task(self):
         """每天0点自动刷新 (编辑模式)"""
-        channel = self.bot.get_channel(DAILY_RECOMMEND_CHANNEL_ID)
-        if not channel: return
-        # 使用 mode="edit"
-        await self.refresh_recommendation_panel(channel, mode="edit")
+        # 【修改】支持多频道推送
+        for channel_id in DAILY_RECOMMEND_CHANNEL_ID:
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                # 使用 mode="edit" 以保持频道整洁
+                await self.refresh_recommendation_panel(channel, mode="edit")
+                await asyncio.sleep(2) # 防止速率限制
 
     @daily_recommend_task.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
 
     # --- 手动调试命令 ---
-    @app_commands.command(name="发送今日推荐", description="[管理员] 强制刷新并重发今日角色卡推荐")
+    @app_commands.command(name="发送今日推荐", description="[管理员] 强制刷新并重发今日推荐")
     async def manual_recommend(self, interaction: discord.Interaction):
         is_admin = interaction.user.guild_permissions.administrator
         is_tester = False
