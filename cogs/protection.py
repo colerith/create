@@ -107,13 +107,26 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
 
     # 4. 点赞检测
     reacted = False
+    
+    # --- Debug 调试代码 (排查完后可删除) ---
+    print(f"正在检查消息: {target_msg.id}")
+    print(f"当前用户 ID: {interaction.user.id}")
+    # -------------------------------------
+
     for r in target_msg.reactions:
-        async for u in r.users():
-            if u.id == interaction.user.id: reacted = True; break
+        # r.users() 默认 limit 是 100，如果赞很多，需要设为 None
+        async for u in r.users(limit=None): 
+            # print(f"检测到点赞用户: {u.id} - {u.name}") # 极其详细的调试
+            if u.id == interaction.user.id: 
+                reacted = True
+                break
         if reacted: break
     
     if not reacted:
-        return False, f"🛑 请先对 **[帖子首楼]({target_msg.jump_url})** 点赞才能继续下载唷！"
+        # 这里建议把 jump_url 打印出来，确保链接是对的
+        return False, f"🛑 您还没点赞呢！\n请点击这里跳转到首楼：👉 **[点我去点赞]({target_msg.jump_url})** \n（点赞后请再次点击按钮）"
+
+    # ...
 
     # 5. 评论检测 (严格校验)
     if "comment" in unlock_type:
