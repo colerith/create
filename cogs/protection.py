@@ -10,51 +10,63 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import aiosqlite
 
-# 确保 database.py 在同级目录
 from database import get_db
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
+# --- Cache ---
+LIKE_CACHE = {}
+
+# --- Database Init ---
+async def init_likes_db():
+    async with get_db() as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cached_likes (
+                message_id INTEGER,
+                user_id INTEGER,
+                PRIMARY KEY (message_id, user_id)
+            )
+        """)
+        # 创建索引以加速查询
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
+        await db.commit()
+
 # --- Helper: Comment Validator ---
 def is_valid_comment(content: str) -> bool:
     if not content: return False
     
-    # 1. 禁止 Discord 表情代码 <a:name:id> 或 <:name:id>
-    if re.search(r'<a?:.+?:\d+>', content):
-        return False
-        
-    # 2. 去除链接、空格、换行
-    content_clean = re.sub(r'http\S+', '', content).strip()
-    content_clean = re.sub(r'\s+', '', content_clean) # 去除所有空白字符
+    # 1. 剔除 Discord 自定义表情 (<:name:id> 或 <a:name:id>)
+    content_no_emoji = re.sub(r'<a?:.+?:\d+>', '', content)
     
-    # 3. 基础长度检查 (>5)
+    # 2. 剔除链接
+    content_clean = re.sub(r'http\S+', '', content_no_emoji).strip()
+    
+    # 3. 剔除所有空白字符 (空格、换行)
+    content_clean = re.sub(r'\s+', '', content_clean) 
+    
+    # --- 下面是对“剩余纯文本”的校验 ---
+
+    # 4. 基础长度检查 (必须 > 5个纯汉字/字母)
     if len(content_clean) <= 5:
         return False
 
-    # 4. 禁止纯数字/纯符号
+    # 5. 禁止纯数字
     if content_clean.isdigit(): 
         return False
     
-    # 5. 连续重复字符检查
+    # 6. 禁止连续重复字符 (如 "啊啊啊啊啊")
     if re.search(r'(.)\1{4,}', content_clean):
         return False
 
-    # 6. 字符多样性检查 (核心防刷逻辑)
-    # 计算有多少种不同的字符。
-    # "111111" -> 只有 '1' -> 1种
-    # "ababab" -> 只有 'a','b' -> 2种
-    # "可以可以" -> '可','以' -> 2种
-    # "谢谢楼主分享" -> 6种 -> 通过
-    # 阈值建议设为 4，意味着至少要有 4 个不同的字
+    # 7. 字符多样性检查 (至少要有 4 个不同的字)
     if len(set(content_clean)) < 4:
         return False
         
     return True
 
-# --- Shared Logic Helpers (共用逻辑 - 移至全局) ---
-# 这些函数必须在类定义之外，以便所有 View 和 Modal 都能调用
+# --- Shared Logic Helpers ---
 
 async def fetch_files_common(bot, file_data):
     """通用文件下载逻辑"""
@@ -109,14 +121,15 @@ async def record_download_common(user, item_row):
     asyncio.create_task(_update())
 
 async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
-    """通用验证逻辑：包含特权、每日限制、点赞、评论校验"""
-    # 1. 身份特权检测
+    """通用验证逻辑：优先查库，查不到再查API"""
+    
+    # 1. 身份特权检测 (保持不变)
     has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
     is_owner = (interaction.user.id == owner_id)
     if is_owner and has_test_role: is_owner = False 
     if is_owner: return True, "owner"
 
-    # 2. 每日下载限制
+    # 2. 每日下载限制 (保持不变)
     today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
@@ -128,65 +141,75 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     # 3. 定位【点赞目标】 (帖子首楼)
     # =====================================================
     op_msg = None
-    
-    # 尝试寻找帖子的首楼（第一条消息）
     if isinstance(interaction.channel, discord.Thread):
         try:
             if interaction.channel.starter_message:
                 op_msg = interaction.channel.starter_message
             else:
                 async for msg in interaction.channel.history(limit=1, oldest_first=True):
-                    op_msg = msg
-                    break
+                    op_msg = msg; break
         except: pass
 
     if not op_msg:
-        try:
-            op_msg = await interaction.channel.fetch_message(target_message_id)
-        except:
-            return False, "❌ 无法定位原始帖子，请检查帖子是否已被删除。"
+        try: op_msg = await interaction.channel.fetch_message(target_message_id)
+        except: return False, "❌ 无法定位原始帖子，请检查帖子是否已被删除。"
 
     # =====================================================
-    # 4. 执行【点赞检测】 (针对 op_msg / 首楼)
+    # 4. 执行【点赞检测】 (数据库优先 + API 兜底)
     # =====================================================
-    reacted = False
-    for r in op_msg.reactions:
-        async for u in r.users(limit=None): 
-            if u.id == interaction.user.id: 
-                reacted = True; break
-        if reacted: break
-    
-    if not reacted:
+    user_id = interaction.user.id
+    msg_id = op_msg.id
+    has_liked = False
+
+    # [Step A] 优先查询本地数据库 (极快，0 风险)
+    async with get_db() as db:
+        cursor = await db.execute("SELECT 1 FROM cached_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
+        if await cursor.fetchone():
+            has_liked = True
+
+    # [Step B] 如果数据库没记录，去查 API (兜底，防止 Bot 离线时漏记录)
+    if not has_liked:
+        reacted = False
+        for r in op_msg.reactions:
+            try:
+                if r.count == 0: continue
+                async for u in r.users(limit=None): 
+                    if u.id == user_id: 
+                        reacted = True
+                        break
+                if reacted: break
+                await asyncio.sleep(0.1) # 只有走 API 才需要 sleep
+            except: continue
+        
+        if reacted:
+            has_liked = True
+            # [Step C] API 查到了，赶紧补录到数据库，下次就不查 API 了
+            async with get_db() as db:
+                await db.execute("INSERT OR IGNORE INTO cached_likes (message_id, user_id) VALUES (?, ?)", (msg_id, user_id))
+                await db.commit()
+
+    if not has_liked:
         return False, f"🛑 您还没点赞呢！\n请点击这里跳转到 **[帖子首楼]({op_msg.jump_url})** 给作者点个赞吧！👍\n（点完赞后请再次点击按钮）"
 
     # =====================================================
-    # 5. 执行【评论检测】 (针对 面板消息 之后的新评论)
+    # 5. 执行【评论检测】 
     # =====================================================
     if "comment" in unlock_type:
         has_commented = False
-        
-        # 创建一个 Object 来代表面板消息
         panel_snowflake = discord.Object(id=target_message_id)
-
         try:
-            # 扫描面板之后的消息
             async for msg in interaction.channel.history(after=panel_snowflake, limit=None):
                 if msg.author.id == interaction.user.id:
                     if is_valid_comment(msg.content):
-                        has_commented = True
-                        break
-        except Exception as e:
-            print(f"Comment check error: {e}")
+                        has_commented = True; break
+        except: pass
         
         if not has_commented:
             return False, (
                 "💬 **评论未达标！**\n"
                 "请在 **本下载面板下方** 发送一条有意义的新评论。\n"
-                "❌ **拒绝以下内容**：\n"
-                "- 字数过少 (需 >5 字)\n"
-                "- 纯表情 / 纯数字 / 纯标点\n"
-                "- 刷屏复读机 (如：啊啊啊啊、111111、顶顶顶)\n"
-                "✅ **推荐**：说说你对这个资源的看法~"
+                "✅ **要求**：纯文本需大于 5 个字 (允许带表情)\n"
+                "❌ **拒绝**：纯数字 / 刷屏 / 无意义字符"
             )
 
     return True, "passed"
@@ -530,6 +553,7 @@ class ProtectionCog(commands.Cog):
         self.bot = bot
         self.ctx_menu = app_commands.ContextMenu(name="转为保护附件", callback=self.convert_to_protected)
         self.bot.tree.add_command(self.ctx_menu)
+        self.bot.loop.create_task(init_likes_db())
 
     # === 定义命令分组 ===
     # 贴主专用的命令组
@@ -557,6 +581,34 @@ class ProtectionCog(commands.Cog):
         if ids_to_clean:
             async with get_db() as db: await db.executemany("DELETE FROM protected_items WHERE message_id = ?", [(i,) for i in ids_to_clean]); await db.commit()
         return active_posts
+    
+    # ==========================================
+    # 实时点赞监听器
+    # ==========================================
+    
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """当有点赞发生时，立即记录到数据库"""
+        # 排除机器人自己
+        if payload.user_id == self.bot.user.id: return
+        
+        # 写入数据库 (异步且静默，不影响主线程)
+        async with get_db() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO cached_likes (message_id, user_id) VALUES (?, ?)", 
+                (payload.message_id, payload.user_id)
+            )
+            await db.commit()
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        """当取消点赞时，从数据库移除记录"""
+        async with get_db() as db:
+            await db.execute(
+                "DELETE FROM cached_likes WHERE message_id = ? AND user_id = ?", 
+                (payload.message_id, payload.user_id)
+            )
+            await db.commit()
 
     @admin_group.command(name="修复面板", description="刷新本频道所有旧面板，使其适配新逻辑")
     async def fix_panels(self, interaction: discord.Interaction):
