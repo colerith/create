@@ -5,6 +5,7 @@ import json
 import asyncio
 import io
 import re
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -29,47 +30,25 @@ async def init_likes_db():
                 PRIMARY KEY (message_id, user_id)
             )
         """)
-        # 创建索引以加速查询
         await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
         await db.commit()
 
 # --- Helper: Comment Validator ---
 def is_valid_comment(content: str) -> bool:
     if not content: return False
-    
-    # 1. 剔除 Discord 自定义表情 (<:name:id> 或 <a:name:id>)
     content_no_emoji = re.sub(r'<a?:.+?:\d+>', '', content)
-    
-    # 2. 剔除链接
     content_clean = re.sub(r'http\S+', '', content_no_emoji).strip()
-    
-    # 3. 剔除所有空白字符 (空格、换行)
     content_clean = re.sub(r'\s+', '', content_clean) 
-    
-    # --- 下面是对“剩余纯文本”的校验 ---
-
-    # 4. 基础长度检查 (必须 > 5个纯汉字/字母)
-    if len(content_clean) <= 5:
-        return False
-
-    # 5. 禁止纯数字
-    if content_clean.isdigit(): 
-        return False
-    
-    # 6. 禁止连续重复字符 (如 "啊啊啊啊啊")
-    if re.search(r'(.)\1{4,}', content_clean):
-        return False
-
-    # 7. 字符多样性检查 (至少要有 4 个不同的字)
-    if len(set(content_clean)) < 4:
-        return False
-        
+    if len(content_clean) <= 5: return False
+    if content_clean.isdigit(): return False
+    if re.search(r'(.)\1{4,}', content_clean): return False
+    if len(set(content_clean)) < 4: return False
     return True
 
 # --- Shared Logic Helpers ---
 
 async def fetch_files_common(bot, file_data):
-    """通用文件下载逻辑"""
+    """通用文件下载逻辑，返回 bytes 数据"""
     results = []
     if not isinstance(file_data, list): return []
 
@@ -121,15 +100,14 @@ async def record_download_common(user, item_row):
     asyncio.create_task(_update())
 
 async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
-    """通用验证逻辑：优先查库，查不到再查API"""
-    
-    # 1. 身份特权检测 (保持不变)
+    """通用验证逻辑"""
+    # 1. 身份特权
     has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
     is_owner = (interaction.user.id == owner_id)
     if is_owner and has_test_role: is_owner = False 
     if is_owner: return True, "owner"
 
-    # 2. 每日下载限制 (保持不变)
+    # 2. 频率限制
     today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
@@ -137,80 +115,60 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     if download_count >= DAILY_DOWNLOAD_LIMIT:
         return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # =====================================================
-    # 3. 定位【点赞目标】 (帖子首楼)
-    # =====================================================
+    # 3. 定位首楼
     op_msg = None
     if isinstance(interaction.channel, discord.Thread):
         try:
-            if interaction.channel.starter_message:
-                op_msg = interaction.channel.starter_message
+            if interaction.channel.starter_message: op_msg = interaction.channel.starter_message
             else:
-                async for msg in interaction.channel.history(limit=1, oldest_first=True):
-                    op_msg = msg; break
+                async for msg in interaction.channel.history(limit=1, oldest_first=True): op_msg = msg; break
         except: pass
 
     if not op_msg:
         try: op_msg = await interaction.channel.fetch_message(target_message_id)
-        except: return False, "❌ 无法定位原始帖子，请检查帖子是否已被删除。"
+        except: return False, "❌ 无法定位原始帖子。"
 
-    # =====================================================
-    # 4. 执行【点赞检测】 (数据库优先 + API 兜底)
-    # =====================================================
+    # 4. 点赞检测
     user_id = interaction.user.id
     msg_id = op_msg.id
     has_liked = False
 
-    # [Step A] 优先查询本地数据库 (极快，0 风险)
     async with get_db() as db:
         cursor = await db.execute("SELECT 1 FROM cached_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
-        if await cursor.fetchone():
-            has_liked = True
+        if await cursor.fetchone(): has_liked = True
 
-    # [Step B] 如果数据库没记录，去查 API (兜底，防止 Bot 离线时漏记录)
     if not has_liked:
         reacted = False
         for r in op_msg.reactions:
             try:
                 if r.count == 0: continue
                 async for u in r.users(limit=None): 
-                    if u.id == user_id: 
-                        reacted = True
-                        break
+                    if u.id == user_id: reacted = True; break
                 if reacted: break
-                await asyncio.sleep(0.1) # 只有走 API 才需要 sleep
+                await asyncio.sleep(0.1)
             except: continue
         
         if reacted:
             has_liked = True
-            # [Step C] API 查到了，赶紧补录到数据库，下次就不查 API 了
             async with get_db() as db:
                 await db.execute("INSERT OR IGNORE INTO cached_likes (message_id, user_id) VALUES (?, ?)", (msg_id, user_id))
                 await db.commit()
 
     if not has_liked:
-        return False, f"🛑 您还没点赞呢！\n请点击这里跳转到 **[帖子首楼]({op_msg.jump_url})** 给作者点个赞吧！👍\n（点完赞后请再次点击按钮）"
+        return False, f"🛑 您还没点赞呢！\n请跳转到 **[帖子首楼]({op_msg.jump_url})** 点个赞吧！👍"
 
-    # =====================================================
-    # 5. 执行【评论检测】 
-    # =====================================================
+    # 5. 评论检测
     if "comment" in unlock_type:
         has_commented = False
         panel_snowflake = discord.Object(id=target_message_id)
         try:
             async for msg in interaction.channel.history(after=panel_snowflake, limit=None):
                 if msg.author.id == interaction.user.id:
-                    if is_valid_comment(msg.content):
-                        has_commented = True; break
+                    if is_valid_comment(msg.content): has_commented = True; break
         except: pass
         
         if not has_commented:
-            return False, (
-                "💬 **评论未达标！**\n"
-                "请在 **本下载面板下方** 发送一条有意义的新评论。\n"
-                "✅ **要求**：纯文本需大于 5 个字 (允许带表情)\n"
-                "❌ **拒绝**：纯数字 / 刷屏 / 无意义字符"
-            )
+            return False, "💬 **评论未达标！**\n请在 **本下载面板下方** 发送一条有意义的评论（>5字，禁纯水）。"
 
     return True, "passed"
 
@@ -234,6 +192,48 @@ class DraftPasswordModal(ui.Modal, title="设置口令"):
         if not clean_pwd: return await i.response.send_message("口令不能为空！", ephemeral=True)
         self.view_ref.draft_password = clean_pwd; self.view_ref.draft_mode = self.next_mode; await self.view_ref.update_dashboard(i)
 
+# --- Renaming Classes (Added) ---
+
+class RenameFileModal(ui.Modal, title="重命名文件"):
+    name_input = ui.TextInput(label="新文件名 (无需输入后缀)", placeholder="例如：我的汉化补丁", max_length=100)
+    
+    def __init__(self, view_ref, file_index, old_filename):
+        super().__init__()
+        self.view_ref = view_ref
+        self.file_index = file_index
+        self.name_stem, self.ext = os.path.splitext(old_filename)
+        self.name_input.default = self.name_stem
+        
+    async def on_submit(self, interaction: discord.Interaction):
+        new_stem = self.name_input.value.strip()
+        if not new_stem: return await interaction.response.send_message("文件名不能为空！", ephemeral=True)
+        
+        new_full_name = f"{new_stem}{self.ext}"
+        self.view_ref.custom_names[self.file_index] = new_full_name
+        
+        await interaction.response.defer(ephemeral=True)
+        await self.view_ref.update_dashboard(interaction)
+        await interaction.followup.send(f"✅ 文件已重命名为：`{new_full_name}`", ephemeral=True)
+
+class FileSelectView(ui.View):
+    def __init__(self, protection_view):
+        super().__init__(timeout=60)
+        self.protection_view = protection_view
+        options = []
+        for i, att in enumerate(protection_view.attachments):
+            current_name = protection_view.custom_names.get(i, att.filename)
+            label = current_name[:95]
+            options.append(discord.SelectOption(label=f"{i+1}. {label}", value=str(i), description=f"原始: {att.filename[:50]}"))
+            
+        self.select_menu = ui.Select(placeholder="选择要改名的文件...", options=options, min_values=1, max_values=1)
+        self.select_menu.callback = self.select_callback
+        self.add_item(self.select_menu)
+        
+    async def select_callback(self, interaction: discord.Interaction):
+        idx = int(self.select_menu.values[0])
+        current_name = self.protection_view.custom_names.get(idx, self.protection_view.attachments[idx].filename)
+        await interaction.response.send_modal(RenameFileModal(self.protection_view, idx, current_name))
+
 # --- Creator View (Draft) ---
 
 class ProtectionDraftView(ui.View):
@@ -247,13 +247,19 @@ class ProtectionDraftView(ui.View):
         self.draft_log = default_log
         self.draft_password = None
         self.draft_mode = "like"
+        self.custom_names = {} # {index: "new_name.zip"}
     
     async def update_dashboard(self, interaction: discord.Interaction):
         log_preview = self.draft_log[:50] + "..." if self.draft_log and len(self.draft_log) > 50 else self.draft_log
-        status_desc = (f"📦 **已传文件**: {len(self.attachments)} 个\n🏷️ **当前标题**: {self.draft_title}\n📝 **作者提示**: {'✅ ' + log_preview if self.draft_log else '⚪ 未设置'}\n")
+        
+        renamed_count = len(self.custom_names)
+        file_status = f"{len(self.attachments)} 个"
+        if renamed_count > 0: file_status += f" (已改名 {renamed_count} 个)"
+
+        status_desc = (f"📦 **已传文件**: {file_status}\n🏷️ **当前标题**: {self.draft_title}\n📝 **作者提示**: {'✅ ' + log_preview if self.draft_log else '⚪ 未设置'}\n")
         mode_map = {"like": "👍 点赞解锁", "like_comment": "💬 点赞+评论", "like_password": f"🔐 点赞+口令 (口令: ||{self.draft_password}||)", "like_comment_password": f"🔐💬 点赞+评论+口令 (口令: ||{self.draft_password}||)"}
         status_desc += f"⚙️ **获取方式**: {mode_map.get(self.draft_mode)}"
-        guide_desc = ("1️⃣ 点击 **第一排** 按钮修改标题或添加说明。\n2️⃣ 点击 **第二排** 按钮选择解锁条件。\n3️⃣ 确认无误后，点击底部的 **🚀 确认发布**。")
+        guide_desc = ("1️⃣ 点击 **第一排** 修改标题、说明或 **修改文件名**。\n2️⃣ 点击 **第二排** 选择解锁条件。\n3️⃣ 确认无误后，点击底部的 **🚀 确认发布**。")
         embed = discord.Embed(title="🛠️ 附件保护控制台", color=0x87ceeb); embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False); embed.add_field(name="📖 操作指引", value=guide_desc, inline=False); embed.set_footer(text="此面板仅你自己可见")
         
         if interaction.response.is_done(): await interaction.edit_original_response(content=None, embed=embed, view=self)
@@ -263,10 +269,15 @@ class ProtectionDraftView(ui.View):
     async def btn_set_title(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftTitleModal(self))
     @ui.button(label="作者提示", style=discord.ButtonStyle.secondary, row=0, emoji="📝")
     async def btn_set_note(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftNoteModal(self))
-    @ui.button(label="查看已传文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
+    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
+    async def btn_rename_files(self, i: discord.Interaction, b: ui.Button): await i.response.send_message("请选择要重命名的文件：", view=FileSelectView(self), ephemeral=True)
+    @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
     async def btn_view_files(self, i: discord.Interaction, b: ui.Button): 
-        names = "\n".join([f"- {f.filename}" for f in self.attachments])
-        await i.response.send_message(f"已准备文件：\n{names[:1900]}", ephemeral=True)
+        names = []
+        for idx, att in enumerate(self.attachments):
+            final_name = self.custom_names.get(idx, att.filename)
+            names.append(f"{idx+1}. {final_name}")
+        await i.response.send_message(f"**当前文件列表：**\n" + "\n".join(names)[:1900], ephemeral=True)
     
     @ui.button(label="点赞", style=discord.ButtonStyle.primary, row=1)
     async def mode_like(self, i: discord.Interaction, b: ui.Button): self.draft_mode = "like"; await self.update_dashboard(i)
@@ -289,9 +300,11 @@ class ProtectionDraftView(ui.View):
     async def publish(self, interaction: discord.Interaction):
         files_to_send, file_metadata = [], []
         try:
-            for att in self.attachments: 
+            for idx, att in enumerate(self.attachments): 
                 file_bytes = await att.read()
-                f = discord.File(io.BytesIO(file_bytes), filename=att.filename)
+                # 使用自定义文件名
+                final_filename = self.custom_names.get(idx, att.filename)
+                f = discord.File(io.BytesIO(file_bytes), filename=final_filename)
                 files_to_send.append(f)
         except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
         
@@ -306,7 +319,7 @@ class ProtectionDraftView(ui.View):
                     "channel_id": backup_msg.channel.id,
                     "message_id": backup_msg.id,
                     "attachment_index": i,
-                    "filename": att.filename,
+                    "filename": att.filename, # 这里的 filename 已经是修改后的
                     "url": att.url
                 })
         except discord.Forbidden: 
@@ -352,7 +365,6 @@ class ProtectionDraftView(ui.View):
 
 class PasswordUnlockModal(ui.Modal, title="请输入口令"):
     password_input = ui.TextInput(label="口令", placeholder="请输入...", max_length=50)
-    
     def __init__(self, correct_password, item_row, bot, unlock_type): 
         super().__init__()
         self.c = correct_password
@@ -365,16 +377,12 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
             return await i.response.send_message("❌ 口令错误！", ephemeral=True)
         
         await i.response.defer(ephemeral=True, thinking=True)
-        
-        # 调用通用验证
         success, msg = await check_requirements_common(i, self.ut, self.row['owner_id'], self.row['message_id'])
-        if not success:
-            return await i.followup.send(msg, ephemeral=True)
+        if not success: return await i.followup.send(msg, ephemeral=True)
 
         try: file_data = json.loads(self.row['storage_urls'])
         except: return await i.followup.send("❌ 数据损坏", ephemeral=True)
 
-        # 调用通用下载
         file_results = await fetch_files_common(self.bot, file_data)
         if file_results: 
             await record_download_common(i.user, self.row)
@@ -383,26 +391,21 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
         else: 
             await i.followup.send("❌ 文件下载失败，请联系作者。", ephemeral=True)
 
-# --- List View (For /获取附件 command) ---
+# --- List View ---
 
 class PostListView(ui.View):
     def __init__(self, bot, posts_rows):
         super().__init__(timeout=600)
         self.bot = bot
-        self.posts = posts_rows # list of DB rows
+        self.posts = posts_rows 
         self.selected_row = None
         
-        # 初始化下拉菜单
         options = []
         for p in self.posts:
-            # 截断标题防止过长
             title = p['title'][:90]
             ts_str = datetime.fromisoformat(p['created_at']).strftime('%m-%d %H:%M')
             options.append(discord.SelectOption(
-                label=title,
-                description=f"发布于: {ts_str}",
-                value=str(p['message_id']),
-                emoji="📄"
+                label=title, description=f"发布于: {ts_str}", value=str(p['message_id']), emoji="📄"
             ))
         
         self.select_menu = ui.Select(placeholder="🔍 请选择要获取的附件...", options=options, row=0)
@@ -410,29 +413,19 @@ class PostListView(ui.View):
         self.add_item(self.select_menu)
 
     async def on_select(self, interaction: discord.Interaction):
-        # 获取用户选择的 message_id
         selected_id = int(self.select_menu.values[0])
         self.selected_row = next((p for p in self.posts if p['message_id'] == selected_id), None)
         
         if not self.selected_row:
             return await interaction.response.send_message("选择出错，请重试。", ephemeral=True)
 
-        # 更新按钮状态
         self.btn_download.disabled = False
-        
-        # 构建详情 Embed
         try:
             file_data = json.loads(self.selected_row['storage_urls'])
             file_list = "\n".join([f"📄 {f.get('filename','???')}" for f in file_data])
         except: file_list = "解析错误"
         
-        mode_map = {
-            "like": "👍 点赞首楼", 
-            "like_comment": "👍💬 点赞 + 评论 (>5字，禁表情)", 
-            "like_password": "👍🔐 点赞 + 口令", 
-            "like_comment_password": "👍💬🔐 点赞 + 评论 + 口令"
-        }
-        
+        mode_map = {"like": "👍 点赞", "like_comment": "👍💬 点赞+评论", "like_password": "👍🔐 点赞+口令", "like_comment_password": "👍💬🔐 全套验证"}
         embed = discord.Embed(title=f"📂 {self.selected_row['title']}", color=discord.Color.green())
         embed.add_field(name="📋 包含文件", value=file_list[:1000], inline=False)
         embed.add_field(name="🔑 获取条件", value=mode_map.get(self.selected_row['unlock_type'], "未知"), inline=False)
@@ -443,13 +436,10 @@ class PostListView(ui.View):
     @ui.button(label="验证并获取", style=discord.ButtonStyle.success, emoji="🎁", disabled=True, row=1)
     async def btn_download(self, interaction: discord.Interaction, button: ui.Button):
         if not self.selected_row: return
-        
         row = self.selected_row
         unlock_type = row['unlock_type']
         
-        # 密码模式 -> 弹窗
         if "password" in unlock_type:
-            # 列表模式下也允许 owner 直接下载，如不需要可删掉下面几行
             has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
             if interaction.user.id == row['owner_id'] and not has_test_role:
                  await interaction.response.defer(ephemeral=True, thinking=True)
@@ -457,9 +447,7 @@ class PostListView(ui.View):
                  file_results = await fetch_files_common(self.bot, file_data)
                  if file_results: await interaction.followup.send(content="👑 主人请拿好：", files=make_discord_files_common(file_results), ephemeral=True)
                  return
-
             await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self.bot, unlock_type))
-        # 非密码模式
         else:
             await interaction.response.defer(ephemeral=True, thinking=True)
             success, msg = await check_requirements_common(interaction, unlock_type, row['owner_id'], row['message_id'])
@@ -468,7 +456,6 @@ class PostListView(ui.View):
             file_data = json.loads(row['storage_urls'])
             file_results = await fetch_files_common(self.bot, file_data)
             
-            # 计算剩余
             today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             async with get_db() as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
@@ -495,27 +482,19 @@ class DownloadView(ui.View):
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
             row = await (await db.execute("SELECT * FROM protected_items WHERE message_id = ?", (message_id,))).fetchone()
-            
-            if not row:
-                return await interaction.response.send_message("❌ 该附件已被作者删除或失效。", ephemeral=True)
-            
+            if not row: return await interaction.response.send_message("❌ 该附件已被作者删除或失效。", ephemeral=True)
             file_data = json.loads(row['storage_urls'])
             unlock_type = row['unlock_type']
             owner_id = row['owner_id']
 
-        # 密码模式 -> 弹窗
         if "password" in unlock_type:
             has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
             if interaction.user.id == owner_id and not has_test_role:
-                # 拥有者直接下载
                 await interaction.response.defer(ephemeral=True, thinking=True)
                 file_results = await fetch_files_common(self.bot, file_data)
                 if file_results: await interaction.followup.send(content="👑 主人请拿好：", files=make_discord_files_common(file_results), ephemeral=True)
                 return
-
             await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self.bot, unlock_type))
-        
-        # 非密码模式 -> 直接验证
         else:
             await interaction.response.defer(ephemeral=True, thinking=True)
             success, msg = await check_requirements_common(interaction, unlock_type, owner_id, message_id)
@@ -523,7 +502,6 @@ class DownloadView(ui.View):
 
             file_results = await fetch_files_common(self.bot, file_data)
             
-            # 计算剩余
             today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             async with get_db() as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
@@ -555,12 +533,8 @@ class ProtectionCog(commands.Cog):
         self.bot.tree.add_command(self.ctx_menu)
         self.bot.loop.create_task(init_likes_db())
 
-    # === 定义命令分组 ===
-    # 贴主专用的命令组
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
-    # 用户个人的命令组
     user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
-    # 管理员维护组
     admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
 
     async def cog_unload(self):
@@ -582,41 +556,25 @@ class ProtectionCog(commands.Cog):
             async with get_db() as db: await db.executemany("DELETE FROM protected_items WHERE message_id = ?", [(i,) for i in ids_to_clean]); await db.commit()
         return active_posts
     
-    # ==========================================
-    # 实时点赞监听器
-    # ==========================================
-    
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        """当有点赞发生时，立即记录到数据库"""
-        # 排除机器人自己
         if payload.user_id == self.bot.user.id: return
-        
-        # 写入数据库 (异步且静默，不影响主线程)
         async with get_db() as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO cached_likes (message_id, user_id) VALUES (?, ?)", 
-                (payload.message_id, payload.user_id)
-            )
+            await db.execute("INSERT OR IGNORE INTO cached_likes (message_id, user_id) VALUES (?, ?)", (payload.message_id, payload.user_id))
             await db.commit()
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        """当取消点赞时，从数据库移除记录"""
         async with get_db() as db:
-            await db.execute(
-                "DELETE FROM cached_likes WHERE message_id = ? AND user_id = ?", 
-                (payload.message_id, payload.user_id)
-            )
+            await db.execute("DELETE FROM cached_likes WHERE message_id = ? AND user_id = ?", (payload.message_id, payload.user_id))
             await db.commit()
 
-    @admin_group.command(name="修复面板", description="刷新本频道所有旧面板，使其适配新逻辑")
+    @admin_group.command(name="修复面板", description="刷新本频道所有旧面板")
     async def fix_panels(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
             rows = await (await db.execute("SELECT * FROM protected_items WHERE channel_id = ?", (interaction.channel.id,))).fetchall()
-        
         if not rows: return await interaction.followup.send("本频道在数据库中没有活跃记录。", ephemeral=True)
         success_count, fail_count = 0, 0
         for row in rows:
@@ -645,8 +603,7 @@ class ProtectionCog(commands.Cog):
         else:
             log_text = ""
             for log in logs:
-                try:
-                    filenames = ", ".join(json.loads(log['filenames']))
+                try: filenames = ", ".join(json.loads(log['filenames']))
                 except: filenames = "未知文件"
                 ts = discord.utils.format_dt(datetime.fromisoformat(log['timestamp']), 'T')
                 log_text += f"- **{log['title']}**: `{filenames}` ({ts})\n"
@@ -655,23 +612,13 @@ class ProtectionCog(commands.Cog):
 
     @user_group.command(name="获取附件", description="显示本频道最近的5个受保护附件列表")
     async def get_attachments_list(self, interaction: discord.Interaction):
-        # 1. 查询最近 5 条记录
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 5", 
-                (interaction.channel.id,)
-            )
+            cursor = await db.execute("SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 5", (interaction.channel.id,))
             rows = await cursor.fetchall()
-
-        if not rows:
-            return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录。", ephemeral=True)
-
-        # 2. 如果只有1条，也用下拉菜单（保持一致性），或者你可以选择直接显示
+        if not rows: return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录。", ephemeral=True)
         view = PostListView(self.bot, rows)
-        
         embed = discord.Embed(title="📂 附件获取列表", description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个进行查看和下载。", color=0x87ceeb)
-        
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @maker_group.command(name="管理附件", description="查看和管理我发布的保护贴及附件")
@@ -701,8 +648,7 @@ class ProtectionCog(commands.Cog):
     @app_commands.describe(file1="附件1", file2="附件2", file3="附件3", file4="附件4", file5="附件5", file6="附件6", file7="附件7", file8="附件8", file9="附件9", file10="附件10")
     async def create_protection(self, interaction: discord.Interaction, file1: discord.Attachment, file2: discord.Attachment=None, file3: discord.Attachment=None, file4: discord.Attachment=None, file5: discord.Attachment=None, file6: discord.Attachment=None, file7: discord.Attachment=None, file8: discord.Attachment=None, file9: discord.Attachment=None, file10: discord.Attachment=None):
         attachments = [f for f in [file1, file2, file3, file4, file5, file6, file7, file8, file9, file10] if f]
-        if not attachments:
-            return await interaction.response.send_message("请至少上传一个文件！", ephemeral=True)
+        if not attachments: return await interaction.response.send_message("请至少上传一个文件！", ephemeral=True)
         view = ProtectionDraftView(self.bot, interaction.user, attachments)
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87ceeb)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
