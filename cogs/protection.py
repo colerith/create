@@ -86,7 +86,8 @@ async def fetch_files_common(bot, file_data):
                         msg = await channel.fetch_message(mid)
                         fetched_messages[(cid, mid)] = msg
                     except Exception as e:
-                        print(f"Failed to refresh URL ref: {e}")
+                        # 私信如果被用户关闭，这里会报错，但我们catch住，尝试用旧URL
+                        print(f"Failed to refresh URL ref from DM/Channel: {e}")
                 
                 # 如果拿到了消息，更新 URL
                 if msg and 0 <= idx < len(msg.attachments):
@@ -111,11 +112,7 @@ async def fetch_files_common(bot, file_data):
 def make_discord_files_common(file_results):
     return [discord.File(io.BytesIO(res['bytes']), filename=res['filename']) for res in file_results]
 
-async def send_dm_backup_common(user, file_results):
-    files = make_discord_files_common(file_results)
-    if not files: return
-    try: await user.send(content="这是您刚刚下载的附件备份：", files=files)
-    except: pass
+# 【注意】这里不再有 send_dm_backup_common，因为你说只取消下载后私发
 
 async def record_download_common(user, item_row):
     async def _update():
@@ -133,7 +130,6 @@ async def record_download_common(user, item_row):
 async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
     """
     通用验证逻辑 (优化版)
-    优化点：增加 API 请求间隔，限制历史消息获取数量
     """
     # 1. 身份特权
     has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
@@ -205,8 +201,8 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
         has_commented = False
         panel_snowflake = discord.Object(id=target_message_id)
         try:
-            # 【优化】只检查最近 100 条消息，防止卡死
-            async for msg in interaction.channel.history(after=panel_snowflake, limit=100):
+            # 【优化】只检查最近 50 条消息，防止卡死
+            async for msg in interaction.channel.history(after=panel_snowflake, limit=50):
                 if msg.author.id == interaction.user.id:
                     if is_valid_comment(msg.content): has_commented = True; break
         except: pass
@@ -348,8 +344,10 @@ class ProtectionDraftView(ui.View):
         
         stored_data = []
         try:
+            # 【修改】：发送给发布者的私信
             dm = await self.user.create_dm()
             backup_msg = await dm.send(content=f"【{self.draft_title}】的备份！\nID: {interaction.id}", files=files_to_send)
+            
             for i, att in enumerate(backup_msg.attachments):
                 stored_data.append({
                     "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
@@ -384,6 +382,7 @@ class ProtectionDraftView(ui.View):
             await db.commit()
         
         await final_msg.edit(view=DownloadView(self.bot))
+        # 这个DM仅为提示，不含文件
         await dm.send(content=f"保护贴已发布！\n跳转链接：{final_msg.jump_url}")
         await interaction.followup.send("✅ 发布成功！", ephemeral=True)
 
@@ -410,8 +409,8 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
         file_results = await fetch_files_common(self.bot, file_data)
         if file_results: 
             await record_download_common(i.user, self.row)
+            # 仅发送到频道
             await i.followup.send(content="🔓 口令正确！文件给你：", files=make_discord_files_common(file_results), ephemeral=True)
-            await send_dm_backup_common(i.user, file_results)
         else: 
             await i.followup.send("❌ 文件下载失败，请联系作者。", ephemeral=True)
 
@@ -431,10 +430,8 @@ class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
     async def on_submit(self, interaction: discord.Interaction):
         new_stem = self.name_input.value.strip()
         if not new_stem: return await interaction.response.send_message("文件名不能为空！", ephemeral=True)
-        
         new_full_name = f"{new_stem}{self.ext}"
         self.file_data[self.file_index]['filename'] = new_full_name
-        
         async with get_db() as db:
             await db.execute("UPDATE protected_items SET storage_urls = ? WHERE message_id = ?", (json.dumps(self.file_data), self.message_id))
             await db.commit()
@@ -452,7 +449,6 @@ class ManageFilesSelectView(ui.View):
         self.select = ui.Select(placeholder="选择要重命名的文件...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-        
     async def on_select(self, interaction: discord.Interaction):
         idx = int(self.select.values[0])
         await interaction.response.send_modal(EditPublishedFileModal(self.message_id, idx, self.file_data))
@@ -462,11 +458,9 @@ class PostManagementView(ui.View):
         super().__init__(timeout=60)
         self.message_id = message_id
         self.file_data = file_data
-
     @ui.button(label="✏️ 修改文件名", style=discord.ButtonStyle.primary)
     async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message("请选择要修改的文件：", view=ManageFilesSelectView(self.message_id, self.file_data), ephemeral=True)
-
     @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger)
     async def delete_post(self, interaction: discord.Interaction, button: ui.Button):
         async with get_db() as db: 
@@ -483,13 +477,12 @@ class PostSelectionView(ui.View):
         for p in posts_rows:
             title = p['title'][:80]
             dl_count = p['download_count']
-            # 【这里添加了下载次数显示】
+            # 【核心修改】添加下载次数显示
             options.append(discord.SelectOption(label=title, value=str(p['message_id']), description=f"下载: {dl_count}次 | ID: {p['message_id']}"))
         self.select = ui.Select(placeholder="选择要管理的帖子...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
         self.posts_map = {str(p['message_id']): p for p in posts_rows}
-
     async def on_select(self, interaction: discord.Interaction):
         mid_str = self.select.values[0]
         row = self.posts_map[mid_str]
@@ -506,15 +499,11 @@ class PostListView(ui.View):
         self.bot = bot
         self.posts = posts_rows 
         self.selected_row = None
-        
         options = []
         for p in self.posts:
             title = p['title'][:90]
             ts_str = datetime.fromisoformat(p['created_at']).strftime('%m-%d %H:%M')
-            options.append(discord.SelectOption(
-                label=title, description=f"发布于: {ts_str}", value=str(p['message_id']), emoji="📄"
-            ))
-        
+            options.append(discord.SelectOption(label=title, description=f"发布于: {ts_str}", value=str(p['message_id']), emoji="📄"))
         self.select_menu = ui.Select(placeholder="🔍 请选择要获取的附件...", options=options, row=0)
         self.select_menu.callback = self.on_select
         self.add_item(self.select_menu)
@@ -523,19 +512,16 @@ class PostListView(ui.View):
         selected_id = int(self.select_menu.values[0])
         self.selected_row = next((p for p in self.posts if p['message_id'] == selected_id), None)
         if not self.selected_row: return await interaction.response.send_message("选择出错，请重试。", ephemeral=True)
-
         self.btn_download.disabled = False
         try:
             file_data = json.loads(self.selected_row['storage_urls'])
             file_list = "\n".join([f"📄 {f.get('filename','???')}" for f in file_data])
         except: file_list = "解析错误"
-        
         mode_map = {"like": "👍 点赞", "like_comment": "👍💬 点赞+评论", "like_password": "👍🔐 点赞+口令", "like_comment_password": "👍💬🔐 全套验证"}
         embed = discord.Embed(title=f"📂 {self.selected_row['title']}", color=discord.Color.green())
         embed.add_field(name="📋 包含文件", value=file_list[:1000], inline=False)
         embed.add_field(name="🔑 获取条件", value=mode_map.get(self.selected_row['unlock_type'], "未知"), inline=False)
         embed.set_footer(text="请点击下方按钮验证条件并下载")
-        
         await interaction.response.edit_message(embed=embed, view=self)
 
     @ui.button(label="验证并获取", style=discord.ButtonStyle.success, emoji="🎁", disabled=True, row=1)
@@ -557,18 +543,15 @@ class PostListView(ui.View):
             await interaction.response.defer(ephemeral=True, thinking=True)
             success, msg = await check_requirements_common(interaction, unlock_type, row['owner_id'], row['message_id'])
             if not success: return await interaction.followup.send(msg, ephemeral=True)
-            
             file_data = json.loads(row['storage_urls'])
             file_results = await fetch_files_common(self.bot, file_data)
-            
             today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             async with get_db() as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
                 cnt = (await cursor.fetchone())[0]
-
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                await send_dm_backup_common(interaction.user, file_results)
+                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
@@ -583,7 +566,6 @@ class DownloadView(ui.View):
     @ui.button(label="获取附件", style=discord.ButtonStyle.primary, emoji="🎁", custom_id="dl_btn_v5")
     async def download_btn(self, interaction: discord.Interaction, button: ui.Button):
         message_id = self.target_message_id if self.target_message_id else interaction.message.id
-        
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
             row = await (await db.execute("SELECT * FROM protected_items WHERE message_id = ?", (message_id,))).fetchone()
@@ -604,17 +586,14 @@ class DownloadView(ui.View):
             await interaction.response.defer(ephemeral=True, thinking=True)
             success, msg = await check_requirements_common(interaction, unlock_type, owner_id, message_id)
             if not success: return await interaction.followup.send(msg, ephemeral=True)
-
             file_results = await fetch_files_common(self.bot, file_data)
-            
             today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
             async with get_db() as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
                 cnt = (await cursor.fetchone())[0]
-            
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                await send_dm_backup_common(interaction.user, file_results)
+                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
