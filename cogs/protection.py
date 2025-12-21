@@ -93,10 +93,6 @@ async def record_download_common(user, item_row):
 # --- 核心验证逻辑 (完全无API，查首楼ID) ---
 
 async def check_requirements_common(interaction, unlock_type, owner_id, panel_message_id):
-    """
-    panel_message_id: 这是 Bot 发的那条面板消息的 ID。
-    但是！我们验证点赞时，要查的是【首楼 ID】（即 Channel ID）。
-    """
     user = interaction.user
     
     # 1. 身份特权
@@ -128,8 +124,7 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
             has_liked = True
 
     if not has_liked:
-        # 生成跳转链接
-        jump_target = interaction.channel.jump_url if isinstance(interaction.channel, discord.Thread) else f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{check_target_id}"
+        jump_target = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{check_target_id}"
         
         return False, (
             f"🛑 **未检测到有效点赞！**\n"
@@ -141,8 +136,6 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
     # === 4. 验证评论 ===
     if "comment" in unlock_type:
         has_commented = False
-        # 评论同理，我们查的是“用户有没有在这个帖子(Thread ID)里发过言”
-        # 所以查询的 message_id 字段也应该是 channel.id
         
         check_comment_target_id = interaction.channel.id if isinstance(interaction.channel, discord.Thread) else panel_message_id
         
