@@ -1,8 +1,8 @@
-#protection.py
+# protection.py
 
 import discord
 from discord import app_commands, ui
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import asyncio
 import io
@@ -19,23 +19,6 @@ TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
-# --- Cache ---
-# 简单的内存缓存，减少同一消息短时间内的重复请求
-MESSAGE_CACHE = {} 
-
-# --- Database Init ---
-async def init_likes_db():
-    async with get_db() as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS cached_likes (
-                message_id INTEGER,
-                user_id INTEGER,
-                PRIMARY KEY (message_id, user_id)
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
-        await db.commit()
-
 # --- Helper: Comment Validator ---
 def is_valid_comment(content: str) -> bool:
     if not content: return False
@@ -51,23 +34,15 @@ def is_valid_comment(content: str) -> bool:
 # --- Shared Logic Helpers ---
 
 async def fetch_files_common(bot, file_data):
-    """
-    通用文件下载逻辑 (优化版)
-    优化点：批量处理相同 Message ID 的引用，减少 API 请求次数
-    """
+    """通用文件下载逻辑"""
     results = []
     if not isinstance(file_data, list): return []
-
-    # 1. 预处理：按 Message ID 分组需要刷新的文件
-    # 格式: { (channel_id, message_id): message_object }
     fetched_messages = {}
 
     for item in file_data:
         if not isinstance(item, dict): continue
-        
         download_url = item.get('url')
         
-        # 尝试刷新 URL (仅当策略为 msg_ref 时)
         if item.get('strategy') == 'msg_ref':
             cid = item.get('channel_id')
             mid = item.get('message_id')
@@ -75,37 +50,26 @@ async def fetch_files_common(bot, file_data):
             
             if cid and mid:
                 msg = fetched_messages.get((cid, mid))
-                
-                # 如果还没获取过这条消息，去获取一次
                 if not msg:
                     try:
-                        # 优先从 Bot 缓存获取
                         channel = bot.get_channel(cid)
-                        if not channel: 
-                            channel = await bot.fetch_channel(cid)
-                        
-                        # 尝试获取消息 (带简单内存缓存，防止短时并发请求)
+                        if not channel: channel = await bot.fetch_channel(cid)
                         msg = await channel.fetch_message(mid)
                         fetched_messages[(cid, mid)] = msg
                     except Exception as e:
-                        # 私信如果被用户关闭，这里会报错，但我们catch住，尝试用旧URL
-                        print(f"Failed to refresh URL ref from DM/Channel: {e}")
+                        print(f"Failed to refresh URL ref: {e}")
                 
-                # 如果拿到了消息，更新 URL
                 if msg and 0 <= idx < len(msg.attachments):
                     download_url = msg.attachments[idx].url
 
         if not download_url: continue
 
-        # 下载文件流
         try:
             async with bot.http_session.get(download_url) as resp:
                 if resp.status == 200:
                     data = await resp.read()
                     if len(data) > 0:
                         results.append({'filename': item.get('filename', 'unknown'), 'bytes': data})
-                else:
-                    print(f"HTTP {resp.status} for {download_url}")
         except Exception as e: 
             print(f"DL Error: {e}")
             
@@ -113,8 +77,6 @@ async def fetch_files_common(bot, file_data):
 
 def make_discord_files_common(file_results):
     return [discord.File(io.BytesIO(res['bytes']), filename=res['filename']) for res in file_results]
-
-# 【注意】这里不再有 send_dm_backup_common，因为你说只取消下载后私发
 
 async def record_download_common(user, item_row):
     async def _update():
@@ -129,81 +91,92 @@ async def record_download_common(user, item_row):
             await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
     asyncio.create_task(_update())
 
-# 替换原有的 check_requirements_common 函数
+# --- 核心验证逻辑 (已修正首楼定位) ---
 
 async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
     """
-    通用验证逻辑 (数据库优先版)
+    通用验证逻辑 (数据库优先 + 首楼修正版)
+    target_message_id: 这是 protected_items 表里的 message_id (即 Bot 面板消息ID)
     """
     user = interaction.user
     
-    # 1. 身份特权 (保持不变)
+    # 1. 身份特权
     has_test_role = isinstance(user, discord.Member) and user.get_role(TEST_ROLE_ID)
     is_owner = (user.id == owner_id)
     if is_owner and has_test_role: is_owner = False 
     if is_owner: return True, "owner"
 
-    # 2. 频率限制 (保持不变)
+    # 2. 频率限制
     today_start = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (user.id, today_start))
         if (await cursor.fetchone())[0] >= DAILY_DOWNLOAD_LIMIT:
             return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # 3. 定位首楼 (用于API回退查找)
-    
     # === 验证点赞 ===
     has_liked = False
     
-    # A. 优先查本地数据库 (速度快，无API消耗)
+    # A. 优先查本地数据库 (target_message_id 对应 Bot 面板 ID)
     async with get_db() as db:
         cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, target_message_id))
         if await cursor.fetchone():
             has_liked = True
 
-    # B. 数据库没查到？可能是Bot离线时点的，回退到API检查 (带补录功能)
+    # B. 数据库没查到？回退到 API 检查 (需精确定位首楼)
     if not has_liked:
         try:
-            # ... 获取 op_msg ...
+            op_msg = None
+            # 【关键修正】：判断是帖子还是普通频道
             if isinstance(interaction.channel, discord.Thread):
-                op_msg = interaction.channel.starter_message or await interaction.channel.fetch_message(target_message_id)
+                # 如果是帖子，点赞通常在首楼 (Starter Message)
+                # 尝试获取首楼对象
+                op_msg = interaction.channel.starter_message
+                if not op_msg:
+                    try:
+                        # 帖子的 ID 通常就是首楼消息的 ID
+                        op_msg = await interaction.channel.fetch_message(interaction.channel.id)
+                    except discord.NotFound:
+                        # 极端情况：找不到首楼，回退到面板消息
+                        op_msg = await interaction.channel.fetch_message(target_message_id)
             else:
+                # 普通频道，点赞在面板消息上
                 op_msg = await interaction.channel.fetch_message(target_message_id)
 
-            # 遍历表情
-            for r in op_msg.reactions:
-                # 优化：只查count > 0 的
-                if r.count == 0: continue
-                
-                users = []
-                async for u in r.users(limit=100): 
-                    users.append(u)
-                
-                # 批量写入数据库
-                if users:
-                    async with get_db() as db:
-                        for u in users:
-                            await db.execute(
-                                "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
-                                (u.id, target_message_id)
-                            )
-                        await db.commit()
+            if op_msg:
+                # 遍历表情 (只查 count > 0)
+                for r in op_msg.reactions:
+                    if r.count == 0: continue
+                    
+                    # 批量获取前 100 个用户并缓存
+                    users = []
+                    async for u in r.users(limit=100): 
+                        users.append(u)
+                    
+                    if users:
+                        async with get_db() as db:
+                            for u in users:
+                                # 【关键】：即使是在首楼获取的点赞，存入数据库时
+                                # 也要映射到 target_message_id (Bot 面板 ID)
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
+                                    (u.id, target_message_id)
+                                )
+                            await db.commit()
 
-                current_user_found = any(u.id == user.id for u in users)
-                
-                if current_user_found:
-                    has_liked = True
-
-                    break 
-                
-                await asyncio.sleep(0.5) # 表情之间的间隔
+                    # 检查是否包含当前用户
+                    if any(u.id == user.id for u in users):
+                        has_liked = True
+                        break 
+                    
+                    await asyncio.sleep(0.5)
 
         except Exception as e:
-            print(f"API Batch Fetch Error: {e}")
+            print(f"API Fallback Check Error: {e}")
 
     if not has_liked:
-        jump_url = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{target_message_id}"
-        return False, f"🛑 您还没点赞呢！\n请跳转到 **[帖子首楼]({jump_url})** 点个赞吧！👍\n*(如果是刚才点的，请等待几秒后再试)*"
+        # 生成跳转链接指向首楼
+        thread_jump_url = interaction.channel.jump_url if isinstance(interaction.channel, discord.Thread) else f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{target_message_id}"
+        return False, f"🛑 您还没点赞呢！\n请跳转到 **[帖子首楼]({thread_jump_url})** 点个赞吧！👍\n*(如果是刚才点的，请等待几秒后再试)*"
 
     # === 验证评论 ===
     if "comment" in unlock_type:
@@ -218,10 +191,11 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
         # B. 回退查 API (只查最近的历史消息)
         if not has_commented:
             try:
-                async for msg in interaction.channel.history(limit=50): # 只看最近50条
+                # 限制 limit 防止 429
+                async for msg in interaction.channel.history(limit=50): 
                     if msg.author.id == user.id and is_valid_comment(msg.content):
                         has_commented = True
-                        # 补录数据库
+                        # 补录
                         async with get_db() as db:
                             await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (user.id, target_message_id, "History Check"))
                             await db.commit()
@@ -365,7 +339,6 @@ class ProtectionDraftView(ui.View):
         
         stored_data = []
         try:
-            # 【修改】：发送给发布者的私信
             dm = await self.user.create_dm()
             backup_msg = await dm.send(content=f"【{self.draft_title}】的备份！\nID: {interaction.id}", files=files_to_send)
             
@@ -403,7 +376,6 @@ class ProtectionDraftView(ui.View):
             await db.commit()
         
         await final_msg.edit(view=DownloadView(self.bot))
-        # 这个DM仅为提示，不含文件
         await dm.send(content=f"保护贴已发布！\n跳转链接：{final_msg.jump_url}")
         await interaction.followup.send("✅ 发布成功！", ephemeral=True)
 
@@ -430,7 +402,6 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
         file_results = await fetch_files_common(self.bot, file_data)
         if file_results: 
             await record_download_common(i.user, self.row)
-            # 仅发送到频道
             await i.followup.send(content="🔓 口令正确！文件给你：", files=make_discord_files_common(file_results), ephemeral=True)
         else: 
             await i.followup.send("❌ 文件下载失败，请联系作者。", ephemeral=True)
@@ -498,7 +469,6 @@ class PostSelectionView(ui.View):
         for p in posts_rows:
             title = p['title'][:80]
             dl_count = p['download_count']
-            # 【核心修改】添加下载次数显示
             options.append(discord.SelectOption(label=title, value=str(p['message_id']), description=f"下载: {dl_count}次 | ID: {p['message_id']}"))
         self.select = ui.Select(placeholder="选择要管理的帖子...", options=options)
         self.select.callback = self.on_select
@@ -572,7 +542,6 @@ class PostListView(ui.View):
                 cnt = (await cursor.fetchone())[0]
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
@@ -614,7 +583,6 @@ class DownloadView(ui.View):
                 cnt = (await cursor.fetchone())[0]
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
@@ -634,11 +602,8 @@ class DeleteConfirmView(ui.View):
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # 上下文菜单注册
         self.ctx_menu = app_commands.ContextMenu(name="转为保护附件", callback=self.convert_to_protected)
         self.bot.tree.add_command(self.ctx_menu)
-        
-        # 标记后台同步任务是否已启动
         self.has_started_backfill = False
 
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
@@ -647,23 +612,19 @@ class ProtectionCog(commands.Cog):
 
     async def cog_unload(self):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
-        # 如果有正在运行的同步任务，可以在这里取消（虽然是一次性的，不强制）
 
-    # --- 新增：Bot 启动后触发后台同步 ---
     @commands.Cog.listener()
     async def on_ready(self):
         if not self.has_started_backfill:
             self.has_started_backfill = True
-            # 创建后台任务，不阻塞主线程
             self.bot.loop.create_task(self.slow_sync_data())
 
     async def slow_sync_data(self):
-        """低速后台同步旧数据的核心逻辑"""
+        """低速后台同步旧数据的核心逻辑 (精准定位首楼版)"""
         print("⏳ [后台任务] 开始低速同步旧点赞/评论数据...")
         await self.bot.wait_until_ready()
         
         try:
-            # 1. 获取所有受保护的帖子记录
             async with get_db() as db:
                 db.row_factory = aiosqlite.Row
                 rows = await (await db.execute("SELECT message_id, channel_id FROM protected_items")).fetchall()
@@ -672,58 +633,72 @@ class ProtectionCog(commands.Cog):
             print(f"📦 [后台任务] 发现 {total} 个保护贴需要检查同步。")
 
             for i, row in enumerate(rows):
-                mid = row['message_id']
-                cid = row['channel_id']
+                mid = row['message_id'] # Bot 面板消息ID
+                cid = row['channel_id'] # 频道/帖子ID
                 
                 try:
                     channel = self.bot.get_channel(cid) or await self.bot.fetch_channel(cid)
                     if not channel: continue
 
-                    # 获取帖子/消息对象
-                    try:
-                        msg = await channel.fetch_message(mid)
-                    except discord.NotFound:
-                        # 帖子已被删，清理数据库
+                    # --- 精准定位首楼 ---
+                    target_msg = None
+                    if isinstance(channel, discord.Thread):
+                        # 如果是帖子，尝试获取首楼 (ID 通常等于 channel.id)
+                        try: target_msg = await channel.fetch_message(cid)
+                        except discord.NotFound: 
+                            try: target_msg = await channel.fetch_message(mid)
+                            except: pass
+                    else:
+                        # 如果是普通频道，直接找 Bot 面板消息
+                        try: target_msg = await channel.fetch_message(mid)
+                        except: pass
+                    
+                    if not target_msg:
                         async with get_db() as db:
                             await db.execute("DELETE FROM protected_items WHERE message_id = ?", (mid,))
                             await db.commit()
                         continue
 
-                    # === 同步 1: 点赞数据 (Reactions) ===
-                    for reaction in msg.reactions:
-                        # 批量获取用户（一次100个），减少请求次数
-                        # 这里的逻辑是：不管之前存没存，全量再跑一遍以防遗漏
+                    # --- 同步点赞 ---
+                    for reaction in target_msg.reactions:
+                        user_count = 0 
                         async for user in reaction.users(limit=None):
+                            user_count += 1
                             if user.bot: continue
+                            
+                            # 【核心映射】: 读取 target_msg 点赞 -> 写入 message_id (Bot面板ID)
                             async with get_db() as db:
                                 await db.execute(
                                     "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
                                     (user.id, mid)
                                 )
                                 await db.commit()
-                        
-                        # 每处理完一种表情，休息 2 秒 (防 429)
-                        await asyncio.sleep(2)
+                            
+                            if user_count % 50 == 0: await asyncio.sleep(1.5)
 
-                    # === 同步 2: 评论数据 (如果是帖子) ===
+                        await asyncio.sleep(1)
+
+                    # --- 同步评论 ---
                     if isinstance(channel, discord.Thread):
-                        async for hist_msg in channel.history(limit=None): 
+                        msg_count = 0
+                        async for hist_msg in channel.history(limit=1000): 
+                            msg_count += 1
                             if hist_msg.author.bot: continue
                             if is_valid_comment(hist_msg.content):
+                                # 同样写入 mid 作为关联ID
                                 async with get_db() as db:
                                     await db.execute(
                                         "INSERT OR IGNORE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)",
                                         (hist_msg.author.id, mid, hist_msg.content[:50])
                                     )
                                     await db.commit()
+                            
+                            if msg_count % 50 == 0: await asyncio.sleep(2.0)
                         
-                        # 处理完评论历史，休息 3 秒
                         await asyncio.sleep(3)
 
-                    # 处理完一个完整的帖子，休息 10 秒
-                    if i % 5 == 0:
-                        print(f"🔄 [同步进度] 已处理 {i+1}/{total} 个帖子...")
-                    await asyncio.sleep(10)
+                    print(f"🔄 [同步进度] 已处理 {i+1}/{total} 个帖子 (ID: {mid})")
+                    await asyncio.sleep(5)
 
                 except Exception as e:
                     print(f"❌ [同步错误] 帖子 {mid}: {e}")
@@ -749,45 +724,86 @@ class ProtectionCog(commands.Cog):
             async with get_db() as db: await db.executemany("DELETE FROM protected_items WHERE message_id = ?", [(i,) for i in ids_to_clean]); await db.commit()
         return active_posts
     
-    # --- 监听点赞 (实时存库) ---
+    # --- 监听点赞 (实时映射) ---
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id == self.bot.user.id: return
+        
+        # 我们需要知道用户点赞的是不是帖子的首楼
+        # 从而把这个赞正确记录到对应的 protected_item (Bot面板) 上
+        
         async with get_db() as db:
+            # 1. 直接检查：用户是不是点赞了 Bot 面板消息 (普通频道情况)
+            # 尝试写入 (message_id = payload.message_id)
             await db.execute(
                 "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
                 (payload.user_id, payload.message_id)
             )
+            
+            # 2. 智能映射：如果用户点赞了首楼 (message_id == channel_id)，我们要找到它对应的 Bot 面板
+            if payload.message_id == payload.channel_id:
+                # 这是一个帖子首楼的点赞
+                # 查找该帖子下所有的保护记录 (通常只有一个)
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ?", (payload.channel_id,))
+                rows = await cursor.fetchall()
+                for row in rows:
+                    # 把这个赞“映射”给该帖子下的保护面板消息
+                    await db.execute(
+                        "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)",
+                        (payload.user_id, row['message_id'])
+                    )
+            
             await db.commit()
 
-    # --- 监听取消点赞 (实时删除) ---
+    # --- 监听取消点赞 (实时删除映射) ---
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         async with get_db() as db:
+            # 删除直接记录
             await db.execute(
                 "DELETE FROM user_likes WHERE user_id = ? AND message_id = ?", 
                 (payload.user_id, payload.message_id)
             )
+            
+            # 删除映射记录 (如果是首楼取消赞)
+            if payload.message_id == payload.channel_id:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ?", (payload.channel_id,))
+                rows = await cursor.fetchall()
+                for row in rows:
+                    await db.execute(
+                        "DELETE FROM user_likes WHERE user_id = ? AND message_id = ?",
+                        (payload.user_id, row['message_id'])
+                    )
+            
             await db.commit()
 
     # --- 监听评论 (实时存库) ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
-        # 确保是在帖子(Thread)里
         if not isinstance(message.channel, discord.Thread): return
 
         if is_valid_comment(message.content):
-            # 记录 thread_id 作为 message_id 的关联
+            # 获取帖子ID (channel.id)
             thread_id = message.channel.id 
+            
+            # 我们需要把评论关联到该帖子下的所有保护记录 (Bot面板ID)
             async with get_db() as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", 
-                    (message.author.id, thread_id, message.content[:50]) 
-                )
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ?", (thread_id,))
+                rows = await cursor.fetchall()
+                
+                for row in rows:
+                    panel_msg_id = row['message_id']
+                    await db.execute(
+                        "INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", 
+                        (message.author.id, panel_msg_id, message.content[:50]) 
+                    )
                 await db.commit()
 
-    # --- 管理命令组 ---
+    # ... (管理命令组，保持不变) ...
 
     @admin_group.command(name="修复面板", description="刷新本频道所有旧面板")
     async def fix_panels(self, interaction: discord.Interaction):
