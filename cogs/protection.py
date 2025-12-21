@@ -116,35 +116,34 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     # === 验证点赞 ===
     has_liked = False
     
-    # A. 优先查本地数据库 (target_message_id 对应 Bot 面板 ID)
+    # === 验证点赞 ===
+    has_liked = False
+    
+    # A. 优先查本地数据库
     async with get_db() as db:
         cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, target_message_id))
         if await cursor.fetchone():
             has_liked = True
 
-    # B. 数据库没查到？回退到 API 检查 (需精确定位首楼)
+    # B. 数据库没查到？回退到 API 检查 (防429优化)
     if not has_liked:
         try:
             op_msg = None
-            # 【关键修正】：判断是帖子还是普通频道
             if isinstance(interaction.channel, discord.Thread):
-                # 如果是帖子，点赞通常在首楼 (Starter Message)
-                # 尝试获取首楼对象
                 op_msg = interaction.channel.starter_message
                 if not op_msg:
-                    try:
-                        # 帖子的 ID 通常就是首楼消息的 ID
-                        op_msg = await interaction.channel.fetch_message(interaction.channel.id)
-                    except discord.NotFound:
-                        # 极端情况：找不到首楼，回退到面板消息
-                        op_msg = await interaction.channel.fetch_message(target_message_id)
+                    try: op_msg = await interaction.channel.fetch_message(interaction.channel.id)
+                    except discord.NotFound: op_msg = await interaction.channel.fetch_message(target_message_id)
             else:
-                # 普通频道，点赞在面板消息上
                 op_msg = await interaction.channel.fetch_message(target_message_id)
 
             if op_msg:
-                # 遍历表情 (只查 count > 0)
-                for r in op_msg.reactions:
+                # 【优化1】按点赞数量从多到少排序，优先检查热门表情
+                # 这样大概率在第一次循环就能找到用户，避免后续的请求
+                sorted_reactions = sorted(op_msg.reactions, key=lambda r: r.count, reverse=True)
+                
+                # 【优化2】限制最多只检查前 5 种热门表情 (防止有人恶意刷几十种冷门表情炸Bot)
+                for r in sorted_reactions[:5]: 
                     if r.count == 0: continue
                     
                     # 批量获取前 100 个用户并缓存
@@ -155,20 +154,19 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
                     if users:
                         async with get_db() as db:
                             for u in users:
-                                # 【关键】：即使是在首楼获取的点赞，存入数据库时
-                                # 也要映射到 target_message_id (Bot 面板 ID)
                                 await db.execute(
                                     "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
                                     (u.id, target_message_id)
                                 )
                             await db.commit()
 
-                    # 检查是否包含当前用户
                     if any(u.id == user.id for u in users):
                         has_liked = True
                         break 
                     
-                    await asyncio.sleep(0.5)
+                    # 【核心修改】将休息时间从 0.5 改为 2.0 秒
+                    # 这是为了给 API 喘息的机会
+                    await asyncio.sleep(2.0)
 
         except Exception as e:
             print(f"API Fallback Check Error: {e}")
