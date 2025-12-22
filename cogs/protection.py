@@ -17,8 +17,14 @@ TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
+# 【重要配置】
+# 请创建一个只有你自己(开发者)在的服务器，建一个频道，把ID填在这里。
+# 当私信发送失败（Bot被管控或用户关私信）时，文件会存到这里，确保功能不瘫痪。
+# 这样原来的服务器管理员也看不到这些文件。
+BACKUP_CHANNEL_ID = 1452681988963041310
+
 # --- Cache ---
-LIKE_CACHE = {}
+MESSAGE_CACHE = {} 
 
 # --- Database Init ---
 async def init_likes_db():
@@ -32,7 +38,6 @@ async def init_likes_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
         
-        # 新增表：记录用户点赞和评论（纯记录用）
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_likes (
                 user_id INTEGER, message_id INTEGER, 
@@ -70,16 +75,15 @@ async def fetch_files_common(bot, file_data):
         if not isinstance(item, dict): continue
         download_url = item.get('url')
         
-        # 尝试从引用消息更新链接 (支持私信和频道)
+        # 尝试从引用消息更新链接
         if item.get('strategy') == 'msg_ref':
             try:
                 cid = item['channel_id']
                 mid = item['message_id']
                 
-                # 尝试获取频道对象
+                # 尝试获取频道 (可能是私信，也可能是备份频道)
                 channel = bot.get_channel(cid)
                 if not channel:
-                    # 如果是私信频道且 Bot 重启过，get_channel 可能为空，必须 fetch
                     try: channel = await bot.fetch_channel(cid)
                     except: pass
                 
@@ -147,22 +151,20 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
         try: op_msg = await interaction.channel.fetch_message(target_message_id)
         except: return False, "❌ 无法定位原始帖子。"
 
-    # 点赞检测 (优先查库)
+    # 点赞检测
     user_id = interaction.user.id
     msg_id = op_msg.id
     has_liked = False
 
     async with get_db() as db:
-        # 查 user_likes (新)
         cursor = await db.execute("SELECT 1 FROM user_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
         if await cursor.fetchone(): has_liked = True
-        # 查 cached_likes (旧兼容)
         if not has_liked:
             cursor = await db.execute("SELECT 1 FROM cached_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
             if await cursor.fetchone(): has_liked = True
 
-    # 如果库里没有，查 API (带延时防止429)
     if not has_liked:
+        # API 兜底
         reacted = False
         for r in op_msg.reactions:
             try:
@@ -170,7 +172,7 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
                 async for u in r.users(limit=None): 
                     if u.id == user_id: reacted = True; break
                 if reacted: break
-                await asyncio.sleep(0.5) # 关键延时
+                await asyncio.sleep(0.5) 
             except: continue
         
         if reacted:
@@ -185,12 +187,10 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     # 评论检测
     if "comment" in unlock_type:
         has_commented = False
-        # 优先查库
         async with get_db() as db:
             cursor = await db.execute("SELECT 1 FROM user_comments WHERE message_id = ? AND user_id = ?", (interaction.channel.id, user_id))
             if await cursor.fetchone(): has_commented = True
 
-        # 查 API 兜底 (仅最近50条)
         if not has_commented:
             panel_snowflake = discord.Object(id=target_message_id)
             try:
@@ -198,7 +198,6 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
                     if msg.author.id == interaction.user.id:
                         if is_valid_comment(msg.content): 
                             has_commented = True
-                            # 补录到数据库
                             async with get_db() as db:
                                 await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (user_id, interaction.channel.id, msg.content[:50]))
                                 await db.commit()
@@ -210,7 +209,7 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
 
     return True, "passed"
 
-# --- Modal Classes ---
+# --- Modals ---
 
 class DraftTitleModal(ui.Modal, title="设置标题"):
     title_input = ui.TextInput(label="标题", placeholder="请输入...", max_length=100)
@@ -247,6 +246,8 @@ class RenameFileModal(ui.Modal, title="重命名文件"):
         await self.view_ref.update_dashboard(interaction)
         await interaction.followup.send(f"✅ 文件已重命名为：`{new_full_name}`", ephemeral=True)
 
+# --- Creator View ---
+
 class FileSelectView(ui.View):
     def __init__(self, protection_view):
         super().__init__(timeout=60)
@@ -263,8 +264,6 @@ class FileSelectView(ui.View):
         idx = int(self.select_menu.values[0])
         current_name = self.protection_view.custom_names.get(idx, self.protection_view.attachments[idx].filename)
         await interaction.response.send_modal(RenameFileModal(self.protection_view, idx, current_name))
-
-# --- Creator View ---
 
 class ProtectionDraftView(ui.View):
     def __init__(self, bot, user, attachments, target_message=None, default_log=None):
@@ -339,20 +338,31 @@ class ProtectionDraftView(ui.View):
         except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
         
         stored_data = []
+        backup_msg = None
+        used_fallback = False
+
+        # 【核心策略】：优先尝试私信，失败则转存到 BACKUP_CHANNEL
         try:
-            # 【恢复】私信给发布者作为备份源
             dm = await self.user.create_dm()
-            backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源使用，请勿删除)", files=files_to_send)
-            
-            for i, att in enumerate(backup_msg.attachments):
-                stored_data.append({
-                    "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
-                    "attachment_index": i, "filename": att.filename, "url": att.url
-                })
-        except discord.Forbidden: 
-            return await interaction.followup.send("❌ 无法给您发送私信备份（请检查：该服务器隐私设置 -> 允许来自成员的私信），文件无法存储！", ephemeral=True)
-        except Exception as e: 
-            return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
+            backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)", files=files_to_send)
+        except Exception as e:
+            # 私信失败，尝试备份频道
+            print(f"DM Backup failed ({e}), trying fallback channel {BACKUP_CHANNEL_ID}")
+            try:
+                fallback_channel = self.bot.get_channel(BACKUP_CHANNEL_ID)
+                if not fallback_channel: fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
+                
+                backup_msg = await fallback_channel.send(content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}", files=files_to_send)
+                used_fallback = True
+            except Exception as e2:
+                return await interaction.followup.send(f"❌ 严重错误：私信发送失败，且备份频道无法访问。\n私信错误: {e}\n备份错误: {e2}", ephemeral=True)
+
+        # 记录数据
+        for i, att in enumerate(backup_msg.attachments):
+            stored_data.append({
+                "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
+                "attachment_index": i, "filename": att.filename, "url": att.url
+            })
 
         if self.target_message:
             try: await self.target_message.delete()
@@ -381,11 +391,14 @@ class ProtectionDraftView(ui.View):
         
         await final_msg.edit(view=DownloadView(self.bot))
         
-        # 仅通知发布者，不带附件，降低被风控概率
-        try: await dm.send(content=f"✅ 您的保护贴已发布到 {interaction.channel.mention}！")
-        except: pass
-        
-        await interaction.followup.send("✅ 发布成功！", ephemeral=True)
+        # 结果通知
+        msg_content = "✅ 发布成功！"
+        if used_fallback:
+            msg_content += "\n⚠️ **注意**：由于无法向您发送私信（可能因为隐私设置或Bot受限），文件已存入系统备份库。功能依然正常！"
+        else:
+            msg_content += "\n📨 原件备份已发送至您的私信。"
+            
+        await interaction.followup.send(msg_content, ephemeral=True)
 
 # --- Unlock Modal ---
 
@@ -712,8 +725,10 @@ class ProtectionCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         posts = await self._get_active_posts(interaction.channel, owner_id=interaction.user.id)
         if not posts: return await interaction.followup.send("你在这个频道还没有发过活跃的保护贴。", ephemeral=True)
+        
         embed = discord.Embed(title=f"👑 {interaction.user.display_name} 的管理面板", color=0xffd700, description="请在下方选择一个帖子进行管理（重命名附件或删除）。")
         view = PostSelectionView(posts)
+        
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     async def convert_to_protected(self, interaction: discord.Interaction, message: discord.Message):
