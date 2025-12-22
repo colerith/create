@@ -21,7 +21,7 @@ TEST_ROLE_ID = 1402290127627091979
 # 请创建一个只有你自己(开发者)在的服务器，建一个频道，把ID填在这里。
 # 当私信发送失败（Bot被管控或用户关私信）时，文件会存到这里，确保功能不瘫痪。
 # 这样原来的服务器管理员也看不到这些文件。
-BACKUP_CHANNEL_ID = 1452681988963041310
+BACKUP_CHANNEL_ID = 1452683440699867360
 
 # --- Cache ---
 MESSAGE_CACHE = {} 
@@ -751,3 +751,4 @@ class ProtectionCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(ProtectionCog(bot))
+
