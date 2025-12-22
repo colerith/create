@@ -17,9 +17,8 @@ TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
-# 【重要配置】
-# 当私信发送失败时，文件会存到这里。
-BACKUP_CHANNEL_ID = 1452683440699867360 
+# 【重要配置】备份频道ID (当私信失败时使用)
+BACKUP_CHANNEL_ID = 1452683440699867360
 
 # --- Cache ---
 MESSAGE_CACHE = {} 
@@ -27,6 +26,7 @@ MESSAGE_CACHE = {}
 # --- Database Init ---
 async def init_likes_db():
     async with get_db() as db:
+        # 兼容旧表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cached_likes (
                 message_id INTEGER,
@@ -36,6 +36,7 @@ async def init_likes_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
         
+        # 新逻辑核心表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_likes (
                 user_id INTEGER, message_id INTEGER, 
@@ -65,36 +66,44 @@ def is_valid_comment(content: str) -> bool:
 # --- Shared Logic Helpers ---
 
 async def fetch_files_common(bot, file_data):
-    """通用文件下载逻辑"""
+    """
+    通用文件下载逻辑
+    注意：这里必须保留最小限度的 fetch_message 以获取最新的文件 URL (因为旧 URL 会过期)
+    但不再进行遍历操作，且仅针对特定 Message ID
+    """
     results = []
     if not isinstance(file_data, list): return []
 
-    fetched_messages = {}
+    fetched_messages = {} # 内存缓存，避免同一次操作重复请求同一条消息
 
     for item in file_data:
         if not isinstance(item, dict): continue
         download_url = item.get('url')
         
-        # 尝试刷新 URL
+        # 尝试刷新 URL (仅当策略为 msg_ref 时)
         if item.get('strategy') == 'msg_ref':
-            try:
-                cid = item['channel_id']
-                mid = item['message_id']
+            cid = item.get('channel_id')
+            mid = item.get('message_id')
+            idx = item.get('attachment_index', 0)
+            
+            if cid and mid:
+                msg = fetched_messages.get((cid, mid))
+                if not msg:
+                    try:
+                        # 优先缓存
+                        channel = bot.get_channel(cid)
+                        if not channel: 
+                            try: channel = await bot.fetch_channel(cid)
+                            except: pass # 忽略无法获取的频道
+                        
+                        if channel:
+                            msg = await channel.fetch_message(mid)
+                            fetched_messages[(cid, mid)] = msg
+                    except Exception:
+                        pass # 失败则使用旧 URL
                 
-                # 尝试获取频道
-                channel = bot.get_channel(cid)
-                if not channel:
-                    try: channel = await bot.fetch_channel(cid)
-                    except: pass
-                
-                if channel:
-                    msg = await channel.fetch_message(mid)
-                    fetched_messages[(cid, mid)] = msg # 缓存一下
-                    idx = item.get('attachment_index', 0)
-                    if 0 <= idx < len(msg.attachments):
-                        download_url = msg.attachments[idx].url
-            except Exception as e:
-                print(f"Refresh URL failed: {e}")
+                if msg and 0 <= idx < len(msg.attachments):
+                    download_url = msg.attachments[idx].url
 
         if not download_url: continue
 
@@ -103,10 +112,10 @@ async def fetch_files_common(bot, file_data):
                 if resp.status == 200:
                     data = await resp.read()
                     if len(data) > 0:
-                        # 注意：这里我们使用数据库里存好的 item['filename'] (中文名)
-                        # 而不是从 URL 或 header 里读取名字
                         results.append({'filename': item.get('filename', 'unknown'), 'bytes': data})
-        except Exception as e: print(f"DL Error: {e}")
+        except Exception as e: 
+            print(f"DL Error: {e}")
+            
     return results
 
 def make_discord_files_common(file_results):
@@ -125,7 +134,9 @@ async def record_download_common(user, item_row):
             await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
     asyncio.create_task(_update())
 
-async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
+# --- 【核心修改】严格的 DB 验证逻辑 (无 API 调用) ---
+
+async def check_requirements_common(interaction, unlock_type, owner_id, panel_message_id):
     user = interaction.user
     
     # 1. 身份特权
@@ -142,76 +153,51 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     if cnt >= DAILY_DOWNLOAD_LIMIT:
         return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # 3. 定位首楼
-    op_msg = None
+    # 3. 点赞检测 (纯 DB)
+    # 确定要检查的目标 Message ID
+    # 如果是在帖子(Thread)里，通常点赞对象是首楼。Discord中首楼ID == Thread ID。
+    # 如果是在普通频道，点赞对象是面板消息 ID (panel_message_id)
+    
+    target_check_id = panel_message_id
     if isinstance(interaction.channel, discord.Thread):
-        try:
-            if interaction.channel.starter_message: op_msg = interaction.channel.starter_message
-            else:
-                async for msg in interaction.channel.history(limit=1, oldest_first=True): op_msg = msg; break
-        except: pass
+        target_check_id = interaction.channel.id 
 
-    if not op_msg:
-        try: op_msg = await interaction.channel.fetch_message(target_message_id)
-        except: return False, "❌ 无法定位原始帖子。"
-
-    # 4. 点赞检测
-    user_id = interaction.user.id
-    msg_id = op_msg.id
     has_liked = False
-
     async with get_db() as db:
-        cursor = await db.execute("SELECT 1 FROM user_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
+        # 查新表
+        cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
         if await cursor.fetchone(): has_liked = True
+        
+        # 查旧表 (兼容)
         if not has_liked:
-            cursor = await db.execute("SELECT 1 FROM cached_likes WHERE message_id = ? AND user_id = ?", (msg_id, user_id))
+            cursor = await db.execute("SELECT 1 FROM cached_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
             if await cursor.fetchone(): has_liked = True
 
     if not has_liked:
-        # API 兜底
-        reacted = False
-        for r in op_msg.reactions:
-            try:
-                if r.count == 0: continue
-                async for u in r.users(limit=None): 
-                    if u.id == user_id: reacted = True; break
-                if reacted: break
-                await asyncio.sleep(0.5) 
-            except: continue
-        
-        if reacted:
-            has_liked = True
-            async with get_db() as db:
-                await db.execute("INSERT OR IGNORE INTO user_likes (message_id, user_id) VALUES (?, ?)", (msg_id, user_id))
-                await db.commit()
+        jump_url = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{target_check_id}"
+        return False, (
+            f"🛑 **数据库未找到点赞记录！**\n"
+            f"请跳转到 **[帖子首楼]({jump_url})** 点个赞 👍。\n"
+            f"⚠️ **重要提示**：如果您已经点了赞但Bot没反应，**请取消点赞，然后重新点一次**，系统即可秒级记录。"
+        )
 
-    if not has_liked:
-        return False, f"🛑 您还没点赞呢！\n请跳转到 **[帖子首楼]({op_msg.jump_url})** 点个赞吧！👍"
-
-    # 5. 评论检测
+    # 4. 评论检测 (纯 DB)
     if "comment" in unlock_type:
         has_commented = False
-        # 优先查库
+        # 评论通常是在当前频道/帖子内
+        current_thread_id = interaction.channel.id
+        
         async with get_db() as db:
-            cursor = await db.execute("SELECT 1 FROM user_comments WHERE message_id = ? AND user_id = ?", (interaction.channel.id, user_id))
+            # 只要在这个频道发过被记录的评论即可
+            cursor = await db.execute("SELECT 1 FROM user_comments WHERE user_id = ? AND message_id = ?", (user.id, current_thread_id))
             if await cursor.fetchone(): has_commented = True
-
-        # 查 API 兜底
-        if not has_commented:
-            panel_snowflake = discord.Object(id=target_message_id)
-            try:
-                async for msg in interaction.channel.history(after=panel_snowflake, limit=50):
-                    if msg.author.id == interaction.user.id:
-                        if is_valid_comment(msg.content): 
-                            has_commented = True
-                            async with get_db() as db:
-                                await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (user_id, interaction.channel.id, msg.content[:50]))
-                                await db.commit()
-                            break
-            except: pass
         
         if not has_commented:
-            return False, "💬 **评论未达标！**\n请在 **本下载面板下方** 发送一条有意义的评论（>5字，禁纯水）。"
+            return False, (
+                "💬 **数据库未找到评论记录！**\n"
+                "请在当前帖子内发送一条有意义的评论（>5字，禁纯水）。\n"
+                "⚠️ **注意**：Bot 不会读取历史消息。如果您之前评论过但没被记录，请**重新发一条**。"
+            )
 
     return True, "passed"
 
@@ -338,50 +324,30 @@ class ProtectionDraftView(ui.View):
         try:
             for idx, att in enumerate(self.attachments): 
                 file_bytes = await att.read()
-                # 优先使用用户设置的自定义文件名
                 final_filename = self.custom_names.get(idx, att.filename)
-                
                 f = discord.File(io.BytesIO(file_bytes), filename=final_filename)
                 files_to_send.append(f)
         except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
         
         stored_data = []
-        backup_msg = None
-        used_fallback = False
-
-        # 【核心逻辑】：优先私信，失败则转存到 BACKUP_CHANNEL
         try:
-            dm = await self.user.create_dm()
-            backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)", files=files_to_send)
-        except Exception as e:
-            # 私信失败，尝试备份频道
-            print(f"DM Backup failed ({e}), trying fallback channel {BACKUP_CHANNEL_ID}")
+            # 优先私信，失败转存备份频道
             try:
+                dm = await self.user.create_dm()
+                backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)", files=files_to_send)
+            except:
+                # Fallback
                 fallback_channel = self.bot.get_channel(BACKUP_CHANNEL_ID)
                 if not fallback_channel: fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
-                
                 backup_msg = await fallback_channel.send(content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}", files=files_to_send)
-                used_fallback = True
-            except Exception as e2:
-                return await interaction.followup.send(f"❌ 严重错误：私信发送失败，且备份频道无法访问。\n私信错误: {e}\n备份错误: {e2}", ephemeral=True)
-
-        # 记录数据
-        for i, att in enumerate(backup_msg.attachments):
-            # 【关键修改】：这里我们要存入数据库的是“真正想要显示的文件名”
-            # 即用户在面板里改过的名字 (self.custom_names)
-            # 或者原始文件的名字 (self.attachments[i].filename)
-            # 绝对不能用 att.filename，因为那是被 Discord 乱码化过的
             
-            real_display_name = self.custom_names.get(i, self.attachments[i].filename)
-            
-            stored_data.append({
-                "strategy": "msg_ref", 
-                "channel_id": backup_msg.channel.id, 
-                "message_id": backup_msg.id,
-                "attachment_index": i, 
-                "filename": real_display_name, # 使用正确的中文名
-                "url": att.url
-            })
+            for i, att in enumerate(backup_msg.attachments):
+                real_display_name = self.custom_names.get(i, self.attachments[i].filename)
+                stored_data.append({
+                    "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
+                    "attachment_index": i, "filename": real_display_name, "url": att.url
+                })
+        except Exception as e: return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
 
         if self.target_message:
             try: await self.target_message.delete()
@@ -410,13 +376,7 @@ class ProtectionDraftView(ui.View):
         
         await final_msg.edit(view=DownloadView(self.bot))
         
-        msg_content = "✅ 发布成功！"
-        if used_fallback:
-            msg_content += "\n⚠️ **注意**：由于无法向您发送私信，文件已自动转存至备份库。"
-        else:
-            msg_content += "\n📨 原件备份已发送至您的私信。"
-            
-        await interaction.followup.send(msg_content, ephemeral=True)
+        await interaction.followup.send("✅ 发布成功！", ephemeral=True)
 
 # --- Unlock Modal ---
 
@@ -743,10 +703,8 @@ class ProtectionCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         posts = await self._get_active_posts(interaction.channel, owner_id=interaction.user.id)
         if not posts: return await interaction.followup.send("你在这个频道还没有发过活跃的保护贴。", ephemeral=True)
-        
         embed = discord.Embed(title=f"👑 {interaction.user.display_name} 的管理面板", color=0xffd700, description="请在下方选择一个帖子进行管理（重命名附件或删除）。")
         view = PostSelectionView(posts)
-        
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     async def convert_to_protected(self, interaction: discord.Interaction, message: discord.Message):
