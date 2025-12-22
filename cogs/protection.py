@@ -18,10 +18,8 @@ DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
 # 【重要配置】
-# 请创建一个只有你自己(开发者)在的服务器，建一个频道，把ID填在这里。
-# 当私信发送失败（Bot被管控或用户关私信）时，文件会存到这里，确保功能不瘫痪。
-# 这样原来的服务器管理员也看不到这些文件。
-BACKUP_CHANNEL_ID = 1452683440699867360
+# 当私信发送失败时，文件会存到这里。
+BACKUP_CHANNEL_ID = 1452683440699867360 
 
 # --- Cache ---
 MESSAGE_CACHE = {} 
@@ -71,17 +69,19 @@ async def fetch_files_common(bot, file_data):
     results = []
     if not isinstance(file_data, list): return []
 
+    fetched_messages = {}
+
     for item in file_data:
         if not isinstance(item, dict): continue
         download_url = item.get('url')
         
-        # 尝试从引用消息更新链接
+        # 尝试刷新 URL
         if item.get('strategy') == 'msg_ref':
             try:
                 cid = item['channel_id']
                 mid = item['message_id']
                 
-                # 尝试获取频道 (可能是私信，也可能是备份频道)
+                # 尝试获取频道
                 channel = bot.get_channel(cid)
                 if not channel:
                     try: channel = await bot.fetch_channel(cid)
@@ -89,11 +89,11 @@ async def fetch_files_common(bot, file_data):
                 
                 if channel:
                     msg = await channel.fetch_message(mid)
+                    fetched_messages[(cid, mid)] = msg # 缓存一下
                     idx = item.get('attachment_index', 0)
                     if 0 <= idx < len(msg.attachments):
                         download_url = msg.attachments[idx].url
             except Exception as e:
-                # 即使刷新失败，也尝试使用旧 URL 下载
                 print(f"Refresh URL failed: {e}")
 
         if not download_url: continue
@@ -103,6 +103,8 @@ async def fetch_files_common(bot, file_data):
                 if resp.status == 200:
                     data = await resp.read()
                     if len(data) > 0:
+                        # 注意：这里我们使用数据库里存好的 item['filename'] (中文名)
+                        # 而不是从 URL 或 header 里读取名字
                         results.append({'filename': item.get('filename', 'unknown'), 'bytes': data})
         except Exception as e: print(f"DL Error: {e}")
     return results
@@ -110,7 +112,6 @@ async def fetch_files_common(bot, file_data):
 def make_discord_files_common(file_results):
     return [discord.File(io.BytesIO(res['bytes']), filename=res['filename']) for res in file_results]
 
-# 下载时不需要发私信，只在频道发
 async def record_download_common(user, item_row):
     async def _update():
         async with get_db() as db:
@@ -125,20 +126,23 @@ async def record_download_common(user, item_row):
     asyncio.create_task(_update())
 
 async def check_requirements_common(interaction, unlock_type, owner_id, target_message_id):
-    """通用验证逻辑"""
-    has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
-    is_owner = (interaction.user.id == owner_id)
+    user = interaction.user
+    
+    # 1. 身份特权
+    has_test_role = isinstance(user, discord.Member) and user.get_role(TEST_ROLE_ID)
+    is_owner = (user.id == owner_id)
     if is_owner and has_test_role: is_owner = False 
     if is_owner: return True, "owner"
 
-    today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    # 2. 频率限制
+    today_start = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with get_db() as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
-        download_count = (await cursor.fetchone())[0]
-    if download_count >= DAILY_DOWNLOAD_LIMIT:
+        cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (user.id, today_start))
+        cnt = (await cursor.fetchone())[0]
+    if cnt >= DAILY_DOWNLOAD_LIMIT:
         return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # 定位首楼
+    # 3. 定位首楼
     op_msg = None
     if isinstance(interaction.channel, discord.Thread):
         try:
@@ -151,7 +155,7 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
         try: op_msg = await interaction.channel.fetch_message(target_message_id)
         except: return False, "❌ 无法定位原始帖子。"
 
-    # 点赞检测
+    # 4. 点赞检测
     user_id = interaction.user.id
     msg_id = op_msg.id
     has_liked = False
@@ -184,13 +188,15 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
     if not has_liked:
         return False, f"🛑 您还没点赞呢！\n请跳转到 **[帖子首楼]({op_msg.jump_url})** 点个赞吧！👍"
 
-    # 评论检测
+    # 5. 评论检测
     if "comment" in unlock_type:
         has_commented = False
+        # 优先查库
         async with get_db() as db:
             cursor = await db.execute("SELECT 1 FROM user_comments WHERE message_id = ? AND user_id = ?", (interaction.channel.id, user_id))
             if await cursor.fetchone(): has_commented = True
 
+        # 查 API 兜底
         if not has_commented:
             panel_snowflake = discord.Object(id=target_message_id)
             try:
@@ -209,7 +215,7 @@ async def check_requirements_common(interaction, unlock_type, owner_id, target_m
 
     return True, "passed"
 
-# --- Modals ---
+# --- Modal Classes ---
 
 class DraftTitleModal(ui.Modal, title="设置标题"):
     title_input = ui.TextInput(label="标题", placeholder="请输入...", max_length=100)
@@ -332,7 +338,9 @@ class ProtectionDraftView(ui.View):
         try:
             for idx, att in enumerate(self.attachments): 
                 file_bytes = await att.read()
+                # 优先使用用户设置的自定义文件名
                 final_filename = self.custom_names.get(idx, att.filename)
+                
                 f = discord.File(io.BytesIO(file_bytes), filename=final_filename)
                 files_to_send.append(f)
         except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
@@ -341,7 +349,7 @@ class ProtectionDraftView(ui.View):
         backup_msg = None
         used_fallback = False
 
-        # 【核心策略】：优先尝试私信，失败则转存到 BACKUP_CHANNEL
+        # 【核心逻辑】：优先私信，失败则转存到 BACKUP_CHANNEL
         try:
             dm = await self.user.create_dm()
             backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)", files=files_to_send)
@@ -359,9 +367,20 @@ class ProtectionDraftView(ui.View):
 
         # 记录数据
         for i, att in enumerate(backup_msg.attachments):
+            # 【关键修改】：这里我们要存入数据库的是“真正想要显示的文件名”
+            # 即用户在面板里改过的名字 (self.custom_names)
+            # 或者原始文件的名字 (self.attachments[i].filename)
+            # 绝对不能用 att.filename，因为那是被 Discord 乱码化过的
+            
+            real_display_name = self.custom_names.get(i, self.attachments[i].filename)
+            
             stored_data.append({
-                "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
-                "attachment_index": i, "filename": att.filename, "url": att.url
+                "strategy": "msg_ref", 
+                "channel_id": backup_msg.channel.id, 
+                "message_id": backup_msg.id,
+                "attachment_index": i, 
+                "filename": real_display_name, # 使用正确的中文名
+                "url": att.url
             })
 
         if self.target_message:
@@ -391,10 +410,9 @@ class ProtectionDraftView(ui.View):
         
         await final_msg.edit(view=DownloadView(self.bot))
         
-        # 结果通知
         msg_content = "✅ 发布成功！"
         if used_fallback:
-            msg_content += "\n⚠️ **注意**：由于无法向您发送私信（可能因为隐私设置或Bot受限），文件已存入系统备份库。功能依然正常！"
+            msg_content += "\n⚠️ **注意**：由于无法向您发送私信，文件已自动转存至备份库。"
         else:
             msg_content += "\n📨 原件备份已发送至您的私信。"
             
@@ -751,4 +769,3 @@ class ProtectionCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(ProtectionCog(bot))
-
