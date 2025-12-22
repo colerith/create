@@ -1,5 +1,3 @@
-# protection.py
-
 import discord
 from discord import app_commands, ui
 from discord.ext import commands
@@ -10,6 +8,7 @@ import re
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 import aiosqlite
 
 from database import get_db
@@ -17,6 +16,36 @@ from database import get_db
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
+
+# --- Database Init (Updated) ---
+async def init_likes_db():
+    async with get_db() as db:
+        # 1. 缓存点赞表 (Cached Likes) - 兼容旧逻辑
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cached_likes (
+                message_id INTEGER, user_id INTEGER, PRIMARY KEY (message_id, user_id)
+            )
+        """)
+        
+        # 2. 用户点赞表 (User Likes) - 新逻辑核心
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_likes (
+                user_id INTEGER, message_id INTEGER, 
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, message_id)
+            )
+        """)
+        
+        # 3. 用户评论表 (User Comments) - 新逻辑核心
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_comments (
+                user_id INTEGER, message_id INTEGER, content TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, message_id)
+            )
+        """)
+        
+        await db.commit()
 
 # --- Helper: Comment Validator ---
 def is_valid_comment(content: str) -> bool:
@@ -36,12 +65,14 @@ async def fetch_files_common(bot, file_data):
     """通用文件下载逻辑"""
     results = []
     if not isinstance(file_data, list): return []
+
     fetched_messages = {}
 
     for item in file_data:
         if not isinstance(item, dict): continue
         download_url = item.get('url')
         
+        # 尝试刷新 URL
         if item.get('strategy') == 'msg_ref':
             cid = item.get('channel_id')
             mid = item.get('message_id')
@@ -51,12 +82,20 @@ async def fetch_files_common(bot, file_data):
                 msg = fetched_messages.get((cid, mid))
                 if not msg:
                     try:
+                        # 尝试获取频道 (可能是服务器频道，也可能是私信频道)
                         channel = bot.get_channel(cid)
-                        if not channel: channel = await bot.fetch_channel(cid)
-                        msg = await channel.fetch_message(mid)
-                        fetched_messages[(cid, mid)] = msg
-                    except Exception as e:
-                        print(f"Failed to refresh URL ref: {e}")
+                        if not channel: 
+                            try: channel = await bot.fetch_channel(cid)
+                            except: 
+                                # 如果是私信频道且 bot 重启过，fetch_channel 可能失败
+                                # 这里尝试通过 fetch_user -> create_dm 曲线救国 (仅当知道是 DM 时)
+                                pass 
+                        
+                        if channel:
+                            msg = await channel.fetch_message(mid)
+                            fetched_messages[(cid, mid)] = msg
+                    except Exception:
+                        pass # 失败则使用旧 URL
                 
                 if msg and 0 <= idx < len(msg.attachments):
                     download_url = msg.attachments[idx].url
@@ -77,6 +116,8 @@ async def fetch_files_common(bot, file_data):
 def make_discord_files_common(file_results):
     return [discord.File(io.BytesIO(res['bytes']), filename=res['filename']) for res in file_results]
 
+# 注意：这里我们移除了 send_dm_backup_common，因为你不希望下载时私发备份
+
 async def record_download_common(user, item_row):
     async def _update():
         async with get_db() as db:
@@ -90,9 +131,10 @@ async def record_download_common(user, item_row):
             await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
     asyncio.create_task(_update())
 
-# --- 核心验证逻辑 (完全无API，查首楼ID) ---
-
 async def check_requirements_common(interaction, unlock_type, owner_id, panel_message_id):
+    """
+    通用验证逻辑 (数据库优先，无 API 滥用)
+    """
     user = interaction.user
     
     # 1. 身份特权
@@ -105,55 +147,49 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
     today_start = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (user.id, today_start))
-        if (await cursor.fetchone())[0] >= DAILY_DOWNLOAD_LIMIT:
-            return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
+        cnt = (await cursor.fetchone())[0]
+    
+    if cnt >= DAILY_DOWNLOAD_LIMIT:
+        return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # === 3. 验证点赞 ===
-    # 【核心逻辑变更】：
-    # 如果是在帖子里，我们要查的是“用户有没有赞 interaction.channel.id”
-    # 如果是在普通频道，我们要查的是“用户有没有赞 panel_message_id”
-    
-    check_target_id = panel_message_id
+    # 3. 点赞检测
+    # 如果是在论坛帖子里，我们检查用户是否赞了“帖子首楼”(即 thread.id)
+    # 如果是在普通频道，我们检查用户是否赞了“面板消息”(即 panel_message_id)
+    target_check_id = panel_message_id
     if isinstance(interaction.channel, discord.Thread):
-        check_target_id = interaction.channel.id  # 帖子的 ID 就是首楼消息 ID
-    
+        target_check_id = interaction.channel.id # 帖子的 ID 本身就是 Start Message ID
+
     has_liked = False
     async with get_db() as db:
-        cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, check_target_id))
-        if await cursor.fetchone():
-            has_liked = True
+        # 查询 user_likes 表
+        cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
+        if await cursor.fetchone(): has_liked = True
+        
+        # 兼容旧表 cached_likes
+        if not has_liked:
+            cursor = await db.execute("SELECT 1 FROM cached_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
+            if await cursor.fetchone(): has_liked = True
 
     if not has_liked:
-        jump_target = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{check_target_id}"
-        
-        return False, (
-            f"🛑 **未检测到有效点赞！**\n"
-            f"请跳转到 **[帖子首楼]({jump_target})** 点个赞 👍。\n"
-            f"⚠️ **检测对象**：系统正在检查消息 ID `{check_target_id}` 的点赞记录。\n"
-            f"👉 如果您已经点了，请**取消再重新点一次**，系统即可秒级记录。"
-        )
+        jump_url = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{target_check_id}"
+        return False, f"🛑 **未检测到点赞！**\n请跳转到 **[这里]({jump_url})** 点个赞 👍。\n(若已点赞，请**取消再重获**以刷新记录)"
 
-    # === 4. 验证评论 ===
+    # 4. 评论检测
     if "comment" in unlock_type:
         has_commented = False
-        
-        check_comment_target_id = interaction.channel.id if isinstance(interaction.channel, discord.Thread) else panel_message_id
+        # 评论通常是在当前频道/帖子内
+        current_thread_id = interaction.channel.id
         
         async with get_db() as db:
-            cursor = await db.execute("SELECT 1 FROM user_comments WHERE user_id = ? AND message_id = ?", (user.id, check_comment_target_id))
-            if await cursor.fetchone():
-                has_commented = True
+            cursor = await db.execute("SELECT 1 FROM user_comments WHERE user_id = ? AND message_id = ?", (user.id, current_thread_id))
+            if await cursor.fetchone(): has_commented = True
         
         if not has_commented:
-            return False, (
-                "💬 **评论未达标！**\n"
-                "请在 **本下载面板下方** 发送一条有意义的评论（>5字，禁纯水）。\n"
-                "⚠️ **提示**：如果是旧评论，系统可能未记录，请**发一条新评论**即可。"
-            )
+            return False, "💬 **未检测到评论！**\n请在当前帖子内发送一条有意义的评论（>5字，禁纯水）。\n(系统只记录新发送的评论)"
 
     return True, "passed"
 
-# --- Modal Classes ---
+# --- Modals ---
 
 class DraftTitleModal(ui.Modal, title="设置标题"):
     title_input = ui.TextInput(label="标题", placeholder="请输入...", max_length=100)
@@ -173,8 +209,6 @@ class DraftPasswordModal(ui.Modal, title="设置口令"):
         if not clean_pwd: return await i.response.send_message("口令不能为空！", ephemeral=True)
         self.view_ref.draft_password = clean_pwd; self.view_ref.draft_mode = self.next_mode; await self.view_ref.update_dashboard(i)
 
-# --- Renaming Logic ---
-
 class RenameFileModal(ui.Modal, title="重命名文件"):
     name_input = ui.TextInput(label="新文件名 (无需输入后缀)", placeholder="例如：我的汉化补丁", max_length=100)
     def __init__(self, view_ref, file_index, old_filename):
@@ -192,6 +226,8 @@ class RenameFileModal(ui.Modal, title="重命名文件"):
         await self.view_ref.update_dashboard(interaction)
         await interaction.followup.send(f"✅ 文件已重命名为：`{new_full_name}`", ephemeral=True)
 
+# --- Creator View ---
+
 class FileSelectView(ui.View):
     def __init__(self, protection_view):
         super().__init__(timeout=60)
@@ -208,8 +244,6 @@ class FileSelectView(ui.View):
         idx = int(self.select_menu.values[0])
         current_name = self.protection_view.custom_names.get(idx, self.protection_view.attachments[idx].filename)
         await interaction.response.send_modal(RenameFileModal(self.protection_view, idx, current_name))
-
-# --- Creator View (Draft) ---
 
 class ProtectionDraftView(ui.View):
     def __init__(self, bot, user, attachments, target_message=None, default_log=None):
@@ -285,16 +319,17 @@ class ProtectionDraftView(ui.View):
         
         stored_data = []
         try:
+            # 【恢复功能】发送到发布者的私信，作为备份
             dm = await self.user.create_dm()
-            backup_msg = await dm.send(content=f"【{self.draft_title}】的备份！\nID: {interaction.id}", files=files_to_send)
+            backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源使用)", files=files_to_send)
             
             for i, att in enumerate(backup_msg.attachments):
                 stored_data.append({
                     "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
                     "attachment_index": i, "filename": att.filename, "url": att.url
                 })
-        except discord.Forbidden: return await interaction.followup.send("无法私信备份（请开启私信权限）！", ephemeral=True)
-        except Exception as e: return await interaction.followup.send(f"备份失败：{e}", ephemeral=True)
+        except discord.Forbidden: return await interaction.followup.send("❌ 无法给您发送私信备份（请检查隐私设置），文件无法存储！", ephemeral=True)
+        except Exception as e: return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
 
         if self.target_message:
             try: await self.target_message.delete()
@@ -322,7 +357,8 @@ class ProtectionDraftView(ui.View):
             await db.commit()
         
         await final_msg.edit(view=DownloadView(self.bot))
-        await dm.send(content=f"保护贴已发布！\n跳转链接：{final_msg.jump_url}")
+        # 私信通知发布成功
+        await dm.send(content=f"✅ 您的保护贴已发布到 {interaction.channel.mention}！\n跳转链接：{final_msg.jump_url}")
         await interaction.followup.send("✅ 发布成功！", ephemeral=True)
 
 # --- Unlock Modal ---
@@ -486,6 +522,7 @@ class PostListView(ui.View):
                 cnt = (await cursor.fetchone())[0]
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
+                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
@@ -526,15 +563,28 @@ class DownloadView(ui.View):
                 cnt = (await cursor.fetchone())[0]
             if file_results:
                 await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
+                # 仅发送到频道
                 await record_download_common(interaction.user, row)
             else:
                 await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
+
+class DeleteConfirmView(ui.View):
+    def __init__(self, message_id): super().__init__(timeout=60); self.message_id = message_id
+    @ui.button(label="确认删除", style=discord.ButtonStyle.danger)
+    async def confirm(self, i: discord.Interaction, b: ui.Button):
+        async with get_db() as db: await db.execute("DELETE FROM protected_items WHERE message_id = ?", (self.message_id,)); await db.commit()
+        try: await (await i.channel.fetch_message(self.message_id)).delete()
+        except: pass
+        await i.response.edit_message(content="已删除！", view=None, embed=None)
+    @ui.button(label="取消", style=discord.ButtonStyle.secondary)
+    async def cancel(self, i: discord.Interaction, b: ui.Button): await i.response.edit_message(content="操作取消。", view=None, embed=None)
 
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.ctx_menu = app_commands.ContextMenu(name="转为保护附件", callback=self.convert_to_protected)
         self.bot.tree.add_command(self.ctx_menu)
+        self.bot.loop.create_task(init_likes_db())
 
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
     user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
@@ -559,45 +609,27 @@ class ProtectionCog(commands.Cog):
             async with get_db() as db: await db.executemany("DELETE FROM protected_items WHERE message_id = ?", [(i,) for i in ids_to_clean]); await db.commit()
         return active_posts
     
-    # --- 监听点赞 (纯记录) ---
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id == self.bot.user.id: return
-        
-        # 只记录“谁点了哪条消息”这个事实，不做任何逻辑判断或映射
         async with get_db() as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", 
-                (payload.user_id, payload.message_id)
-            )
+            await db.execute("INSERT OR IGNORE INTO user_likes (user_id, message_id) VALUES (?, ?)", (payload.user_id, payload.message_id))
             await db.commit()
 
-    # --- 监听取消点赞 ---
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         async with get_db() as db:
-            await db.execute(
-                "DELETE FROM user_likes WHERE user_id = ? AND message_id = ?", 
-                (payload.user_id, payload.message_id)
-            )
+            await db.execute("DELETE FROM user_likes WHERE user_id = ? AND message_id = ?", (payload.user_id, payload.message_id))
             await db.commit()
 
-    # --- 监听评论 (纯记录) ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
-        
-        # 只要是帖子里的有效评论，就记录“谁在哪个帖子(ID)里发了言”
         if isinstance(message.channel, discord.Thread) and is_valid_comment(message.content):
             thread_id = message.channel.id 
             async with get_db() as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", 
-                    (message.author.id, thread_id, message.content[:50]) 
-                )
+                await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (message.author.id, thread_id, message.content[:50]))
                 await db.commit()
-
-    # ... (管理命令组保持不变) ...
 
     @admin_group.command(name="修复面板", description="刷新本频道所有旧面板")
     async def fix_panels(self, interaction: discord.Interaction):
