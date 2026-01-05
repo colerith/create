@@ -4,7 +4,6 @@ import os
 from dotenv import load_dotenv
 import aiohttp
 
-from cogs.protection import DownloadView
 from database import init_db
 
 load_dotenv()
@@ -46,4 +45,5 @@ class ChimidanBot(commands.Bot):
 bot = ChimidanBot()
 
 if __name__ == "__main__":
+
     bot.run(TOKEN) 
