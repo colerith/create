@@ -17,16 +17,12 @@ TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 DAILY_DOWNLOAD_LIMIT = 50
 TEST_ROLE_ID = 1402290127627091979
 
-# 【重要配置】备份频道ID (当私信失败时使用)
+# 【重要配置】备份频道ID
 BACKUP_CHANNEL_ID = 1452683440699867360
-
-# --- Cache ---
-MESSAGE_CACHE = {} 
 
 # --- Database Init ---
 async def init_likes_db():
     async with get_db() as db:
-        # 兼容旧表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cached_likes (
                 message_id INTEGER,
@@ -36,7 +32,6 @@ async def init_likes_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_likes ON cached_likes (message_id, user_id)")
         
-        # 新逻辑核心表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_likes (
                 user_id INTEGER, message_id INTEGER, 
@@ -66,21 +61,14 @@ def is_valid_comment(content: str) -> bool:
 # --- Shared Logic Helpers ---
 
 async def fetch_files_common(bot, file_data):
-    """
-    通用文件下载逻辑
-    注意：这里必须保留最小限度的 fetch_message 以获取最新的文件 URL (因为旧 URL 会过期)
-    但不再进行遍历操作，且仅针对特定 Message ID
-    """
     results = []
     if not isinstance(file_data, list): return []
-
-    fetched_messages = {} # 内存缓存，避免同一次操作重复请求同一条消息
+    fetched_messages = {} 
 
     for item in file_data:
         if not isinstance(item, dict): continue
         download_url = item.get('url')
         
-        # 尝试刷新 URL (仅当策略为 msg_ref 时)
         if item.get('strategy') == 'msg_ref':
             cid = item.get('channel_id')
             mid = item.get('message_id')
@@ -90,17 +78,16 @@ async def fetch_files_common(bot, file_data):
                 msg = fetched_messages.get((cid, mid))
                 if not msg:
                     try:
-                        # 优先缓存
                         channel = bot.get_channel(cid)
                         if not channel: 
                             try: channel = await bot.fetch_channel(cid)
-                            except: pass # 忽略无法获取的频道
+                            except: pass 
                         
                         if channel:
                             msg = await channel.fetch_message(mid)
                             fetched_messages[(cid, mid)] = msg
                     except Exception:
-                        pass # 失败则使用旧 URL
+                        pass
                 
                 if msg and 0 <= idx < len(msg.attachments):
                     download_url = msg.attachments[idx].url
@@ -134,8 +121,6 @@ async def record_download_common(user, item_row):
             await db.execute("INSERT INTO download_log (user_id, message_id, title, filenames, timestamp) VALUES (?, ?, ?, ?, ?)", (user.id, message_id, item_row['title'], filenames, datetime.now(TZ_SHANGHAI).isoformat())); await db.commit()
     asyncio.create_task(_update())
 
-# --- 【核心修改】严格的 DB 验证逻辑 (无 API 调用) ---
-
 async def check_requirements_common(interaction, unlock_type, owner_id, panel_message_id):
     user = interaction.user
     
@@ -153,22 +138,16 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
     if cnt >= DAILY_DOWNLOAD_LIMIT:
         return False, f"⚠️ 您今日的下载次数已达上限（{DAILY_DOWNLOAD_LIMIT}/{DAILY_DOWNLOAD_LIMIT}）。"
 
-    # 3. 点赞检测 (纯 DB)
-    # 确定要检查的目标 Message ID
-    # 如果是在帖子(Thread)里，通常点赞对象是首楼。Discord中首楼ID == Thread ID。
-    # 如果是在普通频道，点赞对象是面板消息 ID (panel_message_id)
-    
+    # 3. 点赞检测
     target_check_id = panel_message_id
     if isinstance(interaction.channel, discord.Thread):
         target_check_id = interaction.channel.id 
 
     has_liked = False
     async with get_db() as db:
-        # 查新表
         cursor = await db.execute("SELECT 1 FROM user_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
         if await cursor.fetchone(): has_liked = True
         
-        # 查旧表 (兼容)
         if not has_liked:
             cursor = await db.execute("SELECT 1 FROM cached_likes WHERE user_id = ? AND message_id = ?", (user.id, target_check_id))
             if await cursor.fetchone(): has_liked = True
@@ -178,17 +157,15 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
         return False, (
             f"🛑 **数据库未找到点赞记录！**\n"
             f"请跳转到 **[帖子首楼]({jump_url})** 点个赞 👍。\n"
-            f"⚠️ **重要提示**：如果您已经点了赞但Bot没反应，**请取消点赞，然后重新点一次**，系统即可秒级记录。"
+            f"⚠️ **重要提示**：Bot不实时监听旧消息，如果没反应，**请取消点赞，然后重新点一次**，即可秒级记录。"
         )
 
-    # 4. 评论检测 (纯 DB)
+    # 4. 评论检测
     if "comment" in unlock_type:
         has_commented = False
-        # 评论通常是在当前频道/帖子内
         current_thread_id = interaction.channel.id
         
         async with get_db() as db:
-            # 只要在这个频道发过被记录的评论即可
             cursor = await db.execute("SELECT 1 FROM user_comments WHERE user_id = ? AND message_id = ?", (user.id, current_thread_id))
             if await cursor.fetchone(): has_commented = True
         
@@ -200,6 +177,85 @@ async def check_requirements_common(interaction, unlock_type, owner_id, panel_me
             )
 
     return True, "passed"
+
+# --- 【新增】Author Note & Delay View ---
+
+class AuthorNoteView(ui.View):
+    def __init__(self, bot, row):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.row = row
+        self.downloaded = False
+    
+    @ui.button(label="⏳ 请阅读说明 (5s)", style=discord.ButtonStyle.secondary, disabled=True)
+    async def btn_confirm(self, interaction: discord.Interaction, button: ui.Button):
+        if self.downloaded: return
+        self.downloaded = True
+        
+        # Disable button to prevent double clicks
+        button.disabled = True
+        button.label = "🚀 正在发送..."
+        await interaction.response.edit_message(view=self)
+        
+        # Download logic
+        try:
+            file_data = json.loads(self.row['storage_urls'])
+            file_results = await fetch_files_common(self.bot, file_data)
+            
+            # Record log
+            await record_download_common(interaction.user, self.row)
+            
+            if file_results:
+                # Calculate limit
+                today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                async with get_db() as db:
+                    cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
+                    cnt = (await cursor.fetchone())[0]
+                
+                # Send Files (Clean message, no Log)
+                await interaction.followup.send(
+                    content=f"✅ **获取成功！**\n今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}\n请查收下方附件：",
+                    files=make_discord_files_common(file_results),
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send("❌ 文件数据读取失败，请联系管理员。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 发生未知错误: {e}", ephemeral=True)
+
+async def start_download_flow(interaction: discord.Interaction, bot, row):
+    """
+    通用下载流程控制：
+    1. 显示作者提示 Embed
+    2. 等待 5 秒
+    3. 启用按钮供用户点击下载
+    """
+    author_note = row['log'] if row['log'] else "（作者未留下额外说明）"
+    
+    embed = discord.Embed(title="📝 作者提示", description=author_note, color=0xffd700)
+    embed.set_footer(text="请仔细阅读以上内容，5秒后可点击下方按钮获取文件。")
+    
+    view = AuthorNoteView(bot, row)
+    
+    # 发送消息（按钮初始是禁用的）
+    # 如果interaction已经响应过（例如在modal里deferred了），用followup；否则用response
+    if interaction.response.is_done():
+        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        msg = await interaction.original_response()
+
+    # 延时 5 秒
+    await asyncio.sleep(5)
+    
+    # 更新按钮状态
+    view.children[0].disabled = False
+    view.children[0].label = "✅ 我已阅读，获取附件"
+    view.children[0].style = discord.ButtonStyle.success
+    try:
+        await msg.edit(view=view)
+    except:
+        pass # 用户可能已经关闭了弹窗
 
 # --- Modal Classes ---
 
@@ -237,6 +293,30 @@ class RenameFileModal(ui.Modal, title="重命名文件"):
         await interaction.response.defer(ephemeral=True)
         await self.view_ref.update_dashboard(interaction)
         await interaction.followup.send(f"✅ 文件已重命名为：`{new_full_name}`", ephemeral=True)
+
+class PasswordUnlockModal(ui.Modal, title="请输入口令"):
+    password_input = ui.TextInput(label="口令", placeholder="请输入...", max_length=50)
+    def __init__(self, correct_password, item_row, bot, unlock_type): 
+        super().__init__()
+        self.c = correct_password
+        self.row = item_row 
+        self.bot = bot
+        self.ut = unlock_type
+    
+    async def on_submit(self, i: discord.Interaction):
+        if i.data['components'][0]['components'][0]['value'].strip() != self.c: return await i.response.send_message("❌ 口令错误！", ephemeral=True)
+        await i.response.defer(ephemeral=True, thinking=True)
+        
+        # 即使是密码解锁，也要经过check_requirements检查是否需要点赞等其他条件（如果未来混合使用）
+        # 目前混合模式下 password 已经包含在 unlock_type 检查里吗？
+        # 这里为了安全，还是过一遍通用检查，或者直接认为密码对就通过。
+        # 原逻辑：密码对 -> 再检查点赞等。
+        
+        success, msg = await check_requirements_common(i, self.ut, self.row['owner_id'], self.row['message_id'])
+        if not success: return await i.followup.send(msg, ephemeral=True)
+
+        # 密码正确且条件满足 -> 进入 Author Note 流程
+        await start_download_flow(i, self.bot, self.row)
 
 # --- Creator View ---
 
@@ -353,7 +433,7 @@ class ProtectionDraftView(ui.View):
             try: await self.target_message.delete()
             except: pass
             
-        final_desc = self.draft_log if self.draft_log else "一份受保护的附件已发布，满足条件即可获取。"
+        final_desc = "📋 **本附件受保护，请按照下方指示获取。**"
         embed = discord.Embed(title=f"✨ {self.draft_title}", description=final_desc, color=discord.Color.from_rgb(255, 183, 197))
         embed.set_author(name=f"由 {self.user.display_name} 发布", icon_url=self.user.display_avatar.url)
         mode_map = {"like": "👍 **点赞首楼**", "like_comment": "👍💬 **点赞首楼 + 回复本贴**", "like_password": "👍🔐 **点赞首楼 + 口令**", "like_comment_password": "👍💬🔐 **点赞首楼 + 回复本贴 + 口令**"}
@@ -361,6 +441,9 @@ class ProtectionDraftView(ui.View):
         embed.add_field(name="📦 文件数量", value=f"**{len(stored_data)}** 个", inline=True)
         now_ts = discord.utils.format_dt(datetime.now(TZ_SHANGHAI))
         embed.add_field(name="⏰ 发布时间", value=now_ts, inline=True)
+        
+        # 【修改点】Embed中不再有按钮，改为文字提示
+        embed.add_field(name="📥 如何下载？", value="请使用命令：\n**`/保护附件 获取附件`**\n来验证条件并下载文件。", inline=False)
         embed.set_footer(text="由 创作保护助手 强力驱动", icon_url=self.bot.user.display_avatar.url)
         
         final_msg = await interaction.channel.send(embed=embed)
@@ -374,36 +457,10 @@ class ProtectionDraftView(ui.View):
             )
             await db.commit()
         
-        await final_msg.edit(view=DownloadView(self.bot))
+        # 【修改点】发布时不再挂载 DownloadView，因为按钮已经去掉了
+        # await final_msg.edit(view=DownloadView(self.bot)) -> 已移除
         
-        await interaction.followup.send("✅ 发布成功！", ephemeral=True)
-
-# --- Unlock Modal ---
-
-class PasswordUnlockModal(ui.Modal, title="请输入口令"):
-    password_input = ui.TextInput(label="口令", placeholder="请输入...", max_length=50)
-    def __init__(self, correct_password, item_row, bot, unlock_type): 
-        super().__init__()
-        self.c = correct_password
-        self.row = item_row 
-        self.bot = bot
-        self.ut = unlock_type
-    
-    async def on_submit(self, i: discord.Interaction):
-        if i.data['components'][0]['components'][0]['value'].strip() != self.c: return await i.response.send_message("❌ 口令错误！", ephemeral=True)
-        await i.response.defer(ephemeral=True, thinking=True)
-        success, msg = await check_requirements_common(i, self.ut, self.row['owner_id'], self.row['message_id'])
-        if not success: return await i.followup.send(msg, ephemeral=True)
-
-        try: file_data = json.loads(self.row['storage_urls'])
-        except: return await i.followup.send("❌ 数据损坏", ephemeral=True)
-
-        file_results = await fetch_files_common(self.bot, file_data)
-        if file_results: 
-            await record_download_common(i.user, self.row)
-            await i.followup.send(content="🔓 口令正确！文件给你：", files=make_discord_files_common(file_results), ephemeral=True)
-        else: 
-            await i.followup.send("❌ 文件下载失败，请联系作者。", ephemeral=True)
+        await interaction.followup.send("✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True)
 
 # --- Published Management ---
 
@@ -518,81 +575,29 @@ class PostListView(ui.View):
         row = self.selected_row
         unlock_type = row['unlock_type']
         
+        # 1. 检查密码模式
         if "password" in unlock_type:
             has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
+            # 如果是主人且没测试身份，直接给文件（跳过Delay）
             if interaction.user.id == row['owner_id'] and not has_test_role:
                  await interaction.response.defer(ephemeral=True, thinking=True)
                  file_data = json.loads(row['storage_urls'])
                  file_results = await fetch_files_common(self.bot, file_data)
                  if file_results: await interaction.followup.send(content="👑 主人请拿好：", files=make_discord_files_common(file_results), ephemeral=True)
                  return
+            # 否则弹出密码框
             await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self.bot, unlock_type))
+        
+        # 2. 普通模式 (验证点赞评论)
         else:
             await interaction.response.defer(ephemeral=True, thinking=True)
             success, msg = await check_requirements_common(interaction, unlock_type, row['owner_id'], row['message_id'])
             if not success: return await interaction.followup.send(msg, ephemeral=True)
-            file_data = json.loads(row['storage_urls'])
-            file_results = await fetch_files_common(self.bot, file_data)
-            today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            async with get_db() as db:
-                cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
-                cnt = (await cursor.fetchone())[0]
-            if file_results:
-                await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                await record_download_common(interaction.user, row)
-            else:
-                await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
+            
+            # 【修改点】验证通过后，不直接给文件，进入延时提示流程
+            await start_download_flow(interaction, self.bot, row)
 
-class DownloadView(ui.View):
-    def __init__(self, bot, target_message_id=None):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.target_message_id = target_message_id
-
-    @ui.button(label="获取附件", style=discord.ButtonStyle.primary, emoji="🎁", custom_id="dl_btn_v5")
-    async def download_btn(self, interaction: discord.Interaction, button: ui.Button):
-        message_id = self.target_message_id if self.target_message_id else interaction.message.id
-        async with get_db() as db:
-            db.row_factory = aiosqlite.Row
-            row = await (await db.execute("SELECT * FROM protected_items WHERE message_id = ?", (message_id,))).fetchone()
-            if not row: return await interaction.response.send_message("❌ 该附件已被作者删除或失效。", ephemeral=True)
-            file_data = json.loads(row['storage_urls'])
-            unlock_type = row['unlock_type']
-            owner_id = row['owner_id']
-
-        if "password" in unlock_type:
-            has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
-            if interaction.user.id == owner_id and not has_test_role:
-                await interaction.response.defer(ephemeral=True, thinking=True)
-                file_results = await fetch_files_common(self.bot, file_data)
-                if file_results: await interaction.followup.send(content="👑 主人请拿好：", files=make_discord_files_common(file_results), ephemeral=True)
-                return
-            await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self.bot, unlock_type))
-        else:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            success, msg = await check_requirements_common(interaction, unlock_type, owner_id, message_id)
-            if not success: return await interaction.followup.send(msg, ephemeral=True)
-            file_results = await fetch_files_common(self.bot, file_data)
-            today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            async with get_db() as db:
-                cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
-                cnt = (await cursor.fetchone())[0]
-            if file_results:
-                await interaction.followup.send(content=f"🎁 验证通过！\n今日剩余: {DAILY_DOWNLOAD_LIMIT - cnt - 1}/{DAILY_DOWNLOAD_LIMIT}", files=make_discord_files_common(file_results), ephemeral=True)
-                await record_download_common(interaction.user, row)
-            else:
-                await interaction.followup.send("❌ 文件下载失败。", ephemeral=True)
-
-class DeleteConfirmView(ui.View):
-    def __init__(self, message_id): super().__init__(timeout=60); self.message_id = message_id
-    @ui.button(label="确认删除", style=discord.ButtonStyle.danger)
-    async def confirm(self, i: discord.Interaction, b: ui.Button):
-        async with get_db() as db: await db.execute("DELETE FROM protected_items WHERE message_id = ?", (self.message_id,)); await db.commit()
-        try: await (await i.channel.fetch_message(self.message_id)).delete()
-        except: pass
-        await i.response.edit_message(content="已删除！", view=None, embed=None)
-    @ui.button(label="取消", style=discord.ButtonStyle.secondary)
-    async def cancel(self, i: discord.Interaction, b: ui.Button): await i.response.edit_message(content="操作取消。", view=None, embed=None)
+# --- Main Cog ---
 
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
@@ -646,7 +651,7 @@ class ProtectionCog(commands.Cog):
                 await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (message.author.id, thread_id, message.content[:50]))
                 await db.commit()
 
-    @admin_group.command(name="修复面板", description="刷新本频道所有旧面板")
+    @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮（改用命令）")
     async def fix_panels(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         async with get_db() as db:
@@ -657,12 +662,12 @@ class ProtectionCog(commands.Cog):
         for row in rows:
             try:
                 msg = await interaction.channel.fetch_message(row['message_id'])
-                new_view = DownloadView(self.bot)
-                await msg.edit(view=new_view)
+                # 清除View，移除按钮
+                await msg.edit(view=None)
                 success_count += 1
                 await asyncio.sleep(1.0) 
             except: fail_count += 1
-        await interaction.followup.send(f"✅ 修复完成！\n成功刷新: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
+        await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
 
     @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")
     async def my_downloads_today(self, interaction: discord.Interaction):
