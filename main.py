@@ -31,8 +31,6 @@ class ChimidanBot(commands.Bot):
         for filename in os.listdir('./cogs'):
             if filename.endswith('.py'):
                 await self.load_extension(f'cogs.{filename[:-3]}')
-
-        self.add_view(DownloadView(self)) 
         
         await self.tree.sync()
         print(f"奇米蛋已上线来捉！登录为：{self.user}")
@@ -47,3 +45,4 @@ bot = ChimidanBot()
 if __name__ == "__main__":
 
     bot.run(TOKEN) 
+
