@@ -93,7 +93,7 @@ class PaginatorView(ui.View):
 
 
 # ==========================================
-# Part 2. 搜索逻辑 (更新：支持标签筛选)
+# Part 2. 搜索逻辑 (修复版)
 # ==========================================
 
 async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
@@ -102,18 +102,33 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
         ephemeral=True
     )
     
+    # === 【关键修复开始】 ===
     # 确定搜索范围
-    target_forums = selected_channels if selected_channels else interaction.guild.forums
+    target_forums = []
     
+    if selected_channels:
+        # 如果用户选了频道，必须通过 ID 从 guild 重新获取“完整”的频道对象
+        # 因为 ChannelSelect 返回的对象可能不包含 .threads 缓存数据
+        for ch in selected_channels:
+            full_channel = interaction.guild.get_channel(ch.id)
+            if full_channel and isinstance(full_channel, discord.ForumChannel):
+                target_forums.append(full_channel)
+    else:
+        # 如果没选，使用全服所有论坛频道
+        target_forums = [ch for ch in interaction.guild.forums if isinstance(ch, discord.ForumChannel)]
+    # === 【关键修复结束】 ===
+
     # 收集所有帖子
     all_threads = []
     for forum in target_forums:
-        if isinstance(forum, discord.ForumChannel):
-            all_threads.extend(forum.threads)
+        # 这里不需要再判断 isinstance 了，因为上面已经筛选过了
+        # 注意：forum.threads 只能获取“活跃”的帖子，归档(Archived)的帖子通常获取不到
+        # 如果需要搜归档帖，需要额外的异步 API 请求，会非常慢，通常只搜缓存里的活跃帖
+        all_threads.extend(forum.threads)
 
     total_count = len(all_threads)
     if total_count == 0:
-        return await interaction.edit_original_response(content=chimidan_text("呜呜，当前范围内没有帖子可以搜捏..."))
+        return await interaction.edit_original_response(content=chimidan_text("呜呜，当前范围内没有帖子可以搜捏... (可能是帖子被归档了，或者机器人没加载到)"))
 
     sem = asyncio.Semaphore(8) 
     results = []
