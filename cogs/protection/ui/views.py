@@ -4,6 +4,7 @@ import json
 import io
 import asyncio
 import os
+import aiosqlite
 from datetime import datetime
 from database import get_db
 from ..constants import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
@@ -421,46 +422,53 @@ class PostListView(ui.View):
             # 验证通过后，进入注入流程
             await start_download_flow(interaction, self.bot, row)
 
-class BumpButtonView(ui.View):
-    def __init__(self, bot, original_message_id: int):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.original_message_id = original_message_id
+# 请添加到 cogs/protection/ui/views.py 中
 
-    # --- 新增：这个方法负责“打包”外观和按钮 ---
+class BumpButtonView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None) # 持久化视图，永不仅用
+        self.bot = bot
+
     @classmethod
-    def create_layout(cls, bot, original_message_id: int) -> dict:
+    def create_layout(cls, bot, origin_id=None):
         """
-        生成标准的置底消息布局，包含文案和按钮视图。
-        返回一个字典，可以直接作为参数传给 send() 方法。
+        静态方法：生成发送置底消息时所需的参数字典。
+        origin_id 在这里甚至不需要用到，因为我们只是唤起通用的频道列表。
         """
-        description = (
-            "## 📦 附件下载通道\n\n"
-            "本帖附件已包含安全溯源指纹**。\n"
-            "为方便新访客查找，此下载入口将自动保持在话题底部。\n\n"
-            "⬇️ **请点击下方按钮开始获取** ⬇️"
+        view = cls(bot)
+        embed = discord.Embed(
+            description="⬇️ **本频道有受保护的附件** ⬇️\n为了防止资源被聊天记录淹没，请点击下方按钮查看下载列表。",
+            color=0x2b2d31
+        )
+        return {"embed": embed, "view": view}
+
+    @discord.ui.button(label="📥 获取本帖附件", style=discord.ButtonStyle.blurple, custom_id="bump_get_attachments", emoji="📂")
+    async def get_attachments_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 核心逻辑：复刻 /保护附件 获取附件 的功能
+        # 1. 查库
+        from database import get_db # 需确保能导入
+
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            # 查找本频道最近的 5 条记录
+            cursor = await db.execute(
+                "SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 5",
+                (interaction.channel.id,)
+            )
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return await interaction.response.send_message("❌ 本频道当前没有任何受保护的附件记录。", ephemeral=True)
+
+        # 2. 生成那个带下拉菜单的 View (PostListView)
+        view = PostListView(self.bot, rows)
+
+        embed = discord.Embed(
+            title="📂 附件获取列表",
+            description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个进行查看和下载。",
+            color=0x87ceeb
         )
 
-        view = cls(bot, original_message_id)
+        # 3. 发送给用户（仅自己可见）
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-        return {
-            "content": description,
-            "view": view
-        }
-
-    # --- 按钮回调逻辑保持不变 ---
-    @ui.button(label="🎁 获取附件", style=discord.ButtonStyle.success, emoji="📦")
-    async def btn_get_file(self, interaction: discord.Interaction, button: ui.Button):
-        try:
-            from ..db import get_db
-
-            async with get_db() as db:
-                cursor = await db.execute("SELECT * FROM download_rules WHERE message_id = ?", (self.original_message_id,))
-                row = await cursor.fetchone()
-
-            if not row:
-                return await interaction.response.send_message("❌ 原文件数据已失效或被删除。", ephemeral=True)
-            await interaction.response.send_message(f"正在获取原始消息 {self.original_message_id} 的附件...", ephemeral=True)
-
-        except Exception as e:
-            await interaction.response.send_message(f"❌ 系统错误: {e}", ephemeral=True)
