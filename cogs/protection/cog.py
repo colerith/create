@@ -180,65 +180,54 @@ class ProtectionCog(commands.Cog):
         """
         后台循环任务：每10分钟检查一次
         """
-        from .ui.views import BumpButtonView # 延迟导入避免循环引用
+        # 只需要导入 View 类即可，不需要在这里写长长的文案了
+        from .ui.views import BumpButtonView
 
         last_bump_msg = None
 
         try:
             while True:
-                # 初始等待或是循环等待？先发一次再等待，还是先等待？
-                # 逻辑：立即执行一次检查/发送，然后睡10分钟
-
                 try:
-                    # 1. 获取频道最新一条消息
-                    # history 返回的是 iterator，我们要拿第一个
+                    # 1. 检查最新消息
                     messages = [msg async for msg in channel.history(limit=1)]
                     latest_msg = messages[0] if messages else None
 
                     need_resend = False
 
-                    # 2. 判断逻辑
                     if not latest_msg:
-                        # 频道居然是空的？直接发
                         need_resend = True
                     elif last_bump_msg and latest_msg.id == last_bump_msg.id:
-                        # 最新的一条就是我们上次发的 -> 不动
                         need_resend = False
                     else:
-                        # 最新的一条是别人发的，或者我们还没发过 -> 发送
                         need_resend = True
 
                     if need_resend:
-                        # 尝试删除上次发的旧消息（如果存在且还没被别人删掉）
+                        # 删除旧消息
                         if last_bump_msg:
                             try:
                                 await last_bump_msg.delete()
-                            except discord.NotFound:
-                                pass # 已经被删了，无所谓
-                            except discord.Forbidden:
-                                pass # 没权限删？那就留着吧
+                            except (discord.NotFound, discord.Forbidden):
+                                pass
 
-                        # 发送新的
-                        view = BumpButtonView(self.bot, origin_id)
-                        last_bump_msg = await channel.send(
-                            content="⬇️ **请点击下方按钮获取最新附件** ⬇️",
-                            view=view
-                        )
+                        # --- 核心变化：直接调用 View 的类方法获取发送参数 ---
+                        # 这行代码现在的含义是：给我一套“BumpButtonView”的标准外观参数
+                        send_kwargs = BumpButtonView.create_layout(self.bot, origin_id)
+
+                        # 使用 ** 解包字典，自动填入 content 和 view
+                        last_bump_msg = await channel.send(**send_kwargs)
 
                 except discord.Forbidden:
-                    # 如果连发消息权限都没了，就没必要继续循环了
-                    print(f"[{channel.id}] 失去发送权限，停止置底任务。")
+                    print(f"[{channel.id}] 失去权限，停止置底。")
                     break
                 except Exception as e:
                     print(f"[{channel.id}] 置底任务出错: {e}")
-                    # 出错不要紧，休息一下继续，别直接退出了
 
-                # 等待 10 分钟 (600秒)
+                # 等待 10 分钟
                 await asyncio.sleep(600)
 
         except asyncio.CancelledError:
-            # 任务被取消费，清理收尾（可选）
             pass
+
 
     # --- 用户命令 ---
     @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")
