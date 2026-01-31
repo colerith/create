@@ -3,6 +3,7 @@ from discord import ui
 import json
 import io
 import asyncio
+import os
 from datetime import datetime
 from database import get_db
 from ..constants import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
@@ -279,6 +280,80 @@ class ProtectionDraftView(ui.View):
         await interaction.followup.send("✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True)
 
 # --- 帖子列表视图 ---
+class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
+    name_input = ui.TextInput(label="新文件名 (无需输入后缀)", placeholder="请输入新名字", max_length=100)
+    def __init__(self, message_id, file_index, file_data):
+        super().__init__()
+        self.message_id = message_id
+        self.file_index = file_index
+        self.file_data = file_data 
+        current_name = file_data[file_index].get('filename', 'unknown.ext')
+        self.name_stem, self.ext = os.path.splitext(current_name)
+        self.name_input.default = self.name_stem
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_stem = self.name_input.value.strip()
+        if not new_stem: return await interaction.response.send_message("文件名不能为空！", ephemeral=True)
+        new_full_name = f"{new_stem}{self.ext}"
+        self.file_data[self.file_index]['filename'] = new_full_name
+        async with get_db() as db:
+            await db.execute("UPDATE protected_items SET storage_urls = ? WHERE message_id = ?", (json.dumps(self.file_data), self.message_id))
+            await db.commit()
+        await interaction.response.send_message(f"✅ 修改成功！文件已更名为 `{new_full_name}`", ephemeral=True)
+
+class ManageFilesSelectView(ui.View):
+    def __init__(self, message_id, file_data):
+        super().__init__(timeout=60)
+        self.message_id = message_id
+        self.file_data = file_data
+        options = []
+        for i, f in enumerate(file_data):
+            fname = f.get('filename', 'unknown')
+            options.append(discord.SelectOption(label=f"{i+1}. {fname[:90]}", value=str(i)))
+        self.select = ui.Select(placeholder="选择要重命名的文件...", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+    async def on_select(self, interaction: discord.Interaction):
+        idx = int(self.select.values[0])
+        await interaction.response.send_modal(EditPublishedFileModal(self.message_id, idx, self.file_data))
+
+class PostManagementView(ui.View):
+    def __init__(self, message_id, file_data):
+        super().__init__(timeout=60)
+        self.message_id = message_id
+        self.file_data = file_data
+    @ui.button(label="✏️ 修改文件名", style=discord.ButtonStyle.primary)
+    async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message("请选择要修改的文件：", view=ManageFilesSelectView(self.message_id, self.file_data), ephemeral=True)
+    @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger)
+    async def delete_post(self, interaction: discord.Interaction, button: ui.Button):
+        async with get_db() as db: 
+            await db.execute("DELETE FROM protected_items WHERE message_id = ?", (self.message_id,))
+            await db.commit()
+        try: await (await interaction.channel.fetch_message(self.message_id)).delete()
+        except: pass
+        await interaction.response.edit_message(content="✅ 帖子已删除！", embed=None, view=None)
+
+class PostSelectionView(ui.View):
+    def __init__(self, posts_rows):
+        super().__init__(timeout=60)
+        options = []
+        for p in posts_rows:
+            title = p['title'][:80]
+            dl_count = p['download_count']
+            options.append(discord.SelectOption(label=title, value=str(p['message_id']), description=f"下载: {dl_count}次 | ID: {p['message_id']}"))
+        self.select = ui.Select(placeholder="选择要管理的帖子...", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+        self.posts_map = {str(p['message_id']): p for p in posts_rows}
+    async def on_select(self, interaction: discord.Interaction):
+        mid_str = self.select.values[0]
+        row = self.posts_map[mid_str]
+        try: file_data = json.loads(row['storage_urls'])
+        except: file_data = []
+        embed = discord.Embed(title=f"🔧 管理: {row['title']}", description="请选择操作：", color=0xffd700)
+        await interaction.response.edit_message(embed=embed, view=PostManagementView(row['message_id'], file_data))
+
 class PostListView(ui.View):
     def __init__(self, bot, posts_rows):
         super().__init__(timeout=600)
