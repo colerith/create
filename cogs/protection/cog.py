@@ -77,7 +77,7 @@ class ProtectionCog(commands.Cog):
         await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
     
     @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
-    @admin_group.describe(file="请上传需要检查的文件")
+    @app_commands.describe(file="请上传需要检查的文件")
     async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
         await interaction.response.defer(ephemeral=True) 
 
