@@ -400,6 +400,7 @@ class ExplorationCog(commands.Cog):
             await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="更新搜索面板", description="[管理] 清理旧面板并发送新的搜索面板")
+    @app_commands.default_permissions(view_audit_log=True)
     async def refresh_search_panel(self, interaction: discord.Interaction):
         if interaction.user.id != ADMIN_USER_ID:
             return await interaction.response.send_message(chimidan_text("你没有权限操作这个命令捏！"), ephemeral=True)
