@@ -113,66 +113,56 @@ async def sync(ctx):
 @commands.is_owner()
 async def clearsync(ctx):
     """
-    【容错版核弹清理】彻底刷新命令缓存。
-    即使消息丢失也能正常反馈结果。
+    【最终核弹版】彻底解决命令重复问题。
+    它会同时清除「全局残留」和「本地缓存」，然后重新注册。
     """
-    # 1. 先发一条初始消息
-    try:
-        status_msg = await ctx.send("🧹 **正在执行深度清理...**\n⏳ 第一步：正在抹除旧命令缓存...")
-    except:
-        # 如果连发消息都失败，直接不跑了（极少见）
-        return
-
-    # 定义一个更稳健的更新函数，防止消息被删导致报错
-    async def safe_update(text):
+    # 状态消息辅助函数
+    status_msg = None
+    async def safe_send(text):
         nonlocal status_msg
         try:
-            await status_msg.edit(content=text)
-        except discord.NotFound:
-            # 如果原来的消息找不到了（报错404），就发条新的
-            status_msg = await ctx.send(text)
-        except Exception as e:
-            # 其他情况也发新的
-            status_msg = await ctx.send(f"{text}\n(PS: 之前消息更新失败: {e})")
+            if status_msg: await status_msg.edit(content=text)
+            else: status_msg = await ctx.send(text)
+        except: status_msg = await ctx.send(text)
+
+    await safe_send("🧹 **开始执行彻底清理...**\n(请耐心等待，只需几秒)")
 
     try:
-        # --- 核心清理逻辑 ---
+        # Step 1: 清除早已残留的【全局命令】(这是双胞胎的元凶！)
+        # 这相当于告诉 Discord：“把贴在公共走廊上的旧海报全撕了”
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync(guild=None)
+        await safe_send("🧹 进度 1/3: 🔥 已焚毁所有「全局命令」残留。\n(这应该能消灭重复的那个影子)")
 
-        # 步骤 1: 强制清空当前服务器的命令树
-        # 这会告诉 Discord：“这个服务器现在没有任何命令”
+        await asyncio.sleep(1) # 歇一秒让Discord反应过来
+
+        # Step 2: 清除【当前服务器】的旧命令
         bot.tree.clear_commands(guild=ctx.guild)
         await bot.tree.sync(guild=ctx.guild)
+        await safe_send("🧹 进度 2/3: 🏠 已清空「本服命令」缓存。\n(现在应该是个空壳了)")
 
-        # 更新进度
-        await safe_update("🧹 **正在执行深度清理...**\n✅ 第一步完成：旧命令已全部标记为删除。\n⏳ 第二步：正在加载最新代码并重新上传...")
+        await asyncio.sleep(1)
 
-        # 稍微歇一口气，防止 API 请求过快
-        await asyncio.sleep(2)
-
-        # 步骤 2: 将代码里的命令重新加载进来
+        # Step 3: 重新把代码里的命令注册回来（只注册到本服，方便开发）
+        # 将全局定义的命令复制到当前 Guild 空间下
         bot.tree.copy_global_to(guild=ctx.guild)
-
-        # 步骤 3: 再次同步，上传正确版本
         synced = await bot.tree.sync(guild=ctx.guild)
 
-        # --- 结束报告 ---
-        final_msg = (
-            f"✨ **清理完毕！命令树已重建。**\n"
-            f"📊 重新注册命令数：**{len(synced)}** 个。\n"
+        # 结束
+        final_text = (
+            f"✨ **大功告成！**\n"
+            f"✅ 全局残留：**已清除** (重复项应该消失了)\n"
+            f"✅ 本服重建：**{len(synced)}** 个命令\n"
             f"----------------------------------\n"
-            f"现在你应该只能看到以下 3 个主命令组：\n"
-            f"1️⃣ `/贴主` (包含置底功能)\n"
-            f"2️⃣ `/保护附件` (下载与管理)\n"
-            f"3️⃣ `/管理员专用` (配置与迁移)\n\n"
-            f"⚠️ **重要提示**：\n"
-            f"如果你还能看到其他奇怪的命令，请务必 **重启你的 Discord 客户端** (Ctrl+R / 杀后台重启 APP)。"
+            f"⚠️ **最后一步（至关重要）：**\n"
+            f"请现在立刻 **重启你的 Discord 软件** (Ctrl+R / 手机杀后台)。\n"
+            f"这会让你的客户端重新去服务器拉取最新的列表。"
         )
-        await safe_update(final_msg)
-        print(f"✅ Guild {ctx.guild.id} 清理同步完成，共 {len(synced)} 个命令。")
+        await safe_send(final_text)
+        print(f"✅ [CLEARED] Global cleared. Guild {ctx.guild.id} synced {len(synced)} cmds.")
 
     except Exception as e:
-        # 如果出错，直接发新消息报错，不用 edit 了
-        await ctx.send(f"❌ **清理过程中断**\n错误详情: {e}")
+        await safe_send(f"❌ 出错了: {e}")
         import traceback
         traceback.print_exc()
 
