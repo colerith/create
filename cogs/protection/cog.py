@@ -10,6 +10,7 @@ from database import get_db
 from .constants import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
 from .db import init_likes_db
 from .utils import is_valid_comment
+from .utils import extract_trace_from_bytes
 from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
 
 class ProtectionCog(commands.Cog):
@@ -74,6 +75,51 @@ class ProtectionCog(commands.Cog):
                 await asyncio.sleep(1.0) 
             except: fail_count += 1
         await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
+    
+    @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
+    @admin_group.describe(file="请上传需要检查的文件")
+    async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
+        await interaction.response.defer(ephemeral=True) 
+
+        # 1. 下载用户上传的文件
+        try:
+            file_bytes = await file.read()
+        except:
+            return await interaction.followup.send("❌ 文件读取失败，请检查网络或文件是否过大。", ephemeral=True)
+
+        # 2. 提取特征码
+        trace_id = extract_trace_from_bytes(file_bytes, file.filename)
+
+        if not trace_id:
+            return await interaction.followup.send("⚠️ **未检测到溯源信息**\n该文件可能不是由本机器人分发，或者水印已被破坏（如经过了格式转换、压缩或编辑）。", ephemeral=True)
+
+        # 3. 只有拿到 ID，才去数据库查
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM file_traces WHERE trace_id = ?", (trace_id,))
+            record = await cursor.fetchone()
+
+        if not record:
+            return await interaction.followup.send(f"⚠️ **检测到水印但由于数据丢失无法匹配！**\nTraceID: `{trace_id}`\n数据库中未找到该记录。", ephemeral=True)
+
+        # 4. 生成详细报告
+        downloader = interaction.guild.get_member(record['user_id'])
+        user_text = f"{downloader.mention} ({record['user_id']})" if downloader else f"未知用户 ({record['user_id']})"
+
+        dl_time = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d %H:%M:%S')
+
+        embed = discord.Embed(title="🔍 溯源报告", color=0xff0000)
+        embed.description = f"**文件**: `{record['filename']}`\n**溯源 ID**: `{trace_id}`"
+
+        embed.add_field(name="👤 下载者", value=user_text, inline=False)
+        embed.add_field(name="📅 下载时间", value=dl_time, inline=True)
+        embed.add_field(name="📍 来源服务器/频道", value=f"Guild: {record['guild_id']}\nChannel: <#{record['channel_id']}>", inline=True)
+        embed.add_field(name="🔗 原始资源ID", value=f"`{record['message_id']}`", inline=False)
+
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="保护机制 · 幽灵追踪系统")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # --- 用户命令 ---
     @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")

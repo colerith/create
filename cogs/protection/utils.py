@@ -4,9 +4,134 @@ import asyncio
 import io
 import discord
 import aiosqlite
+import struct
+import binascii
+import os
+import uuid
 from datetime import datetime
 from database import get_db
 from .constants import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+
+# 定义我们的魔法签名，用于在二进制末尾识别
+# 格式: 0x00 + NOVA_TRACE: + UUID(12)
+MAGIC_HEADER = b'\x00NOVA_TRACE:'
+
+def generate_trace_id():
+    """生成12位短ID"""
+    return uuid.uuid4().hex[:12]
+
+def _inject_png_text_chunk(data, key, text):
+    """
+    专门为 PNG 注入 tEXt 块。
+    PNG结构: Header + Chunks... + IEND
+    我们要在 IEND 之前插入一个 tEXt chunk。
+    """
+    # PNG Signature
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        return data # 不是PNG，放弃
+
+    # 构建 tEXt chunk 数据
+    # 格式: Keyword + \x00 + Text
+    raw_data = key.encode('latin-1') + b'\x00' + text.encode('latin-1')
+    length = len(raw_data)
+
+    # Chunk Structure: Length(4) + Type(4) + Data + CRC(4)
+    chunk_type = b'tEXt'
+    crc = binascii.crc32(chunk_type)
+    crc = binascii.crc32(raw_data, crc) & 0xffffffff
+
+    chunk = struct.pack('!I', length) + chunk_type + raw_data + struct.pack('!I', crc)
+
+    # 找到 IEND 块的位置 (通常在最后 12 字节: Len(0) + IEND + CRC)
+    # 简单做法：直接插在 IEND 前面
+    # IEND chunk 总是: 00 00 00 00 49 45 4E 44 AE 42 60 82
+    iend_pos = data.rfind(b'\x00\x00\x00\x00IEND\xaeB`\x82')
+    if iend_pos == -1:
+        # 找不到标准结尾，直接追加在末尾
+        return data + chunk
+
+    return data[:iend_pos] + chunk + data[iend_pos:]
+
+def inject_smart_trace(file_bytes, filename, trace_id):
+    """
+    智能注入溯源信息
+    """
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        # 策略 1: PNG 隐写
+        if ext == '.png':
+            print(f"Injecting PNG Trace: {trace_id}")
+            return _inject_png_text_chunk(file_bytes, "Software", f"ProtectionBot | ID:{trace_id}")
+
+        # 策略 2: JSON 字段注入
+        elif ext == '.json':
+            try:
+                # 尝试解析 JSON
+                content = file_bytes.decode('utf-8')
+                json_obj = json.loads(content)
+
+                # 只有当它是字典(对象)时才能插入 Key
+                if isinstance(json_obj, dict):
+                    # 插入放在第一位或者最后都可以，这里直接赋值
+                    json_obj['_protection_trace'] = {
+                        'id': trace_id,
+                        'note': 'This file is tracked based on its download record.'
+                    }
+                    # 重新转回 bytes，保持缩进美观
+                    return json.dumps(json_obj, indent=2, ensure_ascii=False).encode('utf-8')
+            except:
+                pass # 解析失败，回退到通用追加
+
+        # 策略 3: 通用二进制追加 (对绝大多数文件有效且无害)
+        # 直接在文件屁股后面加: \x00NOVA_TRACE:xxxxxx
+        trace_payload = MAGIC_HEADER + trace_id.encode('ascii')
+        return file_bytes + trace_payload
+
+    except Exception as e:
+        print(f"Injection Error: {e}")
+        return file_bytes
+
+def extract_trace_from_bytes(file_bytes, filename):
+    """
+    尝试从文件数据中提取 TraceID
+    返回: trace_id_str 或 None
+    """
+    try:
+        ext = os.path.splitext(filename)[1].lower()
+
+        # 1. 检查通用追加尾巴 (最快)
+        # 搜索 MAGIC_HEADER
+        pos = file_bytes.rfind(MAGIC_HEADER)
+        if pos != -1:
+            # 提取 header 后的 12 位 ID
+            start = pos + len(MAGIC_HEADER)
+            trace_id = file_bytes[start:start+12].decode('ascii', errors='ignore')
+            return trace_id
+
+        # 2. 检查 JSON 字段
+        if ext == '.json':
+            try:
+                content = file_bytes.decode('utf-8')
+                json_obj = json.loads(content)
+                if isinstance(json_obj, dict) and '_protection_trace' in json_obj:
+                    return json_obj['_protection_trace'].get('id')
+            except:
+                pass
+
+        # 3. 检查 PNG tEXt 块
+        s_bytes = file_bytes
+        # 限制搜索范围防止大文件卡死
+        header_pattern = b'ProtectionBot | ID:'
+        idx = s_bytes.find(header_pattern)
+        if idx != -1:
+             start = idx + len(header_pattern)
+             return s_bytes[start:start+12].decode('ascii', errors='ignore')
+
+        return None
+    except Exception as e:
+        print(f"Extraction Error: {e}")
+        return None
 
 # --- 评论验证 ---
 def is_valid_comment(content: str) -> bool:
