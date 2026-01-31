@@ -16,13 +16,13 @@ from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Context Menu
         self.ctx_menu = app_commands.ContextMenu(
             name="转为保护附件",
             callback=self.convert_to_protected
         )
         self.bot.tree.add_command(self.ctx_menu)
         self.bot.loop.create_task(init_likes_db())
+        self.bump_tasks = {}
 
     # 命令组定义
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
@@ -120,6 +120,125 @@ class ProtectionCog(commands.Cog):
         embed.set_footer(text="保护机制 · 幽灵追踪系统")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="置底附件", description="每10分钟检查附件按钮是否在底部，被顶走则重发 (仅贴主/管理可用)")
+    @app_commands.describe(original_message_id="包含附件数据的原始消息ID (如果不填则尝试自动查找)")
+    async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
+        """
+        开启附件自动置底功能。输入 off 可以关闭当前频道的置底。
+        """
+        channel = interaction.channel
+
+        # --- 1. 权限检查 ---
+        is_admin = interaction.user.guild_permissions.administrator
+        is_owner = False
+        if isinstance(channel, discord.Thread) and channel.owner_id == interaction.user.id:
+            is_owner = True
+
+        if not (is_admin or is_owner):
+            return await interaction.response.send_message("❌ 只有 **管理员** 或 **贴主** 才能使用此功能。", ephemeral=True)
+
+        # --- 2. 关闭功能的逻辑 ---
+        if original_message_id and original_message_id.lower() == "off":
+            if channel.id in self.bump_tasks:
+                self.bump_tasks[channel.id].cancel() # 取消任务
+                del self.bump_tasks[channel.id]
+                return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能。", ephemeral=True)
+            else:
+                return await interaction.response.send_message("⚠️ 本频道当前没有开启自动置底。", ephemeral=True)
+
+        # --- 3. 确定原始消息 ID ---
+        target_msg_id = None
+        if original_message_id:
+            try:
+                target_msg_id = int(original_message_id)
+            except:
+                return await interaction.response.send_message("❌ 消息 ID 格式错误。", ephemeral=True)
+        else:
+            # 自动查找逻辑：在数据库里找属于这个频道且有下载数据的最新一条消息
+            async with get_db() as db:
+                cursor = await db.execute("SELECT message_id FROM download_rules WHERE channel_id = ? ORDER BY timestamp DESC LIMIT 1", (channel.id,))
+                res = await cursor.fetchone()
+                if res:
+                    target_msg_id = res[0]
+
+        if not target_msg_id:
+            return await interaction.response.send_message("❌ 找不到有效的文件记录，请手动输入 `original_message_id`。", ephemeral=True)
+
+        # --- 4. 启动任务 ---
+        # 如果已经有任务在运行，先停掉旧的
+        if channel.id in self.bump_tasks:
+            self.bump_tasks[channel.id].cancel()
+
+        # 创建后台任务
+        task = asyncio.create_task(self._bump_loop(channel, target_msg_id))
+        self.bump_tasks[channel.id] = task
+
+        await interaction.response.send_message(f"✅ **自动置底已开启**\n关联源消息: `{target_msg_id}`\n机制: 每 10 分钟检查一次，若不是最新消息则重发。", ephemeral=True)
+
+    async def _bump_loop(self, channel, origin_id):
+        """
+        后台循环任务：每10分钟检查一次
+        """
+        from .ui.views import BumpButtonView # 延迟导入避免循环引用
+
+        last_bump_msg = None
+
+        try:
+            while True:
+                # 初始等待或是循环等待？先发一次再等待，还是先等待？
+                # 逻辑：立即执行一次检查/发送，然后睡10分钟
+
+                try:
+                    # 1. 获取频道最新一条消息
+                    # history 返回的是 iterator，我们要拿第一个
+                    messages = [msg async for msg in channel.history(limit=1)]
+                    latest_msg = messages[0] if messages else None
+
+                    need_resend = False
+
+                    # 2. 判断逻辑
+                    if not latest_msg:
+                        # 频道居然是空的？直接发
+                        need_resend = True
+                    elif last_bump_msg and latest_msg.id == last_bump_msg.id:
+                        # 最新的一条就是我们上次发的 -> 不动
+                        need_resend = False
+                    else:
+                        # 最新的一条是别人发的，或者我们还没发过 -> 发送
+                        need_resend = True
+
+                    if need_resend:
+                        # 尝试删除上次发的旧消息（如果存在且还没被别人删掉）
+                        if last_bump_msg:
+                            try:
+                                await last_bump_msg.delete()
+                            except discord.NotFound:
+                                pass # 已经被删了，无所谓
+                            except discord.Forbidden:
+                                pass # 没权限删？那就留着吧
+
+                        # 发送新的
+                        view = BumpButtonView(self.bot, origin_id)
+                        last_bump_msg = await channel.send(
+                            content="⬇️ **请点击下方按钮获取最新附件** ⬇️",
+                            view=view
+                        )
+
+                except discord.Forbidden:
+                    # 如果连发消息权限都没了，就没必要继续循环了
+                    print(f"[{channel.id}] 失去发送权限，停止置底任务。")
+                    break
+                except Exception as e:
+                    print(f"[{channel.id}] 置底任务出错: {e}")
+                    # 出错不要紧，休息一下继续，别直接退出了
+
+                # 等待 10 分钟 (600秒)
+                await asyncio.sleep(600)
+
+        except asyncio.CancelledError:
+            # 任务被取消费，清理收尾（可选）
+            pass
 
     # --- 用户命令 ---
     @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")
