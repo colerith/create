@@ -57,70 +57,6 @@ class ProtectionCog(commands.Cog):
                 await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (message.author.id, thread_id, message.content[:50]))
                 await db.commit()
 
-    # --- 管理员命令 ---
-    @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮（改用命令）")
-    async def fix_panels(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        async with get_db() as db:
-            db.row_factory = aiosqlite.Row
-            rows = await (await db.execute("SELECT * FROM protected_items WHERE channel_id = ?", (interaction.channel.id,))).fetchall()
-        if not rows: return await interaction.followup.send("本频道在数据库中没有活跃记录。", ephemeral=True)
-        success_count, fail_count = 0, 0
-        for row in rows:
-            try:
-                msg = await interaction.channel.fetch_message(row['message_id'])
-                # 清除View，移除按钮
-                await msg.edit(view=None)
-                success_count += 1
-                await asyncio.sleep(1.0) 
-            except: fail_count += 1
-        await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
-    
-    @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
-    @app_commands.describe(file="请上传需要检查的文件")
-    async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
-        await interaction.response.defer(ephemeral=True) 
-
-        # 1. 下载用户上传的文件
-        try:
-            file_bytes = await file.read()
-        except:
-            return await interaction.followup.send("❌ 文件读取失败，请检查网络或文件是否过大。", ephemeral=True)
-
-        # 2. 提取特征码
-        trace_id = extract_trace_from_bytes(file_bytes, file.filename)
-
-        if not trace_id:
-            return await interaction.followup.send("⚠️ **未检测到溯源信息**\n该文件可能不是由本机器人分发，或者水印已被破坏（如经过了格式转换、压缩或编辑）。", ephemeral=True)
-
-        # 3. 只有拿到 ID，才去数据库查
-        async with get_db() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM file_traces WHERE trace_id = ?", (trace_id,))
-            record = await cursor.fetchone()
-
-        if not record:
-            return await interaction.followup.send(f"⚠️ **检测到水印但由于数据丢失无法匹配！**\nTraceID: `{trace_id}`\n数据库中未找到该记录。", ephemeral=True)
-
-        # 4. 生成详细报告
-        downloader = interaction.guild.get_member(record['user_id'])
-        user_text = f"{downloader.mention} ({record['user_id']})" if downloader else f"未知用户 ({record['user_id']})"
-
-        dl_time = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d %H:%M:%S')
-
-        embed = discord.Embed(title="🔍 溯源报告", color=0xff0000)
-        embed.description = f"**文件**: `{record['filename']}`\n**溯源 ID**: `{trace_id}`"
-
-        embed.add_field(name="👤 下载者", value=user_text, inline=False)
-        embed.add_field(name="📅 下载时间", value=dl_time, inline=True)
-        embed.add_field(name="📍 来源服务器/频道", value=f"Guild: {record['guild_id']}\nChannel: <#{record['channel_id']}>", inline=True)
-        embed.add_field(name="🔗 原始资源ID", value=f"`{record['message_id']}`", inline=False)
-
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(text="保护机制 · 幽灵追踪系统")
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
     @app_commands.command(name="置底附件", description="每10分钟检查附件按钮是否在底部，被顶走则重发 (仅贴主/管理可用)")
     @app_commands.describe(original_message_id="包含附件数据的原始消息ID (如果不填则尝试自动查找)")
     async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
@@ -227,6 +163,70 @@ class ProtectionCog(commands.Cog):
 
         except asyncio.CancelledError:
             pass
+    
+    # --- 管理员命令 ---
+    @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮（改用命令）")
+    async def fix_panels(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute("SELECT * FROM protected_items WHERE channel_id = ?", (interaction.channel.id,))).fetchall()
+        if not rows: return await interaction.followup.send("本频道在数据库中没有活跃记录。", ephemeral=True)
+        success_count, fail_count = 0, 0
+        for row in rows:
+            try:
+                msg = await interaction.channel.fetch_message(row['message_id'])
+                # 清除View，移除按钮
+                await msg.edit(view=None)
+                success_count += 1
+                await asyncio.sleep(1.0) 
+            except: fail_count += 1
+        await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
+    
+    @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
+    @app_commands.describe(file="请上传需要检查的文件")
+    async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
+        await interaction.response.defer(ephemeral=True) 
+
+        # 1. 下载用户上传的文件
+        try:
+            file_bytes = await file.read()
+        except:
+            return await interaction.followup.send("❌ 文件读取失败，请检查网络或文件是否过大。", ephemeral=True)
+
+        # 2. 提取特征码
+        trace_id = extract_trace_from_bytes(file_bytes, file.filename)
+
+        if not trace_id:
+            return await interaction.followup.send("⚠️ **未检测到溯源信息**\n该文件可能不是由本机器人分发，或者水印已被破坏（如经过了格式转换、压缩或编辑）。", ephemeral=True)
+
+        # 3. 只有拿到 ID，才去数据库查
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM file_traces WHERE trace_id = ?", (trace_id,))
+            record = await cursor.fetchone()
+
+        if not record:
+            return await interaction.followup.send(f"⚠️ **检测到水印但由于数据丢失无法匹配！**\nTraceID: `{trace_id}`\n数据库中未找到该记录。", ephemeral=True)
+
+        # 4. 生成详细报告
+        downloader = interaction.guild.get_member(record['user_id'])
+        user_text = f"{downloader.mention} ({record['user_id']})" if downloader else f"未知用户 ({record['user_id']})"
+
+        dl_time = datetime.fromisoformat(record['created_at']).strftime('%Y-%m-%d %H:%M:%S')
+
+        embed = discord.Embed(title="🔍 溯源报告", color=0xff0000)
+        embed.description = f"**文件**: `{record['filename']}`\n**溯源 ID**: `{trace_id}`"
+
+        embed.add_field(name="👤 下载者", value=user_text, inline=False)
+        embed.add_field(name="📅 下载时间", value=dl_time, inline=True)
+        embed.add_field(name="📍 来源服务器/频道", value=f"Guild: {record['guild_id']}\nChannel: <#{record['channel_id']}>", inline=True)
+        embed.add_field(name="🔗 原始资源ID", value=f"`{record['message_id']}`", inline=False)
+
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="保护机制 · 幽灵追踪系统")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
     # --- 用户命令 ---
