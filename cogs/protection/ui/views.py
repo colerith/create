@@ -420,3 +420,47 @@ class PostListView(ui.View):
 
             # 验证通过后，进入注入流程
             await start_download_flow(interaction, self.bot, row)
+
+class BumpButtonView(ui.View):
+    def __init__(self, bot, original_message_id: int):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.original_message_id = original_message_id
+
+    # --- 新增：这个方法负责“打包”外观和按钮 ---
+    @classmethod
+    def create_layout(cls, bot, original_message_id: int) -> dict:
+        """
+        生成标准的置底消息布局，包含文案和按钮视图。
+        返回一个字典，可以直接作为参数传给 send() 方法。
+        """
+        description = (
+            "## 📦 附件下载通道\n\n"
+            "本帖附件已包含安全溯源指纹**。\n"
+            "为方便新访客查找，此下载入口将自动保持在话题底部。\n\n"
+            "⬇️ **请点击下方按钮开始获取** ⬇️"
+        )
+
+        view = cls(bot, original_message_id)
+
+        return {
+            "content": description,
+            "view": view
+        }
+
+    # --- 按钮回调逻辑保持不变 ---
+    @ui.button(label="🎁 获取附件", style=discord.ButtonStyle.success, emoji="📦")
+    async def btn_get_file(self, interaction: discord.Interaction, button: ui.Button):
+        try:
+            from ..db import get_db
+
+            async with get_db() as db:
+                cursor = await db.execute("SELECT * FROM download_rules WHERE message_id = ?", (self.original_message_id,))
+                row = await cursor.fetchone()
+
+            if not row:
+                return await interaction.response.send_message("❌ 原文件数据已失效或被删除。", ephemeral=True)
+            await interaction.response.send_message(f"正在获取原始消息 {self.original_message_id} 的附件...", ephemeral=True)
+
+        except Exception as e:
+            await interaction.response.send_message(f"❌ 系统错误: {e}", ephemeral=True)
