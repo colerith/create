@@ -74,18 +74,34 @@ class ChimidanBot(commands.Bot):
 bot = ChimidanBot()
 
 @bot.command(name="sync")
+@commands.is_owner() # 确保只有你能用
 async def sync(ctx):
     """
-    开发神器：输入 !sync 立即刷新斜杠命令！
+    强力同步：清除当前服务器的旧命令缓存，并重新同步。
+    解决命令重复或不显示的问题。
     """
-    print(f"🔄 收到同步指令，来自: {ctx.author}")
+    print(f"🔄 收到强力同步指令，来自: {ctx.author}")
     async with ctx.typing():
         try:
-            # 先同步到当前服务器（生效最快）
+            # 1. 先清除当前公会的命令（解决重复显示的问题）
+            bot.tree.clear_commands(guild=ctx.guild)
+
+            # 2. 从全局 Tree 复制最新的命令副本到当前公会
             bot.tree.copy_global_to(guild=ctx.guild)
+
+            # 3. 执行同步
             synced = await bot.tree.sync(guild=ctx.guild)
-            await ctx.send(f"✅ **同步成功！**\n已将 {len(synced)} 个命令同步到本服务器。\n(你现在应该能看到 /置底附件 了)")
-            print(f"✅ 已同步 {len(synced)} 个命令到 Guild {ctx.guild.id}")
+
+            await ctx.send(
+                f"✅ **同步与清理完成！**\n"
+                f"已清除旧缓存，并重新注册了 **{len(synced)}** 个命令到本服务器。\n"
+                f"现在的结构应该是：\n"
+                f"- `/贴主 ...` (包含置底附件)\n"
+                f"- `/保护附件 ...`\n"
+                f"- `/管理员专用 ...`"
+            )
+            print(f"✅ Guild {ctx.guild.id} 同步完成，共 {len(synced)} 个命令。")
+
         except Exception as e:
             await ctx.send(f"❌ 同步失败: {e}")
             print(f"❌ 同步出错: {e}")
