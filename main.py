@@ -3,6 +3,7 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import aiohttp
+import asyncio
 
 # 确保你的数据库导入路径是正确的
 from database import init_db
