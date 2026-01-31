@@ -185,8 +185,9 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.update_dashboard(interaction)
 
-    @maker_group.command(name="置底附件", description="每10分钟检查附件按钮是否在底部，被顶走则重发 (仅贴主/管理可用)")
-    @app_commands.describe(original_message_id="包含附件数据的原始消息ID (如果不填则尝试自动查找)")
+        # 妈妈修正后的 auto_bump：修复了表名错误，简化了逻辑
+    @maker_group.command(name="置底附件", description="开启/关闭自动置底：检测到底部不是按钮时重发 (贴主/管理可用)")
+    @app_commands.describe(original_message_id="填 off 关闭。不填则默认开启（无需指定特定ID，按钮只负责唤起面板）")
     async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
         """
         开启附件自动置底功能。输入 off 可以关闭当前频道的置底。
@@ -205,47 +206,40 @@ class ProtectionCog(commands.Cog):
         # --- 2. 关闭功能的逻辑 ---
         if original_message_id and original_message_id.lower() == "off":
             if channel.id in self.bump_tasks:
-                self.bump_tasks[channel.id].cancel() # 取消任务
+                self.bump_tasks[channel.id].cancel()
                 del self.bump_tasks[channel.id]
                 return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能。", ephemeral=True)
             else:
                 return await interaction.response.send_message("⚠️ 本频道当前没有开启自动置底。", ephemeral=True)
 
-        # --- 3. 确定原始消息 ID ---
-        target_msg_id = None
-        if original_message_id:
-            try:
-                target_msg_id = int(original_message_id)
-            except:
-                return await interaction.response.send_message("❌ 消息 ID 格式错误。", ephemeral=True)
-        else:
-            # 自动查找逻辑：在数据库里找属于这个频道且有下载数据的最新一条消息
-            async with get_db() as db:
-                cursor = await db.execute("SELECT message_id FROM download_rules WHERE channel_id = ? ORDER BY timestamp DESC LIMIT 1", (channel.id,))
-                res = await cursor.fetchone()
-                if res:
-                    target_msg_id = res[0]
+        # --- 3. 检查是否有数据 ---
+        # 只要本频道在 protected_items 表里有任何记录，就可以开启
+        async with get_db() as db:
+            # 妈妈在这里修正了表名：download_rules -> protected_items
+            cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ? LIMIT 1", (channel.id,))
+            res = await cursor.fetchone()
 
-        if not target_msg_id:
-            return await interaction.response.send_message("❌ 找不到有效的文件记录，请手动输入 `original_message_id`。", ephemeral=True)
+        if not res:
+            return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录，无法开启置底。", ephemeral=True)
 
         # --- 4. 启动任务 ---
-        # 如果已经有任务在运行，先停掉旧的
         if channel.id in self.bump_tasks:
             self.bump_tasks[channel.id].cancel()
 
-        # 创建后台任务
-        task = asyncio.create_task(self._bump_loop(channel, target_msg_id))
+        # 这里的 origin_id 参数其实已经不重要了，因为我们的按钮是通用的
+        # 但为了保持结构，我们传 0 或者 None 进去都行
+        task = asyncio.create_task(self._bump_loop(channel))
         self.bump_tasks[channel.id] = task
 
-        await interaction.response.send_message(f"✅ **自动置底已开启**\n关联源消息: `{target_msg_id}`\n机制: 每 10 分钟检查一次，若不是最新消息则重发。", ephemeral=True)
+        await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将每 10 分钟检查一次，并提供快捷唤起面板的按钮。", ephemeral=True)
 
-    async def _bump_loop(self, channel, origin_id):
+    async def _bump_loop(self, channel):
         """
         后台循环任务：每10分钟检查一次
         """
-        # 只需要导入 View 类即可，不需要在这里写长长的文案了
         from .ui.views import BumpButtonView
+
+        print(f"✅ [置底任务启动] 频道: {channel.name} ({channel.id})")
 
         last_bump_msg = None
 
@@ -260,24 +254,24 @@ class ProtectionCog(commands.Cog):
 
                     if not latest_msg:
                         need_resend = True
-                    elif last_bump_msg and latest_msg.id == last_bump_msg.id:
-                        need_resend = False
+                    # 如果最新那条消息就是我们要发的置底消息（通过判断是不是机器人发的且带组件），那就不动
+                    elif latest_msg.author.id == self.bot.user.id and latest_msg.components:
+                         # 这里简单判断一下，实际上这足够了
+                         last_bump_msg = latest_msg
+                         need_resend = False
                     else:
                         need_resend = True
 
                     if need_resend:
-                        # 删除旧消息
+                        # 删除旧的（如果是我们自己发的）
                         if last_bump_msg:
                             try:
                                 await last_bump_msg.delete()
-                            except (discord.NotFound, discord.Forbidden):
-                                pass
+                            except: pass # 删不掉就算了
 
-                        # --- 核心变化：直接调用 View 的类方法获取发送参数 ---
-                        # 这行代码现在的含义是：给我一套“BumpButtonView”的标准外观参数
-                        send_kwargs = BumpButtonView.create_layout(self.bot, origin_id)
-
-                        # 使用 ** 解包字典，自动填入 content 和 view
+                        # 2. 发送新的
+                        # 调用我们新写的 create_layout，不需要参数了
+                        send_kwargs = BumpButtonView.create_layout(self.bot)
                         last_bump_msg = await channel.send(**send_kwargs)
 
                 except discord.Forbidden:
@@ -286,11 +280,12 @@ class ProtectionCog(commands.Cog):
                 except Exception as e:
                     print(f"[{channel.id}] 置底任务出错: {e}")
 
-                # 等待 10 分钟
+                # 等待 10 分钟 (600秒)
                 await asyncio.sleep(600)
 
         except asyncio.CancelledError:
             pass
+
 
 async def setup(bot):
     await bot.add_cog(ProtectionCog(bot))
