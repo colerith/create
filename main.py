@@ -107,47 +107,75 @@ async def sync(ctx):
             await ctx.send(f"❌ 同步失败: {e}")
             print(f"❌ 同步出错: {e}")
 
+# 将此代码放入 main.py，替换原来的 clearsync
+
 @bot.command(name="clearsync")
-@commands.is_owner() # 确保只有你能用
+@commands.is_owner()
 async def clearsync(ctx):
     """
-    【核弹级清理】彻底在此服务器清除所有旧命令缓存，然后重新同步。
-    专治：命令重复、删不掉的幽灵命令。
+    【容错版核弹清理】彻底刷新命令缓存。
+    即使消息丢失也能正常反馈结果。
     """
-    status_msg = await ctx.send("🧹 **正在执行深度清理...**\n⏳ 第一步：正在抹除旧命令...")
+    # 1. 先发一条初始消息
+    try:
+        status_msg = await ctx.send("🧹 **正在执行深度清理...**\n⏳ 第一步：正在抹除旧命令缓存...")
+    except:
+        # 如果连发消息都失败，直接不跑了（极少见）
+        return
+
+    # 定义一个更稳健的更新函数，防止消息被删导致报错
+    async def safe_update(text):
+        nonlocal status_msg
+        try:
+            await status_msg.edit(content=text)
+        except discord.NotFound:
+            # 如果原来的消息找不到了（报错404），就发条新的
+            status_msg = await ctx.send(text)
+        except Exception as e:
+            # 其他情况也发新的
+            status_msg = await ctx.send(f"{text}\n(PS: 之前消息更新失败: {e})")
 
     try:
-        # 1. 先清空当前关联的命令树，并强制同步一次“空状态”
-        # 这会让 Discord 认为“这个机器人没有任何命令了”，从而删掉所有旧的
+        # --- 核心清理逻辑 ---
+
+        # 步骤 1: 强制清空当前服务器的命令树
+        # 这会告诉 Discord：“这个服务器现在没有任何命令”
         bot.tree.clear_commands(guild=ctx.guild)
         await bot.tree.sync(guild=ctx.guild)
 
-        await status_msg.edit(content="🧹 **正在执行深度清理...**\n✅ 旧命令已抹除。\n⏳ 第二步：正在重新加载正确命令...")
+        # 更新进度
+        await safe_update("🧹 **正在执行深度清理...**\n✅ 第一步完成：旧命令已全部标记为删除。\n⏳ 第二步：正在加载最新代码并重新上传...")
 
-        # 稍微停顿一下，防止API请求过快
+        # 稍微歇一口气，防止 API 请求过快
         await asyncio.sleep(2)
 
-        # 2. 从已有代码中重新加载命令
-        # copy_global_to 会把你代码里写好的那些 (@app_commands.command) 都搬过来
+        # 步骤 2: 将代码里的命令重新加载进来
         bot.tree.copy_global_to(guild=ctx.guild)
 
-        # 3. 再次同步，这次上传的就是干净的新版本了
+        # 步骤 3: 再次同步，上传正确版本
         synced = await bot.tree.sync(guild=ctx.guild)
 
-        await status_msg.edit(
-            content=f"✨ **清理完毕！焕然一新！**\n"
-                    f"共重新注册了 **{len(synced)}** 个命令。\n"
-                    f"现在的命令列表应该是：\n"
-                    f"- `/贴主` (内含置底附件)\n"
-                    f"- `/保护附件`\n"
-                    f"- `/管理员专用`\n\n"
-                    f"⚠️ **请务必重启你的 Discord 客户端 (Ctrl+R) 以查看最新效果。**"
+        # --- 结束报告 ---
+        final_msg = (
+            f"✨ **清理完毕！命令树已重建。**\n"
+            f"📊 重新注册命令数：**{len(synced)}** 个。\n"
+            f"----------------------------------\n"
+            f"现在你应该只能看到以下 3 个主命令组：\n"
+            f"1️⃣ `/贴主` (包含置底功能)\n"
+            f"2️⃣ `/保护附件` (下载与管理)\n"
+            f"3️⃣ `/管理员专用` (配置与迁移)\n\n"
+            f"⚠️ **重要提示**：\n"
+            f"如果你还能看到其他奇怪的命令，请务必 **重启你的 Discord 客户端** (Ctrl+R / 杀后台重启 APP)。"
         )
-        print(f"✅ Guild {ctx.guild.id} 命令重置完成，共 {len(synced)} 个。")
+        await safe_update(final_msg)
+        print(f"✅ Guild {ctx.guild.id} 清理同步完成，共 {len(synced)} 个命令。")
 
     except Exception as e:
-        await status_msg.edit(content=f"❌ 清理失败: {e}")
-        print(f"❌ Clearsync Error: {e}")
+        # 如果出错，直接发新消息报错，不用 edit 了
+        await ctx.send(f"❌ **清理过程中断**\n错误详情: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 if __name__ == "__main__":
     bot.run(TOKEN)
