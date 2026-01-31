@@ -37,35 +37,41 @@ class AuthorNoteView(ui.View):
 
         # 禁用按钮防止重复点击，并更新提示
         button.disabled = True
-        button.label = "🔍 正在处理溯源..." # 给用户一点反馈，说明我们在干活
+        button.label = "🔍 正在处理溯源..."
         await interaction.response.edit_message(view=self)
 
         # 下载逻辑
         try:
-            # 1. 获取原始文件数据
+            # 1. 获取原始文件数据 (这里面存着我们改好的正确文件名！)
             file_data = json.loads(self.row['storage_urls'])
+
+            # 2. 下载文件内容 (这里返回的文件名往往是被Discord处理过的乱码或下划线)
             raw_results = await fetch_files_common(self.bot, file_data)
 
-            # 2. 记录普通下载日志
+            # 3. 记录普通下载日志
             await record_download_common(interaction.user, self.row)
 
             if raw_results:
                 final_files_to_send = []
-                # 获取当前环境信息用于记录
                 guild_id = interaction.guild_id if interaction.guild else 0
                 channel_id = interaction.channel_id
                 timestamp = datetime.now(TZ_SHANGHAI).isoformat()
 
                 # --- 核心溯源注入逻辑 ---
-                for res in raw_results:
+                # 修改点：使用了 enumerate 来同时获取索引 i
+                # 这样我们就能通过 file_data[i]['filename'] 拿到正确的中文名
+                for i, res in enumerate(raw_results):
+                    # 尝试获取正确的显示文件名，如果拿不到就只好用原始的
+                    correct_filename = file_data[i].get('filename', res['filename'])
+
                     # A. 生成唯一追踪码
                     trace_id = generate_trace_id()
 
-                    # B. 注入指纹 (修改文件二进制数据)
-                    # 注意：inject_smart_trace 会根据文件类型自动选择注入方式
+                    # B. 注入指纹
+                    # 注意：这里我们依然传 correct_filename 进去，以便注入工具能正确识别文件类型
                     new_bytes = inject_smart_trace(
                         res['bytes'],
-                        res['filename'],
+                        correct_filename,
                         trace_id
                     )
 
@@ -76,23 +82,23 @@ class AuthorNoteView(ui.View):
                         guild_id=guild_id,
                         channel_id=channel_id,
                         message_id=self.row['message_id'],
-                        filename=res['filename'],
+                        filename=correct_filename, # 记录里也存正确名字
                         timestamp=timestamp
                     )
 
                     # D. 构建发送用的文件对象
+                    # 关键修改：这里强制使用 correct_filename 作为发送给用户的文件名！
                     final_files_to_send.append(
-                        discord.File(io.BytesIO(new_bytes), filename=res['filename'])
+                        discord.File(io.BytesIO(new_bytes), filename=correct_filename)
                     )
                 # -----------------------
 
-                # 计算剩余额度
+                # 计算剩余额度 (这一块保持不变)
                 today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
                 async with get_db() as db:
                     cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
                     cnt = (await cursor.fetchone())[0]
 
-                # 发送处理后的文件 (带指纹)
                 await interaction.followup.send(
                     content=f"✅ **获取成功！**\n🛡️ 本文件包含溯源指纹，请勿私自转传。\n今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}\n请查收下方附件：",
                     files=final_files_to_send,
@@ -101,10 +107,10 @@ class AuthorNoteView(ui.View):
             else:
                 await interaction.followup.send("❌ 文件数据读取失败，请联系管理员。", ephemeral=True)
         except Exception as e:
-            # 打印错误方便调试
             import traceback
             traceback.print_exc()
             await interaction.followup.send(f"❌ 发生未知错误: {e}", ephemeral=True)
+
 
 async def start_download_flow(interaction: discord.Interaction, bot, row):
     """
