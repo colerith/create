@@ -442,7 +442,7 @@ class BumpButtonView(discord.ui.View):
         )
         return {"embed": embed, "view": view}
 
-    @discord.ui.button(label="📥 获取本帖附件", style=discord.ButtonStyle.blurple, custom_id="bump_get_attachments", emoji="📂")
+    @discord.ui.button(label="获取本帖附件", style=discord.ButtonStyle.blurple, custom_id="bump_get_attachments", emoji="📥")
     async def get_attachments_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # 核心逻辑：复刻 /保护附件 获取附件 的功能
         # 1. 查库
@@ -471,4 +471,3 @@ class BumpButtonView(discord.ui.View):
 
         # 3. 发送给用户（仅自己可见）
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
