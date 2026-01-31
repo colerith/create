@@ -347,6 +347,7 @@ class RecommendCog(commands.Cog):
 
     # --- 手动调试命令 ---
     @app_commands.command(name="更新推荐面板", description="[管理] 强制刷新并重发今日推荐")
+    @app_commands.default_permissions(view_audit_log=True)
     async def manual_recommend(self, interaction: discord.Interaction):
         is_admin = interaction.user.guild_permissions.administrator
         is_tester = False
