@@ -16,20 +16,58 @@ from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Context Menu
         self.ctx_menu = app_commands.ContextMenu(
             name="转为保护附件",
             callback=self.convert_to_protected
         )
         self.bot.tree.add_command(self.ctx_menu)
         self.bot.loop.create_task(init_likes_db())
+        self.bump_tasks = {}
 
-    # 命令组定义
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
     user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
 
-    # 管理员组添加权限装饰器
     admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
+
+    async def cog_load(self):
+        """
+        插件加载时的钩子函数：
+        1. 确保数据库表存在。
+        2. 从数据库恢复所有已开启的置底任务。
+        """
+        print("🔄 [ProtectionCog] 正在初始化置底模块...")
+        async with get_db() as db:
+            # 1. 建表：记录哪些频道开启了置底 (简单存个 channel_id 就行)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bump_config (
+                    channel_id INTEGER PRIMARY KEY
+                )
+            """)
+            await db.commit()
+
+            # 2. 读取配置：查出所有开启了置底的频道
+            cursor = await db.execute("SELECT channel_id FROM bump_config")
+            rows = await cursor.fetchall()
+
+        # 3. 恢复任务
+        count = 0
+        for row in rows:
+            channel_id = row[0]
+            # 获取频道对象（可能需要从缓存获取，如果缓存没有可能需要 fetch）
+            channel = self.bot.get_channel(channel_id)
+
+            # 如果缓存里没有（Bot刚启动可能还没同步完），尝试 fetch 或者忽略
+            # 为了稳健，我们先检查是否只是 None
+            if channel:
+                # 启动循环任务（复用你的 _bump_loop）
+                task = self.bot.loop.create_task(self._bump_loop(channel))
+                self.bump_tasks[channel_id] = task
+                count += 1
+            else:
+                print(f"⚠️ [警告] 无法恢复频道 {channel_id} 的置底任务（频道可能被删或Bot不可见）。")
+
+        print(f"✅ [ProtectionCog] 初始化完成。已恢复 {count} 个频道的自动置底任务。")
+
 
     async def cog_unload(self):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
@@ -51,12 +89,39 @@ class ProtectionCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
-        if isinstance(message.channel, discord.Thread) and is_valid_comment(message.content):
-            thread_id = message.channel.id 
+
+        # 确保是在帖子(Thread)里
+        if not isinstance(message.channel, discord.Thread):
+            return
+
+        # --- 逻辑 A: 原有的评论统计功能 ---
+        if is_valid_comment(message.content):
+            thread_id = message.channel.id
             async with get_db() as db:
                 await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (message.author.id, thread_id, message.content[:50]))
                 await db.commit()
 
+        # --- 逻辑 B: 新增的自动置底功能 ---
+        # 只有当消息包含附件，才去检查是不是贴主
+        if message.attachments:
+            # 检查身份：是否是贴主本人
+            is_owner = False
+            if message.channel.owner_id == message.author.id:
+                is_owner = True
+            elif message.channel.owner_id is None:
+                # 缓存缺失时的备用检查
+                try:
+                    thread = await message.guild.fetch_channel(message.channel.id)
+                    if thread.owner_id == message.author.id:
+                        is_owner = True
+                except:
+                    pass
+
+            if is_owner:
+                print(f"📥 [自动置底] 监测到贴主 {message.author} 在 {message.channel.name} 发布了新附件，正在执行置底...")
+                asyncio.create_task(self.update_sticky_message(message.channel))
+
+    
     # --- 管理员命令 ---
     @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮（改用命令）")
     async def fix_panels(self, interaction: discord.Interaction):
@@ -77,7 +142,7 @@ class ProtectionCog(commands.Cog):
         await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
     
     @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
-    @admin_group.describe(file="请上传需要检查的文件")
+    @app_commands.describe(file="请上传需要检查的文件")
     async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
         await interaction.response.defer(ephemeral=True) 
 
@@ -120,6 +185,7 @@ class ProtectionCog(commands.Cog):
         embed.set_footer(text="保护机制 · 幽灵追踪系统")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
 
     # --- 用户命令 ---
     @user_group.command(name="今日下载记录", description="查询今日下载历史和剩余次数")
@@ -183,6 +249,178 @@ class ProtectionCog(commands.Cog):
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87ceeb)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.update_dashboard(interaction)
+
+    @maker_group.command(name="置底附件", description="开启/关闭自动置底：检测到底部不是按钮时重发 (贴主/管理可用)")
+    @app_commands.describe(original_message_id="填 off 关闭。不填则默认开启（无需指定特定ID）")
+    async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
+        """
+        开启附件自动置底功能，并持久化保存配置。
+        """
+        channel = interaction.channel
+
+        # --- 1. 权限检查 ---
+        is_admin = interaction.user.guild_permissions.administrator
+        is_owner = False
+        if isinstance(channel, discord.Thread) and channel.owner_id == interaction.user.id:
+            is_owner = True
+
+        if not (is_admin or is_owner):
+            return await interaction.response.send_message("❌ 只有 **管理员** 或 **贴主** 才能使用此功能。", ephemeral=True)
+
+        # --- 2. 关闭功能的逻辑 ---
+        if original_message_id and original_message_id.lower() == "off":
+            # A. 停止内存中的任务
+            if channel.id in self.bump_tasks:
+                self.bump_tasks[channel.id].cancel()
+                del self.bump_tasks[channel.id]
+
+            # B. 从数据库删除记录 (新增步骤)
+            async with get_db() as db:
+                await db.execute("DELETE FROM bump_config WHERE channel_id = ?", (channel.id,))
+                await db.commit()
+
+            return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能（配置已保存）。", ephemeral=True)
+
+        # --- 3. 开启功能的逻辑 ---
+        # 只要有一条受保护记录即可开启
+        async with get_db() as db:
+            cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ? LIMIT 1", (channel.id,))
+            res = await cursor.fetchone()
+
+        if not res:
+            return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录，无法开启置底。", ephemeral=True)
+
+        # A. 启动/重启内存任务
+        if channel.id in self.bump_tasks:
+            self.bump_tasks[channel.id].cancel() # 先停掉旧的防止双重运行
+
+        task = self.bot.loop.create_task(self._bump_loop(channel))
+        self.bump_tasks[channel.id] = task
+
+        # B. 写入数据库 (新增步骤)
+        async with get_db() as db:
+            await db.execute("INSERT OR IGNORE INTO bump_config (channel_id) VALUES (?)", (channel.id,))
+            await db.commit()
+
+        await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将每 10 分钟检查一次。\n(配置已保存，Bot 重启后会自动恢复任务)", ephemeral=True)
+
+
+    async def _bump_loop(self, channel):
+        """
+        后台循环任务：每10分钟检查一次
+        具备【智能修复】功能：
+        1. 搜索最近20条消息。
+        2. 如果发现旧的面板且它是最新的 -> 原地复活（编辑修复按钮）。
+        3. 如果旧面板被新消息压住了 -> 删旧发新（保持置底）。
+        4. 没找到 -> 发新的。
+        """
+        from .ui.views import BumpButtonView
+
+        print(f"✅ [置底任务启动] 频道: {channel.name} ({channel.id})")
+
+        try:
+            while True:
+                try:
+                    # 1. 准备好全新的界面数据（按钮是“活”的）
+                    layout_data = BumpButtonView.create_layout(self.bot)
+                    new_view = layout_data.get('view')
+
+                    # 2. 扫描最近 20 条消息
+                    history_msgs = [msg async for msg in channel.history(limit=20)]
+
+                    found_old_bump = None
+                    is_latest = False
+
+                    for i, msg in enumerate(history_msgs):
+                        if msg.author.id == self.bot.user.id and msg.components:
+                            found_old_bump = msg
+                            if i == 0:
+                                is_latest = True
+
+                    # 3. 决策逻辑
+                    if found_old_bump:
+                        if is_latest:
+                            print(f"🔧 [自动修复] 在 {channel.name} 修复旧面板按钮...")
+                            await found_old_bump.edit(**layout_data)
+                        else:
+                            try:
+                                await found_old_bump.delete()
+                            except:
+                                pass
+                            await channel.send(**layout_data)
+                    else:
+                        await channel.send(**layout_data)
+
+                except discord.Forbidden:
+                    print(f"[{channel.id}] 失去权限，停止置底循环。")
+                    break
+                except Exception as e:
+                    print(f"[{channel.id}] 置底任务出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # 等待 10 分钟
+                await asyncio.sleep(600)
+
+        except asyncio.CancelledError:
+            print(f"🛑 [置底任务停止] 频道: {channel.name}")
+
+    async def update_sticky_message(self, thread: discord.Thread):
+        """
+        核心函数：扫描全贴附件 -> 删除旧置底 -> 发送新置底
+        """
+        try:
+            image_data = []
+            async for msg in thread.history(limit=None):
+                if msg.author.id == thread.owner_id and msg.attachments:
+                    for att in msg.attachments:
+                        if att.content_type and (att.content_type.startswith('image/') or att.content_type.startswith('video/')):
+                            image_data.append(att.url)
+
+            if not image_data:
+                return
+
+            image_data.reverse()
+
+            embed = discord.Embed(
+                title="📂 贴主附件汇总",
+                description=f"检测到新附件发布，已自动更新置底。\n当前共收录 **{len(image_data)}** 个文件。",
+                color=0x2b2d31
+            )
+
+            content_str = ""
+            for i, url in enumerate(image_data):
+                line = f"{i+1}. [附件链接]({url})\n"
+                if len(content_str) + len(line) > 3500: # 留点余量
+                    content_str += f"...还有 {len(image_data) - i} 个文件未显示"
+                    break
+                content_str += line
+
+            embed.description += "\n\n" + content_str
+
+            async with get_db() as db:
+                cursor = await db.execute("SELECT message_id FROM sticky_messages WHERE channel_id = ?", (thread.id,))
+                row = await cursor.fetchone()
+
+            if row:
+                old_msg_id = row[0]
+                try:
+                    old_msg = await thread.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    print(f"删除旧置底失败: {e}")
+
+            new_msg = await thread.send(embed=embed, silent=True)
+
+            async with get_db() as db:
+                await db.execute("INSERT OR REPLACE INTO sticky_messages (channel_id, message_id) VALUES (?, ?)", (thread.id, new_msg.id))
+                await db.commit()
+
+        except Exception as e:
+            print(f"❌ 执行置底更新时出错: {e}")
+
 
 async def setup(bot):
     await bot.add_cog(ProtectionCog(bot))
