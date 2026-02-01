@@ -233,11 +233,11 @@ class ProtectionCog(commands.Cog):
             embed.add_field(name="详细记录", value=log_text[:1024], inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @user_group.command(name="获取附件", description="显示本频道最近的5个受保护附件列表")
+    @user_group.command(name="获取附件", description="显示本频道最近的10个受保护附件列表")
     async def get_attachments_list(self, interaction: discord.Interaction):
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 5", (interaction.channel.id,))
+            cursor = await db.execute("SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 10", (interaction.channel.id,))
             rows = await cursor.fetchall()
         if not rows: return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录。", ephemeral=True)
         view = PostListView(self.bot, rows)
@@ -246,6 +246,28 @@ class ProtectionCog(commands.Cog):
 
     # --- 贴主命令 ---
     @maker_group.command(name="管理附件", description="查看和管理我发布的保护贴及附件")
+    async def _get_active_posts(self, channel, owner_id: int):
+        """
+        [修复] 这是一个辅助方法，用于从数据库中获取当前频道内属于该用户的所有活跃保护贴。
+        供 manage_attachments 命令使用。
+        """
+        async with get_db() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM protected_items WHERE channel_id = ? AND owner_id = ?",
+                (channel.id, owner_id)
+            )
+            rows = await cursor.fetchall()
+
+            posts = []
+            for row in rows:
+                p = dict(row)
+                if not p.get('title'):
+                    p['title'] = "未命名附件"
+                posts.append(p)
+
+            return posts
+
     async def manage_attachments(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         posts = await self._get_active_posts(interaction.channel, owner_id=interaction.user.id)
