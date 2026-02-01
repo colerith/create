@@ -8,53 +8,67 @@ import struct
 import binascii
 import os
 import uuid
+import random
 from datetime import datetime
 from database import get_db
 from .constants import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
-# 定义我们的魔法签名，用于在二进制末尾识别
+# --- 魔法签名与隐写配置 ---
 # 格式: 0x00 + NOVA_TRACE: + UUID(12)
 MAGIC_HEADER = b'\x00NOVA_TRACE:'
+
+# 零宽字符映射表：用于将二进制 0/1 转换为不可见字符
+# \u200b (Zero Width Space) -> 0
+# \u200c (Zero Width Non-Joiner) -> 1
+ZW_ZERO = '\u200b'
+ZW_ONE  = '\u200c'
 
 def generate_trace_id():
     """生成12位短ID"""
     return uuid.uuid4().hex[:12]
 
+# --- 零宽字符隐写工具函数 ---
+def text_to_zw(text: str) -> str:
+    """将普通文本转换为零宽字符序列"""
+    binary = ''.join(format(ord(c), '08b') for c in text)
+    return ''.join(ZW_ZERO if b == '0' else ZW_ONE for b in binary)
+
+def zw_to_text(zw_string: str) -> str:
+    """提取并在零宽字符序列中解码出原文本"""
+    # 过滤掉非零宽字符
+    filtered = [c for c in zw_string if c in (ZW_ZERO, ZW_ONE)]
+    if not filtered: return None
+
+    binary_str = ''.join('0' if c == ZW_ZERO else '1' for c in filtered)
+
+    # 每8位转回一个字符
+    chars = []
+    for i in range(0, len(binary_str), 8):
+        byte = binary_str[i:i+8]
+        if len(byte) < 8: break
+        chars.append(chr(int(byte, 2)))
+    return ''.join(chars)
+
 def _inject_png_text_chunk(data, key, text):
     """
     专门为 PNG 注入 tEXt 块。
-    PNG结构: Header + Chunks... + IEND
-    我们要在 IEND 之前插入一个 tEXt chunk。
     """
-    # PNG Signature
-    if data[:8] != b'\x89PNG\r\n\x1a\n':
-        return data # 不是PNG，放弃
+    if data[:8] != b'\x89PNG\r\n\x1a\n': return data
 
-    # 构建 tEXt chunk 数据
-    # 格式: Keyword + \x00 + Text
     raw_data = key.encode('latin-1') + b'\x00' + text.encode('latin-1')
     length = len(raw_data)
-
-    # Chunk Structure: Length(4) + Type(4) + Data + CRC(4)
     chunk_type = b'tEXt'
     crc = binascii.crc32(chunk_type)
     crc = binascii.crc32(raw_data, crc) & 0xffffffff
-
     chunk = struct.pack('!I', length) + chunk_type + raw_data + struct.pack('!I', crc)
 
-    # 找到 IEND 块的位置 (通常在最后 12 字节: Len(0) + IEND + CRC)
-    # 简单做法：直接插在 IEND 前面
-    # IEND chunk 总是: 00 00 00 00 49 45 4E 44 AE 42 60 82
     iend_pos = data.rfind(b'\x00\x00\x00\x00IEND\xaeB`\x82')
-    if iend_pos == -1:
-        # 找不到标准结尾，直接追加在末尾
-        return data + chunk
-
+    if iend_pos == -1: return data + chunk
     return data[:iend_pos] + chunk + data[iend_pos:]
 
 def inject_smart_trace(file_bytes, filename, trace_id):
     """
-    智能注入溯源信息
+    智能注入溯源信息 (升级版：支持隐形水印)
     """
     ext = os.path.splitext(filename)[1].lower()
 
@@ -64,27 +78,41 @@ def inject_smart_trace(file_bytes, filename, trace_id):
             print(f"Injecting PNG Trace: {trace_id}")
             return _inject_png_text_chunk(file_bytes, "Software", f"ProtectionBot | ID:{trace_id}")
 
-        # 策略 2: JSON 字段注入
+        # 策略 2: JSON 高级隐写
         elif ext == '.json':
             try:
-                # 尝试解析 JSON
                 content = file_bytes.decode('utf-8')
                 json_obj = json.loads(content)
 
-                # 只有当它是字典(对象)时才能插入 Key
                 if isinstance(json_obj, dict):
-                    # 插入放在第一位或者最后都可以，这里直接赋值
-                    json_obj['_protection_trace'] = {
-                        'id': trace_id,
-                        'note': 'This file is tracked based on its download record.'
-                    }
-                    # 重新转回 bytes，保持缩进美观
+                    # A. 生成隐形水印 (零宽字符)
+
+                    target_key = None
+                    for k, v in json_obj.items():
+                        if isinstance(v, str) and len(v) > 0:
+                            target_key = k
+                            break
+
+                    hidden_mark = text_to_zw(f"TRACE:{trace_id}")
+
+                    if target_key:
+                        # 注入到现有的字符串值末尾 (肉眼看不见)
+                        json_obj[target_key] += hidden_mark
+
+                    # B. 伪装字段 (明面上的诱饵)
+                    # 故意放一个看起来像 Hash 的东西，让破解者以为这是水印
+                    fake_hash = uuid.uuid4().hex
+                    json_obj['_integrity_check'] = f"{fake_hash}.{trace_id[:4]}"
+
+                    # C. 防止小白直接删字段：在最外层再加一个隐形 Key (如果解析器允许)
+                    # 但为了兼容性，我们主要依赖 A 方案
+
                     return json.dumps(json_obj, indent=2, ensure_ascii=False).encode('utf-8')
             except:
-                pass # 解析失败，回退到通用追加
+                pass # JSON解析失败，回退
 
-        # 策略 3: 通用二进制追加 (对绝大多数文件有效且无害)
-        # 直接在文件屁股后面加: \x00NOVA_TRACE:xxxxxx
+        # 策略 3: 通用二进制追加 (保底方案)
+        # 直接在末尾追加二进制水印
         trace_payload = MAGIC_HEADER + trace_id.encode('ascii')
         return file_bytes + trace_payload
 
@@ -94,39 +122,51 @@ def inject_smart_trace(file_bytes, filename, trace_id):
 
 def extract_trace_from_bytes(file_bytes, filename):
     """
-    尝试从文件数据中提取 TraceID
+    尝试从文件数据中提取 TraceID (升级版：支持读取隐形水印)
     返回: trace_id_str 或 None
     """
     try:
         ext = os.path.splitext(filename)[1].lower()
+        trace_id = None
 
-        # 1. 检查通用追加尾巴 (最快)
-        # 搜索 MAGIC_HEADER
-        pos = file_bytes.rfind(MAGIC_HEADER)
-        if pos != -1:
-            # 提取 header 后的 12 位 ID
-            start = pos + len(MAGIC_HEADER)
-            trace_id = file_bytes[start:start+12].decode('ascii', errors='ignore')
-            return trace_id
-
-        # 2. 检查 JSON 字段
+        # 1. 优先检查 JSON 隐形水印 (最高优先级)
         if ext == '.json':
             try:
                 content = file_bytes.decode('utf-8')
+
+                decoded_text = zw_to_text(content)
+                if decoded_text and "TRACE:" in decoded_text:
+                    # 提取 TRACE: 后面的部分
+                    match = re.search(r'TRACE:([a-f0-9]{12})', decoded_text)
+                    if match:
+                        return match.group(1)
+
                 json_obj = json.loads(content)
-                if isinstance(json_obj, dict) and '_protection_trace' in json_obj:
-                    return json_obj['_protection_trace'].get('id')
+                if isinstance(json_obj, dict):
+                    # 检查旧版字段
+                    if '_protection_trace' in json_obj:
+                         return json_obj['_protection_trace'].get('id')
+                    if '_integrity_check' in json_obj:
+                        val = json_obj['_integrity_check']
+                        if '.' in val:
+                            return val.split('.')[-1] # 只拿后缀
             except:
                 pass
 
-        # 3. 检查 PNG tEXt 块
+        # 2. 检查 PNG tEXt 块
         s_bytes = file_bytes
-        # 限制搜索范围防止大文件卡死
         header_pattern = b'ProtectionBot | ID:'
         idx = s_bytes.find(header_pattern)
         if idx != -1:
              start = idx + len(header_pattern)
              return s_bytes[start:start+12].decode('ascii', errors='ignore')
+
+        # 3. 检查通用追加尾巴 (保底)
+        pos = file_bytes.rfind(MAGIC_HEADER)
+        if pos != -1:
+            start = pos + len(MAGIC_HEADER)
+            trace_id = file_bytes[start:start+12].decode('ascii', errors='ignore')
+            return trace_id
 
         return None
     except Exception as e:
