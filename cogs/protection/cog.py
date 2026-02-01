@@ -246,31 +246,53 @@ class ProtectionCog(commands.Cog):
 
     # --- 贴主命令 ---
     @maker_group.command(name="管理附件", description="查看和管理我发布的保护贴及附件")
-    async def _get_active_posts(self, channel, owner_id: int):
+    async def manage_attachments(self, interaction: discord.Interaction):
         """
-        [修复] 这是一个辅助方法，用于从数据库中获取当前频道内属于该用户的所有活跃保护贴。
-        供 manage_attachments 命令使用。
+        整合版命令：包含权限检查与数据库直接查询。
+        只有贴主能在自己的帖子内调用此命令。
         """
+        # --- 第一步：权限与环境检查 ---
+        if interaction.user.id != interaction.channel.owner_id:
+            return await interaction.response.send_message(
+                "❌ 只有帖子的创建者才能管理附件",
+                ephemeral=True
+            )
+
+        # --- 第二步：直接从数据库获取数据 (原 _get_active_posts 逻辑) ---
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
+            # 直接用当前频道ID查库
             cursor = await db.execute(
-                "SELECT * FROM protected_items WHERE channel_id = ? AND owner_id = ?",
-                (channel.id, owner_id)
+                "SELECT * FROM protected_items WHERE channel_id = ?",
+                (interaction.channel.id,)
             )
             rows = await cursor.fetchall()
 
-            posts = []
-            for row in rows:
-                p = dict(row)
-                if not p.get('title'):
-                    p['title'] = "未命名附件"
-                posts.append(p)
+        # 数据处理
+        if not rows:
+            return await interaction.response.send_message(
+                "当前帖子没有受保护的附件",
+                ephemeral=True
+            )
 
-            return posts
+        posts = []
+        for row in rows:
+            p = dict(row)
+            if not p.get('title'):
+                p['title'] = "未命名附件"
+            posts.append(p)
+
+        # --- 第三步：生成界面并发送 ---
+        view = PostSelectionView(posts)
+        await interaction.response.send_message(
+            f"找到 {len(posts)} 个受保护的附件：",
+            view=view,
+            ephemeral=True
+        )
 
     async def manage_attachments(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        posts = await self._get_active_posts(interaction.channel, owner_id=interaction.user.id)
+        posts = await self._get_active_posts(interaction.channel)
         if not posts: return await interaction.followup.send("你在这个频道还没有发过活跃的保护贴。", ephemeral=True)
         embed = discord.Embed(title=f"👑 {interaction.user.display_name} 的管理面板", color=0xffd700, description="请在下方选择一个帖子进行管理（重命名附件或删除）。")
         view = PostSelectionView(posts)

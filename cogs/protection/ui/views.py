@@ -289,11 +289,12 @@ class ProtectionDraftView(ui.View):
 # --- 帖子列表视图 ---
 class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
     name_input = ui.TextInput(label="新文件名 (无需输入后缀)", placeholder="请输入新名字", max_length=100)
+
     def __init__(self, message_id, file_index, file_data):
         super().__init__()
         self.message_id = message_id
         self.file_index = file_index
-        self.file_data = file_data 
+        self.file_data = file_data
         current_name = file_data[file_index].get('filename', 'unknown.ext')
         self.name_stem, self.ext = os.path.splitext(current_name)
         self.name_input.default = self.name_stem
@@ -302,12 +303,77 @@ class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
         new_stem = self.name_input.value.strip()
         if not new_stem: return await interaction.response.send_message("文件名不能为空！", ephemeral=True)
         new_full_name = f"{new_stem}{self.ext}"
+
+        # 更新内存数据
         self.file_data[self.file_index]['filename'] = new_full_name
+
+        # 更新数据库
         async with get_db() as db:
             await db.execute("UPDATE protected_items SET storage_urls = ? WHERE message_id = ?", (json.dumps(self.file_data), self.message_id))
             await db.commit()
+
         await interaction.response.send_message(f"✅ 修改成功！文件已更名为 `{new_full_name}`", ephemeral=True)
 
+class EditProtectionTitleModal(ui.Modal, title="修改附件标题"):
+    title_input = ui.TextInput(label="新标题", placeholder="请输入新的显示标题", max_length=100)
+
+    def __init__(self, message_id, current_title):
+        super().__init__()
+        self.message_id = message_id
+        self.title_input.default = current_title
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_title = self.title_input.value.strip()
+        if not new_title: return
+
+        async with get_db() as db:
+            await db.execute("UPDATE protected_items SET title = ? WHERE message_id = ?", (new_title, self.message_id))
+            await db.commit()
+
+        await interaction.response.send_message(f"✅ 标题已更新为：**{new_title}**", ephemeral=True)
+
+class EditProtectionNoteModal(ui.Modal, title="修改作者提示"):
+    note_input = ui.TextInput(label="新的作者提示", style=discord.TextStyle.paragraph, placeholder="请输入给下载者的说明...", max_length=1000, required=False)
+
+    def __init__(self, message_id, current_note):
+        super().__init__()
+        self.message_id = message_id
+        self.note_input.default = current_note or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_note = self.note_input.value.strip()
+
+        async with get_db() as db:
+            await db.execute("UPDATE protected_items SET log = ? WHERE message_id = ?", (new_note, self.message_id))
+            await db.commit()
+
+        await interaction.response.send_message("✅ 作者提示已更新！", ephemeral=True)
+
+class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
+    pw_input = ui.TextInput(label="设置新口令", placeholder="留空则保持原密码不变（如果是从无密码模式切换来，则必须输入）", min_length=2, max_length=20, required=False)
+
+    def __init__(self, message_id, new_mode):
+        super().__init__()
+        self.message_id = message_id
+        self.new_mode = new_mode
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_pw = self.pw_input.value.strip()
+
+        async with get_db() as db:
+            if new_pw:
+                # 更新模式和密码
+                await db.execute("UPDATE protected_items SET unlock_type = ?, password = ? WHERE message_id = ?", (self.new_mode, new_pw, self.message_id))
+            elif self.new_mode: # 如果是单纯切换模式但不想改密码（前提是原先有密码，这里简单处理，如果没输密码就只更新模式，假设用户知道自己在做什么）
+                 await db.execute("UPDATE protected_items SET unlock_type = ? WHERE message_id = ?", (self.new_mode, self.message_id))
+            await db.commit()
+
+        mode_text = "点赞+口令" if self.new_mode == "like_password" else "全套验证"
+        msg = f"✅ 验证模式已切换为 **{mode_text}**"
+        if new_pw: msg += f"\n新口令: ||{new_pw}||"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+# --- 管理视图组件 ---
 class ManageFilesSelectView(ui.View):
     def __init__(self, message_id, file_data):
         super().__init__(timeout=60)
@@ -324,22 +390,77 @@ class ManageFilesSelectView(ui.View):
         idx = int(self.select.values[0])
         await interaction.response.send_modal(EditPublishedFileModal(self.message_id, idx, self.file_data))
 
+class EditUnlockModeView(ui.View):
+    def __init__(self, message_id):
+        super().__init__(timeout=60)
+        self.message_id = message_id
+
+    async def update_mode(self, interaction, mode, needs_password=False):
+        if needs_password:
+            await interaction.response.send_modal(EditProtectionPasswordModal(self.message_id, mode))
+        else:
+            async with get_db() as db:
+                # 切换回不需要密码的模式时，建议清空密码字段或保留备用，这里仅更新 unlock_type
+                await db.execute("UPDATE protected_items SET unlock_type = ? WHERE message_id = ?", (mode, self.message_id))
+                await db.commit()
+
+            mode_text = "点赞解锁" if mode == "like" else "点赞+评论"
+            await interaction.response.send_message(f"✅ 验证模式已切换为 **{mode_text}**", ephemeral=True)
+
+    @ui.button(label="👍 点赞解锁", style=discord.ButtonStyle.primary)
+    async def mode_like(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like")
+
+    @ui.button(label="💬 点赞+评论", style=discord.ButtonStyle.primary)
+    async def mode_like_comm(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_comment")
+
+    @ui.button(label="🔐 点赞+口令", style=discord.ButtonStyle.success)
+    async def mode_like_pass(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_password", True)
+
+    @ui.button(label="🔐💬 全套验证", style=discord.ButtonStyle.success)
+    async def mode_all(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_comment_password", True)
+
+
 class PostManagementView(ui.View):
-    def __init__(self, message_id, file_data):
+    def __init__(self, message_id, file_data, current_title, current_note):
         super().__init__(timeout=60)
         self.message_id = message_id
         self.file_data = file_data
-    @ui.button(label="✏️ 修改文件名", style=discord.ButtonStyle.primary)
+        self.current_title = current_title
+        self.current_note = current_note
+
+    # 第一排：内容修改
+    @ui.button(label="改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
+    async def edit_title(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(EditProtectionTitleModal(self.message_id, self.current_title))
+
+    @ui.button(label="改提示", style=discord.ButtonStyle.secondary, row=0, emoji="📝")
+    async def edit_note(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(EditProtectionNoteModal(self.message_id, self.current_note))
+
+    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
     async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message("请选择要修改的文件：", view=ManageFilesSelectView(self.message_id, self.file_data), ephemeral=True)
-    @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger)
+
+    # 第二排：逻辑修改与删除
+    @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=1)
+    async def change_mode(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message("请选择新的验证模式：", view=EditUnlockModeView(self.message_id), ephemeral=True)
+
+    @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger, row=1)
     async def delete_post(self, interaction: discord.Interaction, button: ui.Button):
-        async with get_db() as db: 
+        # 双重确认可以防止误删，但作为管理工具直接执行也行，这里直接执行
+        async with get_db() as db:
             await db.execute("DELETE FROM protected_items WHERE message_id = ?", (self.message_id,))
             await db.commit()
-        try: await (await interaction.channel.fetch_message(self.message_id)).delete()
-        except: pass
-        await interaction.response.edit_message(content="✅ 帖子已删除！", embed=None, view=None)
+
+        # 尝试删除 Discord 实际消息
+        try:
+            msg = await interaction.channel.fetch_message(self.message_id)
+            await msg.delete()
+        except:
+            pass
+
+        await interaction.response.edit_message(content="✅ 帖子已删除！相关记录已清理。", embed=None, view=None)
 
 class PostSelectionView(ui.View):
     def __init__(self, posts_rows):
@@ -353,13 +474,24 @@ class PostSelectionView(ui.View):
         self.select.callback = self.on_select
         self.add_item(self.select)
         self.posts_map = {str(p['message_id']): p for p in posts_rows}
+
     async def on_select(self, interaction: discord.Interaction):
         mid_str = self.select.values[0]
         row = self.posts_map[mid_str]
+
         try: file_data = json.loads(row['storage_urls'])
         except: file_data = []
-        embed = discord.Embed(title=f"🔧 管理: {row['title']}", description="请选择操作：", color=0xffd700)
-        await interaction.response.edit_message(embed=embed, view=PostManagementView(row['message_id'], file_data))
+
+        # 将当前标题和提示传进去，方便回显
+        current_title = row['title']
+        current_note = row['log']
+
+        embed = discord.Embed(title=f"🔧 管理: {current_title}", description="请选择操作：", color=0xffd700)
+
+        # 实例化更新后的视图
+        view = PostManagementView(row['message_id'], file_data, current_title, current_note)
+
+        await interaction.response.edit_message(embed=embed, view=view)
 
 class PostListView(ui.View):
     def __init__(self, bot, posts_rows):
