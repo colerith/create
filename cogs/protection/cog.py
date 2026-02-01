@@ -31,42 +31,64 @@ class ProtectionCog(commands.Cog):
 
     async def cog_load(self):
         """
-        插件加载时的钩子函数：
-        1. 确保数据库表存在。
-        2. 从数据库恢复所有已开启的置底任务。
+        插件加载钩子
         """
-        print("🔄 [ProtectionCog] 正在初始化置底模块...")
-        async with get_db() as db:
-            # 1. 建表：记录哪些频道开启了置底 (简单存个 channel_id 就行)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS bump_config (
-                    channel_id INTEGER PRIMARY KEY
-                )
-            """)
-            await db.commit()
+        self.bot.loop.create_task(self._restore_bump_tasks_after_ready())
 
-            # 2. 读取配置：查出所有开启了置底的频道
-            cursor = await db.execute("SELECT channel_id FROM bump_config")
-            rows = await cursor.fetchall()
+        print("⏳ [ProtectionCog] 已安排置底任务恢复计划（将在 Bot 就绪后执行）...")
 
-        # 3. 恢复任务
-        count = 0
-        for row in rows:
-            channel_id = row[0]
-            # 获取频道对象（可能需要从缓存获取，如果缓存没有可能需要 fetch）
-            channel = self.bot.get_channel(channel_id)
 
-            # 如果缓存里没有（Bot刚启动可能还没同步完），尝试 fetch 或者忽略
-            # 为了稳健，我们先检查是否只是 None
-            if channel:
-                # 启动循环任务（复用你的 _bump_loop）
-                task = self.bot.loop.create_task(self._bump_loop(channel))
-                self.bump_tasks[channel_id] = task
-                count += 1
-            else:
-                print(f"⚠️ [警告] 无法恢复频道 {channel_id} 的置底任务（频道可能被删或Bot不可见）。")
+    async def _restore_bump_tasks_after_ready(self):
+        """
+        后台任务：等待 Bot 完全准备好（缓存加载完毕）后，再恢复置底任务。
+        """
+        # 🟢 关键：一直等到 Bot 说 "我准备好了 / 缓存加载完了"
+        await self.bot.wait_until_ready()
 
-        print(f"✅ [ProtectionCog] 初始化完成。已恢复 {count} 个频道的自动置底任务。")
+        print("🔄 [ProtectionCog] Bot 已就绪，开始恢复置底任务...")
+
+        try:
+            async with get_db() as db:
+                # 1. 建表（如果还没建的话）
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS bump_config (
+                        channel_id INTEGER PRIMARY KEY
+                    )
+                """)
+                await db.commit()
+
+                # 2. 读取配置
+                cursor = await db.execute("SELECT channel_id FROM bump_config")
+                rows = await cursor.fetchall()
+
+            # 3. 恢复任务
+            count = 0
+            for row in rows:
+                channel_id = row[0]
+                channel = self.bot.get_channel(channel_id)
+
+                # 双重保险：如果 get_channel 还是拿不到，尝试 fetch_channel (API请求)
+                if not channel:
+                    try:
+                        channel = await self.bot.fetch_channel(channel_id)
+                    except:
+                        pass
+
+                if channel:
+                    # 避免重复添加
+                    if channel_id not in self.bump_tasks:
+                        task = self.bot.loop.create_task(self._bump_loop(channel))
+                        self.bump_tasks[channel_id] = task
+                        count += 1
+                else:
+                    print(f"⚠️ [警告] 彻底无法找到频道 {channel_id}，跳过恢复。")
+
+            print(f"✅ [ProtectionCog] 自动置底任务恢复完成！共恢复 {count} 个频道。")
+
+        except Exception as e:
+            print(f"❌ [ProtectionCog] 恢复任务失败: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     async def cog_unload(self):
