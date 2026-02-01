@@ -24,12 +24,50 @@ class ProtectionCog(commands.Cog):
         self.bot.loop.create_task(init_likes_db())
         self.bump_tasks = {}
 
-    # 命令组定义
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
     user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
 
-    # 管理员组添加权限装饰器
     admin_group = app_commands.Group(name="管理员专用", description="[管理] 系统维护工具")
+
+    async def cog_load(self):
+        """
+        插件加载时的钩子函数：
+        1. 确保数据库表存在。
+        2. 从数据库恢复所有已开启的置底任务。
+        """
+        print("🔄 [ProtectionCog] 正在初始化置底模块...")
+        async with get_db() as db:
+            # 1. 建表：记录哪些频道开启了置底 (简单存个 channel_id 就行)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bump_config (
+                    channel_id INTEGER PRIMARY KEY
+                )
+            """)
+            await db.commit()
+
+            # 2. 读取配置：查出所有开启了置底的频道
+            cursor = await db.execute("SELECT channel_id FROM bump_config")
+            rows = await cursor.fetchall()
+
+        # 3. 恢复任务
+        count = 0
+        for row in rows:
+            channel_id = row[0]
+            # 获取频道对象（可能需要从缓存获取，如果缓存没有可能需要 fetch）
+            channel = self.bot.get_channel(channel_id)
+
+            # 如果缓存里没有（Bot刚启动可能还没同步完），尝试 fetch 或者忽略
+            # 为了稳健，我们先检查是否只是 None
+            if channel:
+                # 启动循环任务（复用你的 _bump_loop）
+                task = self.bot.loop.create_task(self._bump_loop(channel))
+                self.bump_tasks[channel_id] = task
+                count += 1
+            else:
+                print(f"⚠️ [警告] 无法恢复频道 {channel_id} 的置底任务（频道可能被删或Bot不可见）。")
+
+        print(f"✅ [ProtectionCog] 初始化完成。已恢复 {count} 个频道的自动置底任务。")
+
 
     async def cog_unload(self):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
@@ -213,10 +251,10 @@ class ProtectionCog(commands.Cog):
         await view.update_dashboard(interaction)
 
     @maker_group.command(name="置底附件", description="开启/关闭自动置底：检测到底部不是按钮时重发 (贴主/管理可用)")
-    @app_commands.describe(original_message_id="填 off 关闭。不填则默认开启（无需指定特定ID，按钮只负责唤起面板）")
+    @app_commands.describe(original_message_id="填 off 关闭。不填则默认开启（无需指定特定ID）")
     async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
         """
-        开启附件自动置底功能。输入 off 可以关闭当前频道的置底。
+        开启附件自动置底功能，并持久化保存配置。
         """
         channel = interaction.channel
 
@@ -231,14 +269,20 @@ class ProtectionCog(commands.Cog):
 
         # --- 2. 关闭功能的逻辑 ---
         if original_message_id and original_message_id.lower() == "off":
+            # A. 停止内存中的任务
             if channel.id in self.bump_tasks:
                 self.bump_tasks[channel.id].cancel()
                 del self.bump_tasks[channel.id]
-                return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能。", ephemeral=True)
-            else:
-                return await interaction.response.send_message("⚠️ 本频道当前没有开启自动置底。", ephemeral=True)
 
-        # --- 3. 检查是否有数据 ---
+            # B. 从数据库删除记录 (新增步骤)
+            async with get_db() as db:
+                await db.execute("DELETE FROM bump_config WHERE channel_id = ?", (channel.id,))
+                await db.commit()
+
+            return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能（配置已保存）。", ephemeral=True)
+
+        # --- 3. 开启功能的逻辑 ---
+        # 只要有一条受保护记录即可开启
         async with get_db() as db:
             cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ? LIMIT 1", (channel.id,))
             res = await cursor.fetchone()
@@ -246,14 +290,20 @@ class ProtectionCog(commands.Cog):
         if not res:
             return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录，无法开启置底。", ephemeral=True)
 
-        # --- 4. 启动任务 ---
+        # A. 启动/重启内存任务
         if channel.id in self.bump_tasks:
-            self.bump_tasks[channel.id].cancel()
+            self.bump_tasks[channel.id].cancel() # 先停掉旧的防止双重运行
 
-        task = asyncio.create_task(self._bump_loop(channel))
+        task = self.bot.loop.create_task(self._bump_loop(channel))
         self.bump_tasks[channel.id] = task
 
-        await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将每 10 分钟检查一次，并提供快捷唤起面板的按钮。", ephemeral=True)
+        # B. 写入数据库 (新增步骤)
+        async with get_db() as db:
+            await db.execute("INSERT OR IGNORE INTO bump_config (channel_id) VALUES (?)", (channel.id,))
+            await db.commit()
+
+        await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将每 10 分钟检查一次。\n(配置已保存，Bot 重启后会自动恢复任务)", ephemeral=True)
+
 
     async def _bump_loop(self, channel):
         """
