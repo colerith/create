@@ -212,7 +212,6 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.update_dashboard(interaction)
 
-        # 妈妈修正后的 auto_bump：修复了表名错误，简化了逻辑
     @maker_group.command(name="置底附件", description="开启/关闭自动置底：检测到底部不是按钮时重发 (贴主/管理可用)")
     @app_commands.describe(original_message_id="填 off 关闭。不填则默认开启（无需指定特定ID，按钮只负责唤起面板）")
     async def auto_bump(self, interaction: discord.Interaction, original_message_id: str = None):
@@ -240,9 +239,7 @@ class ProtectionCog(commands.Cog):
                 return await interaction.response.send_message("⚠️ 本频道当前没有开启自动置底。", ephemeral=True)
 
         # --- 3. 检查是否有数据 ---
-        # 只要本频道在 protected_items 表里有任何记录，就可以开启
         async with get_db() as db:
-            # 妈妈在这里修正了表名：download_rules -> protected_items
             cursor = await db.execute("SELECT message_id FROM protected_items WHERE channel_id = ? LIMIT 1", (channel.id,))
             res = await cursor.fetchone()
 
@@ -253,8 +250,6 @@ class ProtectionCog(commands.Cog):
         if channel.id in self.bump_tasks:
             self.bump_tasks[channel.id].cancel()
 
-        # 这里的 origin_id 参数其实已经不重要了，因为我们的按钮是通用的
-        # 但为了保持结构，我们传 0 或者 None 进去都行
         task = asyncio.create_task(self._bump_loop(channel))
         self.bump_tasks[channel.id] = task
 
@@ -263,84 +258,86 @@ class ProtectionCog(commands.Cog):
     async def _bump_loop(self, channel):
         """
         后台循环任务：每10分钟检查一次
+        具备【智能修复】功能：
+        1. 搜索最近20条消息。
+        2. 如果发现旧的面板且它是最新的 -> 原地复活（编辑修复按钮）。
+        3. 如果旧面板被新消息压住了 -> 删旧发新（保持置底）。
+        4. 没找到 -> 发新的。
         """
         from .ui.views import BumpButtonView
 
         print(f"✅ [置底任务启动] 频道: {channel.name} ({channel.id})")
 
-        last_bump_msg = None
-
         try:
             while True:
                 try:
-                    # 1. 检查最新消息
-                    messages = [msg async for msg in channel.history(limit=1)]
-                    latest_msg = messages[0] if messages else None
+                    # 1. 准备好全新的界面数据（按钮是“活”的）
+                    layout_data = BumpButtonView.create_layout(self.bot)
+                    new_view = layout_data.get('view')
 
-                    need_resend = False
+                    # 2. 扫描最近 20 条消息
+                    history_msgs = [msg async for msg in channel.history(limit=20)]
 
-                    if not latest_msg:
-                        need_resend = True
-                    # 如果最新那条消息就是我们要发的置底消息（通过判断是不是机器人发的且带组件），那就不动
-                    elif latest_msg.author.id == self.bot.user.id and latest_msg.components:
-                         # 这里简单判断一下，实际上这足够了
-                         last_bump_msg = latest_msg
-                         need_resend = False
-                    else:
-                        need_resend = True
+                    found_old_bump = None
+                    is_latest = False
 
-                    if need_resend:
-                        # 删除旧的（如果是我们自己发的）
-                        if last_bump_msg:
+                    for i, msg in enumerate(history_msgs):
+                        if msg.author.id == self.bot.user.id and msg.components:
+                            found_old_bump = msg
+                            if i == 0:
+                                is_latest = True
+
+                    # 3. 决策逻辑
+                    if found_old_bump:
+                        if is_latest:
+                            print(f"🔧 [自动修复] 在 {channel.name} 修复旧面板按钮...")
+                            await found_old_bump.edit(**layout_data)
+                        else:
                             try:
-                                await last_bump_msg.delete()
-                            except: pass # 删不掉就算了
-
-                        # 2. 发送新的
-                        # 调用我们新写的 create_layout，不需要参数了
-                        send_kwargs = BumpButtonView.create_layout(self.bot)
-                        last_bump_msg = await channel.send(**send_kwargs)
+                                await found_old_bump.delete()
+                            except:
+                                pass
+                            await channel.send(**layout_data)
+                    else:
+                        await channel.send(**layout_data)
 
                 except discord.Forbidden:
-                    print(f"[{channel.id}] 失去权限，停止置底。")
+                    print(f"[{channel.id}] 失去权限，停止置底循环。")
                     break
                 except Exception as e:
                     print(f"[{channel.id}] 置底任务出错: {e}")
+                    import traceback
+                    traceback.print_exc()
 
-                # 等待 10 分钟 (600秒)
+                # 等待 10 分钟
                 await asyncio.sleep(600)
 
         except asyncio.CancelledError:
-            pass
+            print(f"🛑 [置底任务停止] 频道: {channel.name}")
 
     async def update_sticky_message(self, thread: discord.Thread):
         """
         核心函数：扫描全贴附件 -> 删除旧置底 -> 发送新置底
         """
         try:
-            # 1. 扫描附件
             image_data = []
             async for msg in thread.history(limit=None):
                 if msg.author.id == thread.owner_id and msg.attachments:
                     for att in msg.attachments:
-                        # 过滤图片和视频
                         if att.content_type and (att.content_type.startswith('image/') or att.content_type.startswith('video/')):
                             image_data.append(att.url)
 
-            # 如果没图，就不发了
             if not image_data:
                 return
 
             image_data.reverse()
 
-            # 2. 生成 Embed
             embed = discord.Embed(
                 title="📂 贴主附件汇总",
                 description=f"检测到新附件发布，已自动更新置底。\n当前共收录 **{len(image_data)}** 个文件。",
                 color=0x2b2d31
             )
 
-            # 构造内容列表
             content_str = ""
             for i, url in enumerate(image_data):
                 line = f"{i+1}. [附件链接]({url})\n"
@@ -351,7 +348,6 @@ class ProtectionCog(commands.Cog):
 
             embed.description += "\n\n" + content_str
 
-            # 3. 删除旧消息
             async with get_db() as db:
                 cursor = await db.execute("SELECT message_id FROM sticky_messages WHERE channel_id = ?", (thread.id,))
                 row = await cursor.fetchone()
@@ -362,14 +358,12 @@ class ProtectionCog(commands.Cog):
                     old_msg = await thread.fetch_message(old_msg_id)
                     await old_msg.delete()
                 except discord.NotFound:
-                    pass # 已被删除
+                    pass
                 except Exception as e:
                     print(f"删除旧置底失败: {e}")
 
-            # 4. 发送新消息 (静默发送)
             new_msg = await thread.send(embed=embed, silent=True)
 
-            # 5. 更新数据库
             async with get_db() as db:
                 await db.execute("INSERT OR REPLACE INTO sticky_messages (channel_id, message_id) VALUES (?, ?)", (thread.id, new_msg.id))
                 await db.commit()
