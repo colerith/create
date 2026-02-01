@@ -51,11 +51,38 @@ class ProtectionCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot: return
-        if isinstance(message.channel, discord.Thread) and is_valid_comment(message.content):
-            thread_id = message.channel.id 
+
+        # 确保是在帖子(Thread)里
+        if not isinstance(message.channel, discord.Thread):
+            return
+
+        # --- 逻辑 A: 原有的评论统计功能 ---
+        if is_valid_comment(message.content):
+            thread_id = message.channel.id
             async with get_db() as db:
                 await db.execute("INSERT OR REPLACE INTO user_comments (user_id, message_id, content) VALUES (?, ?, ?)", (message.author.id, thread_id, message.content[:50]))
                 await db.commit()
+
+        # --- 逻辑 B: 新增的自动置底功能 ---
+        # 只有当消息包含附件，才去检查是不是贴主
+        if message.attachments:
+            # 检查身份：是否是贴主本人
+            is_owner = False
+            if message.channel.owner_id == message.author.id:
+                is_owner = True
+            elif message.channel.owner_id is None:
+                # 缓存缺失时的备用检查
+                try:
+                    thread = await message.guild.fetch_channel(message.channel.id)
+                    if thread.owner_id == message.author.id:
+                        is_owner = True
+                except:
+                    pass
+
+            if is_owner:
+                print(f"📥 [自动置底] 监测到贴主 {message.author} 在 {message.channel.name} 发布了新附件，正在执行置底...")
+                asyncio.create_task(self.update_sticky_message(message.channel))
+
     
     # --- 管理员命令 ---
     @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮（改用命令）")
@@ -285,6 +312,70 @@ class ProtectionCog(commands.Cog):
 
         except asyncio.CancelledError:
             pass
+
+    async def update_sticky_message(self, thread: discord.Thread):
+        """
+        核心函数：扫描全贴附件 -> 删除旧置底 -> 发送新置底
+        """
+        try:
+            # 1. 扫描附件
+            image_data = []
+            async for msg in thread.history(limit=None):
+                if msg.author.id == thread.owner_id and msg.attachments:
+                    for att in msg.attachments:
+                        # 过滤图片和视频
+                        if att.content_type and (att.content_type.startswith('image/') or att.content_type.startswith('video/')):
+                            image_data.append(att.url)
+
+            # 如果没图，就不发了
+            if not image_data:
+                return
+
+            image_data.reverse()
+
+            # 2. 生成 Embed
+            embed = discord.Embed(
+                title="📂 贴主附件汇总",
+                description=f"检测到新附件发布，已自动更新置底。\n当前共收录 **{len(image_data)}** 个文件。",
+                color=0x2b2d31
+            )
+
+            # 构造内容列表
+            content_str = ""
+            for i, url in enumerate(image_data):
+                line = f"{i+1}. [附件链接]({url})\n"
+                if len(content_str) + len(line) > 3500: # 留点余量
+                    content_str += f"...还有 {len(image_data) - i} 个文件未显示"
+                    break
+                content_str += line
+
+            embed.description += "\n\n" + content_str
+
+            # 3. 删除旧消息
+            async with get_db() as db:
+                cursor = await db.execute("SELECT message_id FROM sticky_messages WHERE channel_id = ?", (thread.id,))
+                row = await cursor.fetchone()
+
+            if row:
+                old_msg_id = row[0]
+                try:
+                    old_msg = await thread.fetch_message(old_msg_id)
+                    await old_msg.delete()
+                except discord.NotFound:
+                    pass # 已被删除
+                except Exception as e:
+                    print(f"删除旧置底失败: {e}")
+
+            # 4. 发送新消息 (静默发送)
+            new_msg = await thread.send(embed=embed, silent=True)
+
+            # 5. 更新数据库
+            async with get_db() as db:
+                await db.execute("INSERT OR REPLACE INTO sticky_messages (channel_id, message_id) VALUES (?, ?)", (thread.id, new_msg.id))
+                await db.commit()
+
+        except Exception as e:
+            print(f"❌ 执行置底更新时出错: {e}")
 
 
 async def setup(bot):
