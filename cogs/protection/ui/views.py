@@ -426,8 +426,6 @@ class PostListView(ui.View):
 
 class BumpButtonView(discord.ui.View):
     def __init__(self, bot):
-        # timeout=None 表示这个按钮永久有效，不会因为时间到了就失效
-        # 这对于置底按钮非常重要
         super().__init__(timeout=None)
         self.bot = bot
 
@@ -438,15 +436,12 @@ class BumpButtonView(discord.ui.View):
         """
         view = cls(bot)
 
-        # 这里我们不再创建 discord.Embed 对象
-        # 而是直接定义一段简单的纯文本字符串
         message_content = (
             "⬇️ **本频道有受保护的附件** ⬇️\n"
             "为了防止资源被聊天记录淹没，请点击下方按钮查看下载列表。"
+            "如果本按钮失效，也可以使用`/保护附件 获取附件`命令获取。"
         )
 
-        # 返回字典，直接用于 send() 或 edit() 方法的参数解包
-        # 显式指定 embed=None，确保如果是编辑旧消息时，能把旧的 Embed 删掉
         return {
             "content": message_content,
             "embed": None,
@@ -463,12 +458,8 @@ class BumpButtonView(discord.ui.View):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
-        # 为了防止循环导入，可以在这里导入数据库和视图类
-        # 假设你的数据库连接函数在 database.py，下拉菜单视图在 views.py（或者就在同一个文件）
         from database import get_db
-        # from views import PostListView # 如果 PostListView 在别处，请取消注释并确路径
 
-        # 1. 查询数据库：找当前频道的最近附件
         rows = []
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
@@ -478,25 +469,18 @@ class BumpButtonView(discord.ui.View):
             )
             rows = await cursor.fetchall()
 
-        # 如果找不到记录，告诉用户（仅在这个交互中提示这一句话）
         if not rows:
             return await interaction.response.send_message(
                 "❌ 本频道当前没有任何受保护的附件记录。",
                 ephemeral=True
             )
 
-        # 2. 如果找到了，生成那个带下拉菜单的视图 (PostListView)
-        # 注意：这里需要确保 PostListView 在当前作用域可用
-        # 如果 PostListView 就在同一个文件里定义，直接用就行
         view = PostListView(self.bot, rows)
 
-        # 结果展示还是可以用 Embed，因为这是用户点击后看到的详情，漂亮点没关系
-        # 当然，如果你连这个也想改成纯文本，也可以像上面一样改
         result_embed = discord.Embed(
             title="📂 附件获取列表",
             description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个进行查看和下载。",
             color=0x87ceeb
         )
 
-        # 3. 发送给用户（ephemeral=True 表示只有点击按钮的人能看见）
         await interaction.response.send_message(embed=result_embed, view=view, ephemeral=True)
