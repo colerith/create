@@ -10,7 +10,7 @@ from database import init_db
 from cogs.protection.db import init_likes_db
 
 load_dotenv()
-TEST_GUILD_ID = discord.Object(id=1397629012292931726)
+TEST_GUILD_ID = [1397629012292931726, 1384945301780955246, 1413953986519760908]
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
