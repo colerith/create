@@ -245,33 +245,33 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # --- 贴主命令 ---
-    @maker_group.command(name="管理附件", description="查看和管理我发布的保护贴及附件")
+    @maker_group.command(name="管理附件", description="查看和管理我在此讨论串中发布的附件")
     async def manage_attachments(self, interaction: discord.Interaction):
         """
-        整合版命令：包含权限检查与数据库直接查询。
-        只有贴主能在自己的帖子内调用此命令。
+        管理用户自己在当前讨论串中发布的受保护附件。
         """
-        # --- 第一步：权限与环境检查 ---
-        if interaction.user.id != interaction.channel.owner_id:
+        # --- 第一步：环境检查 ---
+        # 确保命令在讨论串（Thread）中使用
+        if not isinstance(interaction.channel, discord.Thread):
             return await interaction.response.send_message(
-                "❌ 只有帖子的创建者才能管理附件",
+                "❌ 此命令只能在讨论串（帖子）中使用。",
                 ephemeral=True
             )
 
-        # --- 第二步：直接从数据库获取数据 (原 _get_active_posts 逻辑) ---
+        # --- 第二步：从数据库获取该用户在此讨论串的附件 ---
         async with get_db() as db:
             db.row_factory = aiosqlite.Row
-            # 直接用当前频道ID查库
+            # 修改查询逻辑：现在是查找当前频道下，属于命令使用者的附件
             cursor = await db.execute(
-                "SELECT * FROM protected_items WHERE channel_id = ?",
-                (interaction.channel.id,)
+                "SELECT * FROM protected_items WHERE channel_id = ? AND user_id = ?",
+                (interaction.channel.id, interaction.user.id)
             )
             rows = await cursor.fetchall()
 
-        # 数据处理
+        # --- 第三步：数据处理与响应 ---
         if not rows:
             return await interaction.response.send_message(
-                "当前帖子没有受保护的附件",
+                "你在当前讨论串中没有发布过受保护的附件。",
                 ephemeral=True
             )
 
@@ -282,21 +282,21 @@ class ProtectionCog(commands.Cog):
                 p['title'] = "未命名附件"
             posts.append(p)
 
-        # --- 第三步：生成界面并发送 ---
+        # --- 第四步：生成界面并发送 ---
         view = PostSelectionView(posts)
         await interaction.response.send_message(
-            f"找到 {len(posts)} 个受保护的附件：",
+            f"你在此讨论串中发布了 {len(posts)} 个受保护的附件，请选择进行管理：",
             view=view,
             ephemeral=True
         )
-
-    async def manage_attachments(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        posts = await self._get_active_posts(interaction.channel)
-        if not posts: return await interaction.followup.send("你在这个频道还没有发过活跃的保护贴。", ephemeral=True)
-        embed = discord.Embed(title=f"👑 {interaction.user.display_name} 的管理面板", color=0xffd700, description="请在下方选择一个帖子进行管理（重命名附件或删除）。")
-        view = PostSelectionView(posts)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    
+    async def convert_to_protected(self, interaction: discord.Interaction, message: discord.Message):
+        if message.author != interaction.user: return await interaction.response.send_message("不可以动别人的东西！", ephemeral=True)
+        if not message.attachments: return await interaction.response.send_message("消息里没有附件？", ephemeral=True)
+        view = ProtectionDraftView(self.bot, interaction.user, message.attachments, target_message=message, default_log=message.content or None)
+        embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87ceeb)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await view.update_dashboard(interaction)
 
     async def convert_to_protected(self, interaction: discord.Interaction, message: discord.Message):
         if message.author != interaction.user: return await interaction.response.send_message("不可以动别人的东西！", ephemeral=True)
