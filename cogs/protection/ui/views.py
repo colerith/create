@@ -1,3 +1,5 @@
+# protection/ui/views.py
+
 import discord
 from discord import ui
 import json
