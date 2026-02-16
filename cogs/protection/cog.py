@@ -163,6 +163,24 @@ class ProtectionCog(commands.Cog):
             except: fail_count += 1
         await interaction.followup.send(f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个", ephemeral=True)
     
+    @admin_group.command(name="修复数据库", description="[管理] 为附件表添加必要的 user_id 字段 (一次性操作)")
+    async def fix_database(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with get_db() as db:
+                # 这就是为表添加新列的SQL命令
+                await db.execute("ALTER TABLE protected_items ADD COLUMN user_id INTEGER;")
+                await db.commit()
+            await interaction.followup.send("✅ 数据库修复成功！`protected_items` 表已成功添加 `user_id` 字段。", ephemeral=True)
+        except aiosqlite.OperationalError as e:
+            # 如果列已经存在，会报错，我们捕捉这个错误并给出提示
+            if "duplicate column name" in str(e):
+                await interaction.followup.send("ℹ️ 数据库无需修复，`user_id` 字段已存在。", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ 数据库修复时发生未知错误: {e}", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 执行修复时发生意外错误: {e}", ephemeral=True)
+            
     @admin_group.command(name="溯源", description="检查文件是否包含保护水印，并查询下载记录")
     @app_commands.describe(file="请上传需要检查的文件")
     async def trace_file(self, interaction: discord.Interaction, file: discord.Attachment):
