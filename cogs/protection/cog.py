@@ -251,10 +251,9 @@ class ProtectionCog(commands.Cog):
         管理用户自己在当前讨论串中发布的受保护附件。
         """
         # --- 第一步：环境检查 ---
-        # 确保命令在讨论串（Thread）中使用
-        if not isinstance(interaction.channel, discord.Thread):
+        if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             return await interaction.response.send_message(
-                "❌ 此命令只能在讨论串（帖子）中使用。",
+                "❌ 此命令只能在文字频道或论坛帖子中使用。",
                 ephemeral=True
             )
 
