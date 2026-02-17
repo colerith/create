@@ -12,8 +12,8 @@ import os
 import uuid
 import random
 from datetime import datetime
-from cogs.protection.db import get_db
-from ...config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+from database import get_db
+from .constants import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
 # --- 魔法签名与隐写配置 ---
 # 格式: 0x00 + NOVA_TRACE: + UUID(12)

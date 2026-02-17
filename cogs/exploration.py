@@ -2,16 +2,17 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands, tasks
 from datetime import datetime, time
-
 import asyncio
 from zoneinfo import ZoneInfo
-from config import EXPLORATION_TARGET_CHANNEL_IDS as TARGET_CHANNEL_IDS, EXPLORATION_ADMIN_USER_ID as ADMIN_USER_ID, TZ_SHANGHAI
-
-
 try:
     from utils import chimidan_text
 except ImportError:
     def chimidan_text(text): return text
+
+# === 配置区域 ===
+TARGET_CHANNEL_IDS = [1450863242179121162, 1450863444373798922, 1451245427444814047]
+ADMIN_USER_ID = 1353777207042113576
+TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 # ==========================================
 # Part 1. 通用分页视图

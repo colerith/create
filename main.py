@@ -6,7 +6,8 @@ import aiohttp
 import asyncio
 
 # 确保你的数据库导入路径是正确的
-from cogs.protection.db import init_db
+from database import init_db
+from cogs.protection.db import init_likes_db
 
 load_dotenv()
 TEST_GUILD_ID = [1397629012292931726, 1384945301780955246, 1413953986519760908]
@@ -29,6 +30,7 @@ class ChimidanBot(commands.Bot):
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession()
         await init_db()
+        await init_likes_db()
         print("✅ 数据库检查完毕。")
 
         # --- 加载插件 ---

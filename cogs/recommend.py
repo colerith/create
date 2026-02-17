@@ -4,12 +4,21 @@ from discord.ext import commands, tasks
 import aiosqlite
 import random
 import asyncio
-
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from cogs.protection.db import get_db
-from config import TZ_SHANGHAI, TARGET_KEYWORDS, TEST_ROLE_ID, DAILY_RECOMMEND_CHANNEL_ID
+from database import get_db
 
+# === 配置 ===
+TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+# 【修改】支持的关键词列表
+TARGET_KEYWORDS = ["角色卡", "预设", "美化", "工具", "小剧场", "世界书"]
+
+# 每日推荐发送的目标频道ID列表
+DAILY_RECOMMEND_CHANNEL_ID = [1450863242179121162, 1450863444373798922, 1451245427444814047]
+
+# 测试员身份组 ID (无视抽卡限制)
+TEST_ROLE_ID = 1402290127627091979
 
 # ==========================================
 # Part 1. 数据库初始化与操作

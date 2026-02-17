@@ -8,8 +8,8 @@ import asyncio
 import os
 import aiosqlite
 from datetime import datetime
-from cogs.protection.db import get_db
-from ....config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+from database import get_db
+from ..constants import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
 # 引入我们新写的“魔法工具”
 from ..utils import (
@@ -592,7 +592,7 @@ class BumpButtonView(discord.ui.View):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
-        from cogs.protection.db import get_db
+        from database import get_db
 
         rows = []
         async with get_db() as db:
