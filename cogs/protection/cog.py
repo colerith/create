@@ -10,7 +10,7 @@ import asyncio
 
 from core.db import get_db
 from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
-from .utils import is_valid_comment
+from cogs.protection.utils import is_valid_comment
 from .utils import extract_trace_from_bytes
 from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
 

@@ -7,13 +7,13 @@ from datetime import datetime, time
 import asyncio
 from zoneinfo import ZoneInfo
 
+from .views import PaginatorView, SearchMethodView
 from config import EXPLORATION_TARGET_CHANNEL_IDS, EXPLORATION_ADMIN_USER_ID, TZ_SHANGHAI
-from views import PaginatorView, SearchMethodView
 from core.utils import TARGET_KEYWORDS
 
 # ---核心搜索逻辑---
 async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
-    await interaction.response.send_message(("收到指令惹！正在全速启动搜索引擎... (0%)"), ephemeral=True)
+    await interaction.response.send_message("收到指令惹！正在全速启动搜索引擎... (0%)", ephemeral=True)
 
     target_forums = []
     if selected_channels:
@@ -29,7 +29,7 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
         all_threads.extend(forum.threads)
 
     if not all_threads:
-        return await interaction.edit_original_response(content=chimidan_text("呜呜，当前范围内没有帖子可以搜捏..."))
+        return await interaction.edit_original_response(content="呜呜，当前范围内没有帖子可以搜捏...")
 
     sem = asyncio.Semaphore(8)
     results = []
@@ -67,18 +67,18 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
             percent = int(((i + 1) / total_count) * 100)
             try:
                 await interaction.edit_original_response(
-                    content=chimidan_text(f"正在全速搜索中...\n进度：{percent}% ({i+1}/{total_count})\n已找到：{len(results)} 个匹配")
+                    content=f"正在全速搜索中...\n进度：{percent}% ({i+1}/{total_count})\n已找到：{len(results)} 个匹配"
                 )
                 last_update_time = now
             except discord.NotFound: break
 
     if not results:
-        return await interaction.edit_original_response(content=chimidan_text(f"呜呜，翻遍了 {total_count} 个帖子也没找到捏..."))
+        return await interaction.edit_original_response(content=f"呜呜，翻遍了 {total_count} 个帖子也没找到捏...")
 
     title = f"🔍 搜索结果: {len(results)}条" + (" (含标签筛选)" if selected_tag_ids else "")
     paginator = PaginatorView(results, title=title, is_daily=False)
     await interaction.edit_original_response(
-        content=chimidan_text("搜索完成惹！找到以下内容："),
+        content=("搜索完成惹！找到以下内容："),
         embed=paginator.get_embed(),
         view=paginator
     )
@@ -144,13 +144,13 @@ class ExplorationCog(commands.Cog):
     @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道的日报面板")
     async def manual_daily_report(self, interaction: discord.Interaction):
         if interaction.user.id != EXPLORATION_ADMIN_USER_ID and not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message(chimidan_text("你没有权限操作这个命令捏！"), ephemeral=True)
+            return await interaction.response.send_message(("你没有权限操作这个命令捏！"), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
         if interaction.channel_id in EXPLORATION_TARGET_CHANNEL_IDS:
             await self.refresh_channel_daily_panel(interaction.channel, resend=True)
-            await interaction.followup.send(chimidan_text("日报面板已清理并发送最新版惹！"), ephemeral=True)
+            await interaction.followup.send(("日报面板已清理并发送最新版惹！"), ephemeral=True)
         else:
             threads = await self.get_todays_threads(interaction.guild)
             date_str = datetime.now(TZ_SHANGHAI).strftime('%Y-%m-%d')
@@ -161,7 +161,7 @@ class ExplorationCog(commands.Cog):
     @app_commands.default_permissions(view_audit_log=True)
     async def refresh_search_panel(self, interaction: discord.Interaction):
         if interaction.user.id != EXPLORATION_ADMIN_USER_ID:
-            return await interaction.response.send_message(chimidan_text("你没有权限操作这个命令捏！"), ephemeral=True)
+            return await interaction.response.send_message(("你没有权限操作这个命令捏！"), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
         channel = interaction.channel
@@ -175,14 +175,14 @@ class ExplorationCog(commands.Cog):
         except Exception as e: print(f"Cleanup failed: {e}")
 
         embed = discord.Embed(title="🔍 奇米蛋搜索雷达", color=0x87ceeb)
-        embed.description = chimidan_text("欢迎使用全服务器帖子搜索功能来捉！\n\n**使用指南：**\n...") # 省略部分文本
+        embed.description = ("欢迎使用全服务器帖子搜索功能来捉！\n\n**使用指南：**\n...") # 省略部分文本
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         embed.set_footer(text="此面板永久有效，点击下方按钮即可使用")
 
         await channel.send(embed=embed, view=SearchMethodView())
-        await interaction.followup.send(chimidan_text(f"处理完成！清理了 {deleted_count} 个旧面板，并发送了最新的搜索雷达！"), ephemeral=True)
+        await interaction.followup.send((f"处理完成！清理了 {deleted_count} 个旧面板，并发送了最新的搜索雷达！"), ephemeral=True)
 
     @app_commands.command(name="快捷搜索", description="调出快捷搜索面板")
     async def search_cmd(self, interaction: discord.Interaction):
-        embed = discord.Embed(title="🔍 奇米蛋搜索雷达快捷版", description=chimidan_text("点击下方按钮开始搜索！"), color=0x87ceeb)
+        embed = discord.Embed(title="🔍 奇米蛋搜索雷达快捷版", description="点击下方按钮开始搜索！", color=0x87ceeb)
         await interaction.response.send_message(embed=embed, view=SearchMethodView(), ephemeral=True)

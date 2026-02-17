@@ -1,4 +1,5 @@
 import discord
+from utils import get_card_forums
 
 def get_card_forums(guild: discord.Guild):
     """【修改】获取所有包含目标关键词的论坛频道"""
