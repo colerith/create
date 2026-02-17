@@ -9,8 +9,7 @@ import asyncio
 from datetime import datetime, time
 
 from core.db import get_db
-from core.utils import TARGET_KEYWORDS
-from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS, RECOMMEND_DAILY_CHANNEL_IDS, RECOMMEND_TEST_ROLE_ID
+from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS, RECOMMEND_DAILY_CHANNEL_IDS, RECOMMEND_TEST_ROLE_ID, TARGET_KEYWORDS, TEST_ROLE_ID
 
 from views import DailyRecommendView
 

@@ -8,8 +8,7 @@ import asyncio
 from zoneinfo import ZoneInfo
 
 from .views import PaginatorView, SearchMethodView
-from config import EXPLORATION_TARGET_CHANNEL_IDS, EXPLORATION_ADMIN_USER_ID, TZ_SHANGHAI
-from core.utils import TARGET_KEYWORDS
+from config import EXPLORATION_TARGET_CHANNEL_IDS, EXPLORATION_ADMIN_USER_ID, TZ_SHANGHAI, TARGET_KEYWORDS, TEST_ROLE_ID
 
 # ---核心搜索逻辑---
 async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
