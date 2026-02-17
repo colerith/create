@@ -1,5 +1,3 @@
-# cogs/protection/cog.py
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,11 +6,12 @@ import json
 import aiosqlite
 import asyncio
 
-from core.db import get_db
-from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
-from cogs.protection.utils import is_valid_comment
+from .db import get_db
+from .utils import is_valid_comment
 from .utils import extract_trace_from_bytes
 from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
+
+from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
 
 class ProtectionCog(commands.Cog):
     def __init__(self, bot):
@@ -485,3 +484,7 @@ class ProtectionCog(commands.Cog):
 
         except Exception as e:
             print(f"❌ 执行置底更新时出错: {e}")
+
+
+async def setup(bot):
+    await bot.add_cog(ProtectionCog(bot))

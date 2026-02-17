@@ -1,5 +1,3 @@
-#cogs/protection/ui/modals.py
-
 import discord
 from discord import ui
 import os

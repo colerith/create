@@ -97,9 +97,6 @@ python main.py
 
 ```
 CREATE/
-├── core/                      # 核心与共享模块
-│   ├── db.py                  # 全局数据库连接与初始化
-│   └── utils.py               # 通用工具函数
 │
 ├── cogs/                      # 机器人所有功能模块（魔法书）的存放处
 │   ├── protection/            # ⭐ 附件保护与溯源模块 (核心功能)
@@ -109,11 +106,8 @@ CREATE/
 │   │       ├── modals.py
 │   │       └── views.py
 │   │
-│   ├── exploration/           # 🧩 作品探索模块
-│   └── recommend/             # ✨ 推荐与抽卡模块
-│── core/                      # 通用共享模块
-│   ├── db.py
-│   ├── utils.py
+│   ├── exploration.py         # 🧩 作品搜索模块
+│   └── recommend.py           # ✨ 推荐与抽卡模块
 ├── .env                       # (需自行创建) 存放机器人TOKEN等敏感信息
 ├── config.py                  # 全局配置文件，存放固定的ID和常量
 ├── main.py                    # 机器人主入口，负责加载Cogs和启动

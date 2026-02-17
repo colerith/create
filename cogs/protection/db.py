@@ -1,4 +1,4 @@
-# core/db.py
+# database.py
 
 import aiosqlite
 
@@ -44,14 +44,6 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS download_log (
                 log_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
                 title TEXT, filenames TEXT, timestamp TEXT NOT NULL
-            )
-        """)
-
-        # 5. 每日抽卡记录表
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS daily_gacha_records (
-                user_id INTEGER PRIMARY KEY,
-                last_draw_date TEXT
             )
         """)
         
