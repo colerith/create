@@ -1,3 +1,5 @@
+# cogs/protection/cog.py
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -6,9 +8,8 @@ import json
 import aiosqlite
 import asyncio
 
-from database import get_db
-from .constants import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
-from .db import init_likes_db
+from core.db import get_db
+from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
 from .utils import is_valid_comment
 from .utils import extract_trace_from_bytes
 from .ui.views import ProtectionDraftView, PostListView, PostSelectionView
@@ -21,7 +22,6 @@ class ProtectionCog(commands.Cog):
             callback=self.convert_to_protected
         )
         self.bot.tree.add_command(self.ctx_menu)
-        self.bot.loop.create_task(init_likes_db())
         self.bump_tasks = {}
 
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
@@ -485,7 +485,3 @@ class ProtectionCog(commands.Cog):
 
         except Exception as e:
             print(f"❌ 执行置底更新时出错: {e}")
-
-
-async def setup(bot):
-    await bot.add_cog(ProtectionCog(bot))

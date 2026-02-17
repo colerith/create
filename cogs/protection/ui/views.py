@@ -1,4 +1,4 @@
-# protection/ui/views.py
+# cogs/protection/ui/views.py
 
 import discord
 from discord import ui
@@ -8,8 +8,8 @@ import asyncio
 import os
 import aiosqlite
 from datetime import datetime
-from database import get_db
-from ..constants import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+from core.db import get_db
+from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
 # 引入我们新写的“魔法工具”
 from ..utils import (
@@ -21,10 +21,10 @@ from ..utils import (
     generate_trace_id    # 新增：生成ID
 )
 # 引入新写的数据库记录函数
-from ..db import log_file_trace
+from ....core.db import log_file_trace
 from .modals import DraftTitleModal, DraftNoteModal, DraftPasswordModal, RenameFileModal, PasswordUnlockModal
 
-# --- 延迟下载视图 (核心修改区域) ---
+# --- 下载组件 ---
 class AuthorNoteView(ui.View):
     def __init__(self, bot, row):
         super().__init__(timeout=300)
@@ -592,7 +592,7 @@ class BumpButtonView(discord.ui.View):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
-        from database import get_db
+        from core.db import get_db
 
         rows = []
         async with get_db() as db:
