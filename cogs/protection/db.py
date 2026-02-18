@@ -3,7 +3,7 @@
 import aiosqlite
 import json
 from datetime import datetime
-from core.db import get_db
+from ..core.db import get_db
 from config import TZ_SHANGHAI
 
 # --- 写操作 (Create / Update) ---

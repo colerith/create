@@ -3,7 +3,7 @@
 import aiosqlite
 from datetime import datetime
 
-from core.db import get_db
+from ..core.db import get_db
 from config import TZ_SHANGHAI
 
 async def init_recommend_db():
