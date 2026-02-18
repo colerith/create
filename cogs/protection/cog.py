@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime
+from async_generator import aenumerate
 import json
 import asyncio
 
@@ -23,7 +24,6 @@ class ProtectionCog(commands.Cog):
         )
         self.bot.tree.add_command(self.ctx_menu)
         self.bump_tasks = {}
-        # 移除旧的 init_likes_db() 调用
 
     maker_group = app_commands.Group(name="贴主", description="[贴主] 附件保护发布与管理工具")
     user_group = app_commands.Group(name="保护附件", description="[用户] 下载与查询附件")
@@ -207,57 +207,114 @@ class ProtectionCog(commands.Cog):
     @app_commands.describe(开关="'on'开启, 'off'关闭")
     async def auto_bump(self, interaction: discord.Interaction, 开关: str):
         is_admin = interaction.user.guild_permissions.administrator
+        # 修正：TextChannel 没有 owner_id，所以要判断类型
         is_owner = isinstance(interaction.channel, discord.Thread) and interaction.channel.owner_id == interaction.user.id
         if not (is_admin or is_owner):
             return await interaction.response.send_message("❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True)
 
-        channel_id = interaction.channel.id
+        channel = interaction.channel
+        channel_id = channel.id
+
         if 开关.lower() == "off":
+            # 停止并移除任务
             if channel_id in self.bump_tasks:
                 self.bump_tasks[channel_id].cancel()
                 del self.bump_tasks[channel_id]
+
+            # 从数据库移除配置
             await protection_db.remove_bump_config(channel_id)
-            return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底功能。", ephemeral=True)
+
+            # 【新增】主动清理旧的置底面板
+            try:
+                async for msg in channel.history(limit=20):
+                    if msg.author.id == self.bot.user.id and msg.components and len(msg.components) > 0 and msg.components[0].children[0].custom_id == "bump_get_attachments":
+                        await msg.delete()
+                        break # 只删除一个就行
+            except Exception:
+                pass # 忽略权限等错误
+
+            return await interaction.response.send_message("✅ 已**关闭**本频道的自动置底，并尝试清理了旧面板。", ephemeral=True)
 
         if 开关.lower() == "on":
+            # 检查是否有附件，这一步是正确的
             rows = await protection_db.get_items_in_channel(channel_id, limit=1)
             if not rows:
                 return await interaction.response.send_message("❌ 本频道没有任何受保护的附件记录，无法开启置底。", ephemeral=True)
 
-            if channel_id in self.bump_tasks: self.bump_tasks[channel_id].cancel()
-            task = self.bot.loop.create_task(self._bump_loop(interaction.channel))
+            # 如果任务已在运行，先停止旧的
+            if channel_id in self.bump_tasks:
+                self.bump_tasks[channel_id].cancel()
+
+            # 创建并记录新任务
+            task = self.bot.loop.create_task(self._bump_loop(channel))
             self.bump_tasks[channel_id] = task
             await protection_db.add_bump_config(channel_id)
-            await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将定时检查置底面板。", ephemeral=True)
+
+            await interaction.response.send_message(f"✅ **自动置底已开启**\nBot 将定时检查并维护置底面板。", ephemeral=True)
         else:
             await interaction.response.send_message("请明确指示 `on` 或 `off`。", ephemeral=True)
 
-    async def _bump_loop(self, channel):
+    async def _bump_loop(self, channel: discord.TextChannel | discord.Thread):
         print(f"✅ [置底任务启动] 频道: {channel.name} ({channel.id})")
         try:
-            while True:
-                await asyncio.sleep(600) # 每10分钟检查一次
+            while not self.bot.is_closed():
                 try:
-                    layout_data = BumpButtonView.create_layout(self.bot)
-                    history_msgs = [msg async for msg in channel.history(limit=20)]
-                    found_old_bump = None
-                    is_latest = False
+                    # 1.【核心】每次循环都检查数据库，确认是否还需要置底
+                    rows = await protection_db.get_items_in_channel(channel.id, limit=1)
+                    should_have_bump = bool(rows)
 
-                    for i, msg in enumerate(history_msgs):
+                    # 2. 查找旧的置底消息
+                    old_bump_message = None
+                    is_at_bottom = False
+                    async for i, msg in aenumerate(channel.history(limit=10)):
+                        # 使用 aenumerate 来获取索引
                         if msg.author.id == self.bot.user.id and msg.components and len(msg.components) > 0 and msg.components[0].children[0].custom_id == "bump_get_attachments":
-                            found_old_bump = msg
-                            if i == 0: is_latest = True
-                            break # 只找最新的那一个面板
+                            old_bump_message = msg
+                            if i == 0:
+                                is_at_bottom = True
+                            break # 只关心最近的一个
 
-                    if found_old_bump and not is_latest:
-                        await found_old_bump.delete()
-                        await channel.send(**layout_data)
-                    elif not found_old_bump:
-                        await channel.send(**layout_data)
+                    # 3. 根据状态执行正确的操作 (状态机逻辑)
+                    if should_have_bump:
+                        # **情况A：应该有，但没有 -> 发送一个新的**
+                        if not old_bump_message:
+                            layout_data = BumpButtonView.create_layout(self.bot)
+                            await channel.send(**layout_data)
 
-                except discord.Forbidden: break # 没权限了就退出
-                except Exception as e: print(f"[{channel.id}] 置底任务出错: {e}")
+                        # **情况B：应该有，也有了，但不在底部 -> 删掉旧的，发送新的**
+                        elif not is_at_bottom:
+                            layout_data = BumpButtonView.create_layout(self.bot)
+                            await old_bump_message.delete()
+                            await asyncio.sleep(1) # 等待一下，防止竞态
+                            await channel.send(**layout_data)
+
+                        # 情况C：应该有，也有了，且在底部 -> 无需操作
+
+                    else: # not should_have_bump
+                        # **情况D：不该有，但有了 -> 删除它，并自动停止任务**
+                        if old_bump_message:
+                            await old_bump_message.delete()
+
+                        # 自动关闭
+                        print(f"ℹ️ [置底任务] 频道 {channel.name} 已无附件，自动停止置底任务。")
+                        if channel.id in self.bump_tasks:
+                            del self.bump_tasks[channel.id]
+                        await protection_db.remove_bump_config(channel.id)
+                        break # 跳出 while True 循环，终止此任务
+
+                except discord.Forbidden:
+                    print(f"❌ [置底任务] 权限不足，任务为频道 {channel.name} 自动停止。")
+                    break # 没权限了直接退出循环
+                except Exception as e:
+                    print(f"- [置底任务] {channel.name} 循环中发生错误: {e}")
+
+                # 无论如何都等待
+                await asyncio.sleep(300) # 建议缩短到5分钟，以便更快响应变化
+
         except asyncio.CancelledError:
+            # 这是正常的任务取消
+            pass
+        finally:
             print(f"🛑 [置底任务停止] 频道: {channel.name}")
 
     async def update_sticky_message(self, thread: discord.Thread):
