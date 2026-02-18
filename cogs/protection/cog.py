@@ -4,7 +4,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime
-from async_generator import aenumerate
 import json
 import asyncio
 
@@ -266,13 +265,18 @@ class ProtectionCog(commands.Cog):
                     # 2. 查找旧的置底消息
                     old_bump_message = None
                     is_at_bottom = False
-                    async for i, msg in aenumerate(channel.history(limit=10)):
-                        # 使用 aenumerate 来获取索引
+
+                    # ---【核心修改】---
+                    # 使用手动计数器替代 aenumerate
+                    i = 0
+                    async for msg in channel.history(limit=10):
                         if msg.author.id == self.bot.user.id and msg.components and len(msg.components) > 0 and msg.components[0].children[0].custom_id == "bump_get_attachments":
                             old_bump_message = msg
                             if i == 0:
                                 is_at_bottom = True
                             break # 只关心最近的一个
+                        i += 1 # 手动增加索引
+                    # ---【修改结束】---
 
                     # 3. 根据状态执行正确的操作 (状态机逻辑)
                     if should_have_bump:
@@ -309,7 +313,7 @@ class ProtectionCog(commands.Cog):
                     print(f"- [置底任务] {channel.name} 循环中发生错误: {e}")
 
                 # 无论如何都等待
-                await asyncio.sleep(300) # 建议缩短到5分钟，以便更快响应变化
+                await asyncio.sleep(300) # 5分钟检查一次
 
         except asyncio.CancelledError:
             # 这是正常的任务取消
