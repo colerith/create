@@ -554,8 +554,6 @@ class PostListView(ui.View):
             # 验证通过后，进入注入流程
             await start_download_flow(interaction, self.bot, row)
 
-# 请添加到 cogs/protection/ui/views.py 中
-
 class BumpButtonView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -590,7 +588,7 @@ class BumpButtonView(discord.ui.View):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
-        from database import get_db
+        from ..core.db import get_db
 
         rows = []
         async with get_db() as db:
