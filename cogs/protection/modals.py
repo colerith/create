@@ -1,9 +1,11 @@
+# protection/modals.py
+
 import discord
 from discord import ui
 import os
 import json
 import asyncio
-from ..utils import check_requirements_common
+from .utils import check_requirements_common
 
 class DraftTitleModal(ui.Modal, title="设置标题"):
     title_input = ui.TextInput(label="标题", placeholder="请输入...", max_length=100)

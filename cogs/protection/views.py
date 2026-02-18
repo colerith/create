@@ -1,4 +1,4 @@
-# protection/ui/views.py
+# protection/views.py
 
 import discord
 from discord import ui
@@ -7,21 +7,18 @@ import io
 import asyncio
 import os
 import aiosqlite
-from datetime import datetime
-from database import get_db
-from ..constants import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
-# 引入我们新写的“魔法工具”
-from ..utils import (
+from datetime import datetime
+from core.db import get_db, log_file_trace
+from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+from .utils import (
     fetch_files_common,
     make_discord_files_common,
     check_requirements_common,
     record_download_common,
-    inject_smart_trace,  # 新增：注入指纹
-    generate_trace_id    # 新增：生成ID
+    inject_smart_trace, 
+    generate_trace_id 
 )
-# 引入新写的数据库记录函数
-from ..db import log_file_trace
 from .modals import DraftTitleModal, DraftNoteModal, DraftPasswordModal, RenameFileModal, PasswordUnlockModal
 
 # --- 延迟下载视图 (核心修改区域) ---

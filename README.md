@@ -97,21 +97,34 @@ python main.py
 
 ```
 CREATE/
-│
-├── cogs/                      # 机器人所有功能模块（魔法书）的存放处
-│   ├── protection/            # ⭐ 附件保护与溯源模块 (核心功能)
-│   │   ├── cog.py             # 命令、事件监听器
-│   │   ├── utils.py           # 专用于此模块的工具函数 (如注入指纹)
-│   │   └── ui/                # UI组件 (Views 和 Modals)
-│   │       ├── modals.py
-│   │       └── views.py
+├── cogs/
+│   ├── core/
+│   │   └── db.py                  # ✅ 核心数据库模块
 │   │
-│   ├── exploration.py         # 🧩 作品搜索模块
-│   └── recommend.py           # ✨ 推荐与抽卡模块
-├── .env                       # (需自行创建) 存放机器人TOKEN等敏感信息
-├── config.py                  # 全局配置文件，存放固定的ID和常量
-├── main.py                    # 机器人主入口，负责加载Cogs和启动
-└── requirements.txt           # 项目依赖库列表
+│   ├── exploration/
+│   │   ├── __init__.py
+│   │   ├── cog.py
+│   │   └── views.py
+│   │
+│   ├── protection/
+│   │   ├── __init__.py
+│   │   ├── cog.py
+│   │   ├── db.py
+│   │   ├── modals.py
+│   │   ├── utils.py
+│   │   └── views.py
+│   │
+│   └── recommend/
+│       ├── __init__.py
+│       ├── cog.py
+│       ├── db.py
+│       ├── utils.py
+│       └── views.py
+│
+├── config.py                      # 全局配置文件
+├── main.py                        # 机器人主入口
+├── README.md
+└── requirements.txt
 ```
 
 **通用模块设计模式**:
