@@ -13,7 +13,7 @@ import uuid
 import random
 
 from datetime import datetime
-from core.db import get_db
+from ..core.db import get_db
 from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 
 # --- 魔法签名与隐写配置 ---

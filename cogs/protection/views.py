@@ -9,7 +9,7 @@ import os
 import aiosqlite
 
 from datetime import datetime
-from core.db import get_db, log_file_trace
+from ..core.db import get_db, log_file_trace
 from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 from .utils import (
     fetch_files_common,
