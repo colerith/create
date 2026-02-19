@@ -320,37 +320,3 @@ class ProtectionCog(commands.Cog):
             pass
         finally:
             print(f"🛑 [置底任务停止] 频道: {channel.name}")
-
-    async def update_sticky_message(self, thread: discord.Thread):
-        """核心函数：扫描贴主附件 -> 发送或更新置底消息"""
-        try:
-            image_urls = []
-            async for msg in thread.history(limit=None):
-                if msg.author.id == thread.owner_id and msg.attachments:
-                    image_urls.extend([att.url for att in msg.attachments if att.content_type and 'image' in att.content_type])
-            if not image_urls: return
-            image_urls.reverse()
-
-            embed_desc = f"检测到新附件发布，已自动更新置底。\n当前共收录 **{len(image_urls)}** 个文件。\n\n"
-            for i, url in enumerate(image_urls, 1):
-                line = f"{i}. [附件链接]({url})\n"
-                if len(embed_desc) + len(line) > 4000:
-                    embed_desc += f"...还有 {len(image_urls) - i + 1} 个文件未显示"
-                    break
-                embed_desc += line
-            embed = discord.Embed(title="📂 贴主附件汇总", description=embed_desc, color=0x2b2d31)
-
-            old_msg_id = await protection_db.get_sticky_message_id(thread.id)
-            if old_msg_id:
-                try:
-                    old_msg = await thread.fetch_message(old_msg_id)
-                    await old_msg.edit(embed=embed)
-                    return # 编辑完成，无需重发
-                except discord.NotFound:
-                    pass
-
-            new_msg = await thread.send(embed=embed, silent=True)
-            await protection_db.set_sticky_message(thread.id, new_msg.id)
-
-        except Exception as e:
-            print(f"❌ 执行贴主附件汇总更新时出错: {e}")
