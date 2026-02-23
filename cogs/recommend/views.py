@@ -200,21 +200,23 @@ class DailyRecommendContainer(ui.LayoutView):
             )
             components.append(header_section)
 
-            # Section 2: 简介和预览图
+           # Section 2: 简介和预览图
             components.append(ui.Separator())
             components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**"))
 
+            # 无论如何都显示简介文本
+            components.append(ui.TextDisplay(content=f"-# {clean_intro}"))
+
+            # 如果有图片，就追加一个 MediaGallery
             if thread_info['image']:
                 components.append(
                     ui.MediaGallery(
                        discord.MediaGalleryItem(
-                           media=thread_info['image'],
-                           description=clean_intro
+                           media=thread_info['image']
+                           # 这里移除 description，因为简介文本已经独立显示了
                        )
                     )
                 )
-            else:
-                components.append(ui.TextDisplay(content=f"-# {clean_intro}"))
 
             # 最后 ActionRow: 放置两个按钮
             components.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
