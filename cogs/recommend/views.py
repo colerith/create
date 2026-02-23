@@ -50,10 +50,13 @@ class GachaContainerView(ui.LayoutView):
         self.btn_draw_ten.callback = lambda i: self.execute_draw(i, 10)
 
         # 3. 初始显示内容
+        init_accessory = ui.Thumbnail(media=self.user.display_avatar.url)
+
         self.display_section = ui.Section(
             ui.TextDisplay(content="### 🎴 缘分感应控制台"),
             ui.TextDisplay(content="请选择资源池，然后点击按钮开始抽卡。"),
             ui.TextDisplay(content="-# 每天仅限 1 次机会 (测试员除外)"),
+            accessory=init_accessory # ✅ 必填
         )
 
         # 4. 结果展示区域 (初始为空或占位)
@@ -71,15 +74,16 @@ class GachaContainerView(ui.LayoutView):
         # 顶部提示区
         pool_name = "全部分区"
         if self.selected_channel_id:
-            # 尝试找回频道名
             f = next((f for f in self.guild_forums if f.id == self.selected_channel_id), None)
             pool_name = f.name if f else "未知分区"
+
+        user_avatar = ui.Thumbnail(media=self.user.display_avatar.url)
 
         header_section = ui.Section(
             ui.TextDisplay(content="### 🎴 缘分感应控制台"),
             ui.TextDisplay(content=f"**当前卡池:** {pool_name}"),
             ui.TextDisplay(content="-# 每天仅限 1 次机会 (测试员除外)"),
-            accessory=ui.Thumbnail(media=self.user.display_avatar.url)
+            accessory=user_avatar # ✅ 必填
         )
 
         # 动作区
