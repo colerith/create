@@ -174,7 +174,7 @@ class GachaContainerView(ui.LayoutView):
 
 
 # =================================================================
-#  Daily Recommendation (每日推荐) 
+#  Daily Recommendation (每日推荐) - 使用 Container 布局 (二次修改)
 # =================================================================
 
 class DailyRecommendContainer(ui.LayoutView):
@@ -186,12 +186,12 @@ class DailyRecommendContainer(ui.LayoutView):
             style=discord.ButtonStyle.primary,
             custom_id="daily_gacha_open_btn"
         )
-        # Gacha 按钮的回调
         self.btn_gacha.callback = self.open_gacha
 
-        # --- Container 构建 ---
+        # 清除旧组件
         self.clear_items()
 
+        # 构建容器
         # 空状态
         if is_empty:
              empty_accessory = ui.Button(label="暂无", disabled=True, style=discord.ButtonStyle.secondary)
@@ -201,46 +201,44 @@ class DailyRecommendContainer(ui.LayoutView):
                     ui.TextDisplay(content="今天资源库里空空如也..."),
                     accessory=empty_accessory
                 ),
+                ui.ActionRow(self.btn_gacha), # 即使是空状态，抽卡按钮也应该显示
                 accent_colour=discord.Color.light_grey()
             )
         # 正常状态
         else:
             components = []
 
-            # 1. 标题与作者区 (作者头像作为 accessory)
-            author_avatar = thread_info['author_avatar'] or "https://cdn.discordapp.com/embed/avatars/0.png"
+            # 获取数据
+            clean_intro = thread_info['intro'][:200].strip() or "（作者未留下简介）"
+            author_avatar_url = thread_info['author_avatar'] or "https://cdn.discordapp.com/embed/avatars/0.png"
+
+            # 1. 第一个 Section: 标题、作者、简介
             header_section = ui.Section(
                 ui.TextDisplay(content=f"### 📅 每日精选 · {thread_info['title']}"),
                 ui.TextDisplay(content=f"👤 作者: {thread_info['author_mention']}"),
-                accessory=ui.Thumbnail(media=author_avatar)
+                ui.TextDisplay(content=f"-# {clean_intro}"), # 使用 -# 增强可读性
+                accessory=ui.Thumbnail(media=author_avatar_url)
             )
             components.append(header_section)
+            components.append(ui.Separator()) # 分割线
 
-            # 2. 简介、分区与标签区
-            clean_intro = thread_info['intro'][:200].strip() or "（作者未留下简介）"
-            tags_str = " / ".join(thread_info['tags'][:5]) if thread_info['tags'] else "无"
-
-            info_section = ui.Section(
-                ui.TextDisplay(content=f"**简介:** {clean_intro}"),
-                ui.TextDisplay(content=f"📂 **分区**: {thread_info['category']}"),
-                ui.TextDisplay(content=f"🏷️ **标签**: {tags_str}"),
-                # 跳转按钮作为 accessory
-                accessory=ui.Button(label="跳转原帖", url=thread_info['url'], style=discord.ButtonStyle.link)
-            )
-            components.append(info_section)
-
-            # 3. 底部交互按钮和分割线
-            components.append(ui.Separator())
-            components.append(ui.ActionRow(self.btn_gacha))
-
-            # 4. 如果有帖子图片，使用 MediaGallery 显示在最底部
+            # 2. 第二个 Section: 帖子图 (MediaGallery)
             if thread_info['image']:
-                components.append(ui.Separator(spacing=discord.SeparatorSpacing.large)) # 大分割线
-                components.append(
-                    ui.MediaGallery(
-                        discord.MediaGalleryItem(media=thread_info['image'], description="帖子预览图")
-                    )
+                image_gallery = ui.MediaGallery(
+                    discord.MediaGalleryItem(media=thread_info['image'])
                 )
+                components.append(image_gallery)
+                components.append(ui.Separator()) # 分割线
+
+            # 3. 第三个部分: 交互按钮 (ActionRow)
+            jump_button = ui.Button(
+                label="跳转原帖",
+                style=discord.ButtonStyle.link,
+                url=thread_info['url']
+            )
+            # 将两个按钮放在同一个 ActionRow
+            action_row = ui.ActionRow(self.btn_gacha, jump_button)
+            components.append(action_row)
 
             # 最终容器
             container = ui.Container(
