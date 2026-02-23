@@ -92,13 +92,6 @@ class GachaContainerView(ui.LayoutView):
         elements = [header_section, ui.Separator()]
 
         if result_content:
-            # 如果有结果，展示结果 Section
-            # Container 中展示复杂结果通常用 TextDisplay，或者 Embed 转换
-            # 但 Container 内部目前主要支持 TextDisplay, MediaGallery 等
-
-            # 这里我们把结果文本拆分为 TextDisplay
-            # 注意：Section 最多 3 个 TextDisplay
-
             # 简单的结果标题
             elements.append(ui.TextDisplay(content="### ✨ 感应结果"))
 
@@ -185,6 +178,7 @@ class DailyRecommendContainer(ui.LayoutView):
                 ui.Section(
                     ui.TextDisplay(content="### 📅 每日推荐"),
                     ui.TextDisplay(content="今天资源库里空空如也..."),
+                    accessory=ui.Button(label="暂无", disabled=True, style=discord.ButtonStyle.secondary)
                 ),
                 accent_colour=discord.Color.light_grey()
             )
