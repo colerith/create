@@ -234,8 +234,9 @@ class SearchPanelContainer(ui.LayoutView):
     """
     永久搜索面板 (Container版)
     """
-    def __init__(self):
+    def __init__(self, bot: discord.Client): 
         super().__init__(timeout=None)
+        self.bot = bot
 
         # 定义按钮
         self.btn_keyword = ui.Button(
@@ -254,10 +255,7 @@ class SearchPanelContainer(ui.LayoutView):
         )
         self.btn_user.callback = self.on_user
 
-        # 定义 Container
-        # 使用一张装饰性的图片作为 accessory
-        # 这里使用一个通用的搜索图标或者 Bot 头像
-        deco_img = "https://cdn-icons-png.flaticon.com/512/622/622669.png" # 示例放大镜图标
+        deco_img = self.bot.user.display_avatar.url
 
         container = ui.Container(
             ui.Section(

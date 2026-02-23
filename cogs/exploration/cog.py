@@ -13,7 +13,7 @@ class ExplorationCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         # 注册持久化 View
-        self.bot.add_view(SearchPanelContainer())
+        self.bot.add_view(SearchPanelContainer(self.bot)) 
         self.daily_task.start()
 
     async def cog_unload(self):
@@ -25,83 +25,82 @@ class ExplorationCog(commands.Cog):
 
         threads_list = []
         for forum in guild.forums:
-            # 简单权限检查
             if not forum.permissions_for(guild.me).read_messages:
                 continue
-
-            # 筛选今日
             threads_list.extend([t for t in forum.threads if t.created_at.timestamp() >= today_start_ts])
 
-        # 按时间倒序
         threads_list.sort(key=lambda t: t.created_at, reverse=True)
         return threads_list
 
-    async def refresh_channel_daily_panel(self, channel: discord.TextChannel, resend: bool = False):
-        """刷新每日更新面板 (Container Ver.)"""
+    async def refresh_channel_daily_report(self, channel: discord.TextChannel):
+        """
+        刷新每日更新日报 (Container Ver.) - 智能编辑模式
+        """
         threads = await self.get_todays_threads(channel.guild)
         date_str = datetime.now(TZ_SHANGHAI).strftime('%Y年%m月%d日')
         panel_title = f"📅 {date_str} 更新日报"
 
         # 创建 Container View
-        # user 传 bot.user 用于展示头像
         view = SearchResultContainer(threads, title=panel_title, user=self.bot.user, is_daily=True)
 
-        # 查找或发送
+        # 查找已有面板
         target_msg = None
-        if not resend:
-            try:
-                async for msg in channel.history(limit=20):
-                    if msg.author == self.bot.user:
-                        # 简单判定：如果是机器人发的，且目前没有 Content (Container消息通常没content或者不重要)，假定是面板
-                        # 或者检查是否有 Button (Container View 会带按钮)
-                        if msg.components:
-                            target_msg = msg
-                            break
-            except Exception as e:
-                print(f"扫描日报面板历史出错: {e}")
+        try:
+            async for msg in channel.history(limit=20):
+                if msg.author == self.bot.user:
+                    if msg.components:
+                        target_msg = msg
+                        break
+        except Exception as e:
+            print(f"扫描日报面板历史出错: {e}")
 
         if target_msg:
             try:
-                # Container 更新：直接 replace view
+                # 编辑模式
                 await target_msg.edit(view=view)
+                return
             except discord.NotFound:
-                await channel.send(view=view)
-        else:
-            if resend:
-                try:
-                    # 清理模式：只清理机器人自己的消息
-                    async for msg in channel.history(limit=20):
-                         if msg.author == self.bot.user:
-                             await msg.delete()
-                             await asyncio.sleep(0.5)
-                except:
-                    pass
-            await channel.send(view=view)
+                pass
+            except Exception as e:
+                print(f"编辑日报面板失败: {e}")
+
+        # 发送新面板
+        if target_msg:
+            try: await target_msg.delete()
+            except: pass
+        await channel.send(view=view)
 
     @tasks.loop(minutes=10)
     async def daily_task(self):
         for channel_id in EXPLORATION_TARGET_CHANNEL_IDS:
             if channel := self.bot.get_channel(channel_id):
-                await self.refresh_channel_daily_panel(channel)
+                await self.refresh_channel_daily_report(channel)
 
     @daily_task.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道的日报面板")
+    # --- 新增/修改后的命令 ---
+
+    @app_commands.command(name="更新日报面板", description="[管理] 刷新本频道的日报内容")
     @app_commands.default_permissions(administrator=True)
     async def manual_daily_report(self, interaction: discord.Interaction):
         if interaction.user.id != ADMIN_USER_ID and not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("你没有权限操作这个命令捏！", ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
-        if interaction.channel_id in EXPLORATION_TARGET_CHANNEL_IDS:
-            await self.refresh_channel_daily_panel(interaction.channel, resend=True)
-            await interaction.followup.send("日报面板已清理并发送最新版惹！", ephemeral=True)
+        if interaction.channel_id not in EXPLORATION_TARGET_CHANNEL_IDS:
+            await interaction.response.send_message("⚠️ 注意：当前频道不在自动更新列表内。", ephemeral=True)
         else:
-            await interaction.followup.send("此命令只能在已配置的日报频道中使用。", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
 
-    @app_commands.command(name="更新搜索面板", description="[管理] 清理旧面板并发送新的搜索面板")
+        await self.refresh_channel_daily_report(interaction.channel)
+
+        if not interaction.response.is_done():
+             await interaction.response.send_message("✅ 日报面板已刷新！", ephemeral=True)
+        else:
+             await interaction.followup.send("✅ 日报面板已刷新！", ephemeral=True)
+
+    @app_commands.command(name="更新搜索面板", description="[管理] 刷新本频道的搜索雷达视图")
     @app_commands.default_permissions(administrator=True)
     async def refresh_search_panel(self, interaction: discord.Interaction):
         if interaction.user.id != ADMIN_USER_ID and not interaction.user.guild_permissions.administrator:
@@ -109,28 +108,30 @@ class ExplorationCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # 清理旧消息
-        try:
-            async for msg in interaction.channel.history(limit=20):
-                # 识别特征：含有特定 Custom ID 的按钮
-                if msg.author == self.bot.user and msg.components:
-                    # 检查是否有 "search_panel_" 开头的组件
-                    is_panel = False
-                    for child in msg.components[0].children:
-                        if hasattr(child, 'custom_id') and child.custom_id and "search_panel_" in child.custom_id:
-                            is_panel = True
-                            break
-                    if is_panel:
-                        await msg.delete()
-                        await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"清理搜索面板失败: {e}")
+        # 定义新视图 (传入 self.bot)
+        new_view = SearchPanelContainer(self.bot)
 
-        # 发送新面板
-        await interaction.channel.send(view=SearchPanelContainer())
-        await interaction.followup.send("最新的搜索雷达已部署！", ephemeral=True)
+        # 尝试查找已有面板并编辑
+        target_msg = None
 
-    @app_commands.command(name="快捷搜索", description="调出快捷搜索面板")
+        if target_msg:
+            try:
+                await target_msg.edit(view=new_view)
+                await interaction.followup.send("✅ 搜索面板已更新（原位编辑）！", ephemeral=True)
+                return
+            except discord.NotFound:
+                pass
+            except Exception:
+                pass
+
+        # 如果没找到或编辑失败，发送新的
+        await interaction.channel.send(view=new_view)
+        await interaction.followup.send("✅ 最新的搜索雷达已重新发送！", ephemeral=True)
+
+    @app_commands.command(name="快捷搜索", description="调出临时搜索面板")
     async def search_cmd(self, interaction: discord.Interaction):
-        # 瞬态面板
-        await interaction.response.send_message(view=SearchPanelContainer(), ephemeral=True)
+        # 瞬态面板 (传入 self.bot)
+        await interaction.response.send_message(
+            view=SearchPanelContainer(self.bot), 
+            ephemeral=True
+        )
