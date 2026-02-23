@@ -39,6 +39,13 @@ async def get_all_statistics_panels():
         cursor = await db.execute("SELECT * FROM statistics_panels")
         return await cursor.fetchall()
 
+async def remove_statistics_panel(message_id: int):
+    """当面板消息被删除时，从数据库移除记录"""
+    async with get_db() as db:
+        await db.execute("DELETE FROM statistics_panels WHERE message_id = ?", (message_id,))
+        await db.commit()
+
+
 # --- 顶帖记录管理 ---
 
 async def log_thread_bump(thread_id: int):
@@ -55,28 +62,7 @@ async def get_recently_bumped_threads(days: int = 7) -> set:
     """获取最近X天内被顶过的帖子ID集合，用于排除"""
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT thread_id, last_bump_timestamp FROM bump_logs")
+        threshold_date_str = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cursor = await db.execute("SELECT thread_id FROM bump_logs WHERE last_bump_timestamp >= ?", (threshold_date_str,))
         rows = await cursor.fetchall()
-
-        recently_bumped_ids = set()
-        if not rows: return recently_bumped_ids
-
-        now_utc = datetime.utcnow()
-        threshold_date = now_utc - timedelta(days=days)
-
-        for row in rows:
-            # 确保时间字符串能被正确解析
-            try:
-                # fromisoformat 支持多种ISO 8601格式
-                bump_time_utc = datetime.fromisoformat(row['last_bump_timestamp'].replace('Z', '+00:00'))
-                # 统一转为无时区的UTC时间进行比较
-                if bump_time_utc.replace(tzinfo=None) > threshold_date:
-                    recently_bumped_ids.add(row['thread_id'])
-            except ValueError:
-                # 兼容可能不带时区信息的旧数据
-                if len(row['last_bump_timestamp']) == 19: # YYYY-MM-DDTHH:MM:SS
-                    bump_time_utc = datetime.strptime(row['last_bump_timestamp'], "%Y-%m-%dT%H:%M:%S")
-                    if bump_time_utc > threshold_date:
-                        recently_bumped_ids.add(row['thread_id'])
-
-        return recently_bumped_ids
+        return {row['thread_id'] for row in rows}
