@@ -19,6 +19,24 @@ class StatisticsCog(commands.Cog):
         self.daily_refresh_task.start()
         self.auto_bump_archived_task.start()
 
+    async def cog_load(self):
+        self.bot.loop.create_task(self.register_persistent_views_after_ready())
+
+    async def register_persistent_views_after_ready(self):
+        await self.bot.wait_until_ready()
+        print("📊 [StatisticsCog] Bot 已就绪，开始注册持久化统计面板...")
+        all_panels = await db.get_all_panels()
+        registered_forums = set()
+        count = 0
+        for panel in all_panels:
+            forum_id = panel['target_forum_id']
+            if forum_id not in registered_forums:
+                view_instance = StatisticsContainerView(self.bot, forum_id)
+                self.bot.add_view(view_instance)
+                registered_forums.add(forum_id)
+                count += 1
+        print(f"✅ [StatisticsCog] 共为 {count} 个不同的论坛注册了刷新按钮。")
+
     def cog_unload(self):
         self.daily_refresh_task.cancel()
         self.auto_bump_archived_task.cancel()
@@ -37,7 +55,6 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(time=time(hour=0, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_refresh_task(self):
-        # ... (此部分代码无需改动，保持原样) ...
         print(f"[{datetime.now(TZ_SHANGHAI)}] 🌞 开始执行每日统计面板刷新任务...")
         all_panels = await db.get_all_panels()
         if not all_panels:
@@ -51,50 +68,48 @@ class StatisticsCog(commands.Cog):
                 if not guild: continue
                 panel_channel = guild.get_channel(panel_record["channel_id"])
                 if not panel_channel: continue
-                target_forum = guild.get_channel(panel_record["target_forum_id"])
-                if not isinstance(target_forum, discord.ForumChannel):
-                    await db.remove_panel_record(panel_record["message_id"])
-                    continue
+
+                target_forum_id = panel_record["target_forum_id"]
                 message = await panel_channel.fetch_message(panel_record["message_id"])
-                new_stats = await utils.fetch_forum_stats(target_forum)
-                new_view = StatisticsContainerView(target_forum, new_stats)
-                await message.edit(view=new_view)
+
+                # 创建一个新的视图实例并调用刷新方法
+                view_instance = StatisticsContainerView(self.bot, target_forum_id)
+                await view_instance.refresh_data_and_update(message_to_edit=message)
+
                 refreshed_count += 1
                 await asyncio.sleep(2)
             except discord.NotFound:
                 await db.remove_panel_record(panel_record["message_id"])
-                print(f"  - 面板消息 {panel_record['message_id']} 已被删除，从数据库移除。")
             except discord.Forbidden:
-                print(f"  - ❌ 权限不足，无法编辑面板 {panel_record['message_id']}。")
+                pass
             except Exception as e:
-                print(f"  - ❌ 刷新面板 {panel_record['message_id']} 时发生未知错误: {e}")
-        print(f"✅ 每日刷新任务完成，共成功刷新 {refreshed_count} / {len(all_panels)} 个面板。")
+                import traceback
+                traceback.print_exc()
 
+        print(f"✅ 每日刷新任务完成，共成功刷新 {refreshed_count} / {len(all_panels)} 个面板。")
 
     @daily_refresh_task.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
 
-    # === 修复顶帖任务 ===
+    # --- 【修复】顶帖任务 ---
     @tasks.loop(hours=3)
     async def auto_bump_archived_task(self):
-        """每3小时扫描一次，通过发评论顶起“沉底”的帖子"""
-        print(f"\n[{datetime.now(TZ_SHANGHAI)}] 🚀 开始执行【评论式】顶帖任务...")
+        """每3小时扫描一次，通过发评论（并立即删除）来顶起“沉底”的帖子"""
+        print(f"\n[{datetime.now(TZ_SHANGHAI)}] 🚀 开始执行【无痕】顶帖任务...")
 
         SILENT_DAYS = 3
-        BUMP_MESSAGES = ["顶", "捞一下", "再捞捞", "顶顶", "顶起"]
+        BUMP_MESSAGES = ["✨发现了一个宝藏好帖唷呐！"]
         three_days_ago = datetime.now(TZ_SHANGHAI) - timedelta(days=SILENT_DAYS)
 
         for guild in self.bot.guilds:
-            if not guild.me.guild_permissions.send_messages_in_threads:
-                print(f"  - 权限不足: 在服务器 {guild.name} 中缺少'在帖子中发送消息'权限，跳过。")
+            if not guild.me.guild_permissions.send_messages_in_threads or not guild.me.guild_permissions.manage_messages:
+                # 同时需要发送和删除消息的权限
                 continue
 
             target_forums = [f for f in guild.forums if any(keyword in f.name for keyword in RECOMMEND_TARGET_KEYWORDS)]
             if not target_forums:
                 continue
-
-            print(f"  - 正在扫描服务器: {guild.name}")
 
             threads_to_bump = []
             all_threads = []
@@ -108,52 +123,34 @@ class StatisticsCog(commands.Cog):
 
             for thread in all_threads:
                 try:
-                    # 正确地从异步生成器中获取最后一条消息
-                    last_message = None
-                    history = thread.history(limit=1)
-                    # 使用 anext 从异步迭代器中安全地取出一项
-                    last_message = await history.__anext__()
-
+                    last_message = await thread.history(limit=1).__anext__()
                     if last_message and last_message.created_at.astimezone(TZ_SHANGHAI) < three_days_ago:
                         if last_message.author != self.bot.user:
                              threads_to_bump.append(thread)
-
-                except StopAsyncIteration:
-                    # 帖子中没有任何消息，不是我们要找的目标
+                except:
                     continue
-                except discord.Forbidden:
-                    # 没有权限访问帖子历史，跳过
-                    continue
-                except Exception as e:
-                    print(f"    - 检查帖子 {thread.name} 时出错: {e}")
-
 
             if not threads_to_bump:
-                print(f"    - 在 {guild.name} 中没有找到超过 {SILENT_DAYS} 天未回复的帖子。")
                 continue
 
-            print(f"    - 发现 {len(threads_to_bump)} 个沉底帖子，计划顶起。")
-
-            bumped_count_this_run = 0
             random.shuffle(threads_to_bump)
-            for thread_to_bump in threads_to_bump[:5]: # 每次最多顶5个
+            for thread_to_bump in threads_to_bump[:5]:
                 try:
-                    await thread_to_bump.send(random.choice(BUMP_MESSAGES))
-                    bumped_count_this_run += 1
-                    print(f"      - ✅ 成功顶帖: '{thread_to_bump.name}' (ID: {thread_to_bump.id})")
+                    # 发送消息并获得消息对象
+                    bump_msg = await thread_to_bump.send(random.choice(BUMP_MESSAGES))
+                    # 短暂等待，确保顶帖效果生效
+                    await asyncio.sleep(5)
+                    # 删除刚刚发送的消息
+                    await bump_msg.delete()
+                    print(f"      - ✅ 成功无痕顶帖: '{thread_to_bump.name}' (ID: {thread_to_bump.id})")
+                    # 在每个操作后也增加延时，防止速率超限
                     await asyncio.sleep(10)
-                except discord.Forbidden:
-                    print(f"      - ❌ 顶帖失败: 没有权限在帖子 '{thread_to_bump.name}' 中发言。")
                 except Exception as e:
-                    print(f"      - ❌ 顶帖时发生未知错误: {e}")
+                    print(f"      - ❌ 无痕顶帖时发生错误: {e}")
 
-            print(f"    - 本轮在 {guild.name} 共成功顶起 {bumped_count_this_run} 个帖子。")
-            await asyncio.sleep(10)
-
-        print(f"[{datetime.now(TZ_SHANGHAI)}] ✨ 【评论式】顶帖任务本轮执行完毕。")
+        print(f"[{datetime.now(TZ_SHANGHAI)}] ✨ 【无痕】顶帖任务本轮执行完毕。")
 
     @auto_bump_archived_task.before_loop
     async def before_auto_bump_task(self):
         await self.bot.wait_until_ready()
-        print("评论式顶帖任务将在1分钟后开始第一次运行...")
         await asyncio.sleep(60)
