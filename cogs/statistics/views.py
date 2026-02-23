@@ -12,9 +12,10 @@ class StatisticsContainerView(ui.LayoutView):
         elements = []
 
         # --- 1. 顶部主标题 ---
+        # 移除了 size 参数
         elements.append(
             ui.Section(
-                ui.TextDisplay(content=f"### 📊 频道统计 · {stats_data.get('channel_name', '加载中')}", size=discord.UITextSize.large),
+                ui.TextDisplay(content=f"### 📊 频道统计 · {stats_data.get('channel_name', '加载中')}"),
                 ui.TextDisplay(content="😋来看看服务器内有什么好帖子吧！"),
                 accessory=ui.Thumbnail(media=stats_data.get('channel_icon_url', "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"))
             )
@@ -31,7 +32,7 @@ class StatisticsContainerView(ui.LayoutView):
 
         # --- 3. 热门帖子列表 ---
         elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="### 近期热门"))
+        elements.append(ui.TextDisplay(content="### 🔥近期热门"))
 
         hot_threads = stats_data.get('hot_threads', [])
         if hot_threads:
@@ -39,7 +40,8 @@ class StatisticsContainerView(ui.LayoutView):
                 elements.append(
                     ui.Section(
                         ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"), # 限制标题长度防止溢出
-                        ui.TextDisplay(content=f"👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}", size=discord.UITextSize.small),
+                        # 移除了 size 参数
+                        ui.TextDisplay(content=f"👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
                         accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
                     )
                 )
@@ -48,7 +50,7 @@ class StatisticsContainerView(ui.LayoutView):
 
         # --- 4. 冷门宝藏列表 ---
         elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="### 💎 冷门遗珠"))
+        elements.append(ui.TextDisplay(content="### 💎 冷门宝藏"))
 
         cold_threads = stats_data.get('cold_threads', [])
         if cold_threads:
@@ -60,7 +62,8 @@ class StatisticsContainerView(ui.LayoutView):
                 elements.append(
                     ui.Section(
                         ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"),
-                        ui.TextDisplay(content=f"发布于 {relative_time}", size=discord.UITextSize.small),
+                        # 移除了 size 参数
+                        ui.TextDisplay(content=f"发布于 {relative_time}"),
                         accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
                     )
                 )
