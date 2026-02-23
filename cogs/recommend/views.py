@@ -205,7 +205,7 @@ class DailyRecommendContainer(ui.LayoutView):
             components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**"))
 
             # 无论如何都显示简介文本
-            components.append(ui.TextDisplay(content=f"-# {clean_intro}"))
+            components.append(ui.TextDisplay(content=f"{clean_intro}"))
 
             # 如果有图片，就追加一个 MediaGallery
             if thread_info['image']:
