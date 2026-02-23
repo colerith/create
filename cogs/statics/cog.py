@@ -26,6 +26,8 @@ class StatisticsCog(commands.Cog):
     @app_commands.command(name="生成统计面板", description="[管理员] 为指定的论坛频道创建一份数据统计报告")
     @app_commands.default_permissions(administrator=True)
     async def create_stats_panel(self, interaction: discord.Interaction):
+        if not interaction.guild:
+             return await interaction.response.send_message("此命令必须在服务器内使用。", ephemeral=True)
         view = ForumSelectView(self.bot)
         await interaction.response.send_message(
             "请在下方选择你想要生成统计报告的论坛频道，然后点击按钮确认。",
@@ -35,6 +37,7 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(time=time(hour=0, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_refresh_task(self):
+        # ... (此部分代码无需改动，保持原样) ...
         print(f"[{datetime.now(TZ_SHANGHAI)}] 🌞 开始执行每日统计面板刷新任务...")
         all_panels = await db.get_all_panels()
         if not all_panels:
@@ -67,25 +70,22 @@ class StatisticsCog(commands.Cog):
                 print(f"  - ❌ 刷新面板 {panel_record['message_id']} 时发生未知错误: {e}")
         print(f"✅ 每日刷新任务完成，共成功刷新 {refreshed_count} / {len(all_panels)} 个面板。")
 
+
     @daily_refresh_task.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
 
-    # === 全新修改的顶帖任务 ===
+    # === 修复顶帖任务 ===
     @tasks.loop(hours=3)
     async def auto_bump_archived_task(self):
         """每3小时扫描一次，通过发评论顶起“沉底”的帖子"""
         print(f"\n[{datetime.now(TZ_SHANGHAI)}] 🚀 开始执行【评论式】顶帖任务...")
 
-        # 定义“沉底”：3天没有新评论
         SILENT_DAYS = 3
-        # 顶帖评论内容，可以随机选择一个
         BUMP_MESSAGES = ["顶", "捞一下", "再捞捞", "顶顶", "顶起"]
-
         three_days_ago = datetime.now(TZ_SHANGHAI) - timedelta(days=SILENT_DAYS)
 
         for guild in self.bot.guilds:
-            # 机器人需要有在帖子中发言的权限
             if not guild.me.guild_permissions.send_messages_in_threads:
                 print(f"  - 权限不足: 在服务器 {guild.name} 中缺少'在帖子中发送消息'权限，跳过。")
                 continue
@@ -97,13 +97,10 @@ class StatisticsCog(commands.Cog):
             print(f"  - 正在扫描服务器: {guild.name}")
 
             threads_to_bump = []
-
-            # 合并扫描活跃和归档的帖子
             all_threads = []
             for forum in target_forums:
                 all_threads.extend(forum.threads)
                 try:
-                    # 也可以扫描归档区，看有没有需要捞起来的
                     async for thread in forum.archived_threads(limit=1000):
                         all_threads.append(thread)
                 except discord.Forbidden:
@@ -111,18 +108,21 @@ class StatisticsCog(commands.Cog):
 
             for thread in all_threads:
                 try:
-                    # 获取帖子的最后一条消息
-                    # history(limit=1) 默认就是最新的
-                    last_message = (await thread.history(limit=1).flatten())[0]
+                    # 正确地从异步生成器中获取最后一条消息
+                    last_message = None
+                    history = thread.history(limit=1)
+                    # 使用 anext 从异步迭代器中安全地取出一项
+                    last_message = await history.__anext__()
 
-                    # 检查最后一条消息的时间是否早于3天前
-                    if last_message.created_at.astimezone(TZ_SHANGHAI) < three_days_ago:
-                        # 额外检查一下，避免机器人自己顶自己的帖子
+                    if last_message and last_message.created_at.astimezone(TZ_SHANGHAI) < three_days_ago:
                         if last_message.author != self.bot.user:
                              threads_to_bump.append(thread)
 
-                except (IndexError, discord.Forbidden):
-                    # 没消息或没权限的帖子，跳过
+                except StopAsyncIteration:
+                    # 帖子中没有任何消息，不是我们要找的目标
+                    continue
+                except discord.Forbidden:
+                    # 没有权限访问帖子历史，跳过
                     continue
                 except Exception as e:
                     print(f"    - 检查帖子 {thread.name} 时出错: {e}")
@@ -135,14 +135,13 @@ class StatisticsCog(commands.Cog):
             print(f"    - 发现 {len(threads_to_bump)} 个沉底帖子，计划顶起。")
 
             bumped_count_this_run = 0
-            for thread_to_bump in threads_to_bump:
+            random.shuffle(threads_to_bump)
+            for thread_to_bump in threads_to_bump[:5]: # 每次最多顶5个
                 try:
-                     # 发送一条随机评论来顶帖
                     await thread_to_bump.send(random.choice(BUMP_MESSAGES))
                     bumped_count_this_run += 1
                     print(f"      - ✅ 成功顶帖: '{thread_to_bump.name}' (ID: {thread_to_bump.id})")
-                    # 不需要记录到数据库，因为下次扫描会直接检查最新评论时间
-                    await asyncio.sleep(10) # 每次顶帖之间增加较长延迟，避免刷屏感
+                    await asyncio.sleep(10)
                 except discord.Forbidden:
                     print(f"      - ❌ 顶帖失败: 没有权限在帖子 '{thread_to_bump.name}' 中发言。")
                 except Exception as e:

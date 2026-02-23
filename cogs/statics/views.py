@@ -23,10 +23,25 @@ class ForumSelectView(ui.View):
         if not self.channel_select.values:
             return await interaction.response.send_message("你还没有选择任何频道！", ephemeral=True)
 
-        target_forum = self.channel_select.values[0]
+        app_command_channel = self.channel_select.values[0]
+        target_forum = interaction.guild.get_channel(app_command_channel.id)
+
+        # 如果 get_channel 失败 (例如缓存问题)，尝试 fetch_channel
+        if not target_forum:
+            try:
+                target_forum = await interaction.guild.fetch_channel(app_command_channel.id)
+            except (discord.InvalidData, discord.HTTPException, discord.NotFound, discord.Forbidden):
+                 return await interaction.response.send_message("❌ 无法获取有效的频道信息，请重试。", ephemeral=True)
+
+
+        # 确保获取到的是 ForumChannel
+        if not isinstance(target_forum, discord.ForumChannel):
+             return await interaction.response.send_message("❌ 您选择的不是一个有效的论坛频道。", ephemeral=True)
+
 
         await interaction.response.defer()
 
+        # 现在传入的是完整的 ForumChannel 对象
         stats = await utils.fetch_forum_stats(target_forum)
 
         view = StatisticsContainerView(target_forum, stats)
@@ -56,28 +71,19 @@ class StatisticsContainerView(ui.LayoutView):
         hottest_list_str = format_post_list(stats['hottest_posts'])
         coldest_list_str = format_post_list(stats['coldest_posts'])
 
-        # === 修改：更新 Container 显示内容 ===
         container = ui.Container(
-            # 1. 标题和总体数据
             ui.Section(
                 ui.TextDisplay(content=f"### 📊 `{forum.name}` 数据报告"),
-                # 显示总帖子数和7日新增
                 ui.TextDisplay(content=f"**总帖子数:** {stats['total_posts']} 篇"),
                 ui.TextDisplay(content=f"**近7日新增:** {stats['recent_posts_count']} 篇"),
                 accessory=ui.Thumbnail(media=forum.guild.icon.url if forum.guild.icon else None)
             ),
             ui.Separator(spacing=discord.SeparatorSpacing.large),
-
-            # 2. 最热帖子
             ui.TextDisplay(content="#### 🔥 本周最热帖子 Top 5"),
             ui.TextDisplay(content=hottest_list_str),
-
             ui.Separator(),
-
-            # 3. 最冷清帖子
             ui.TextDisplay(content="#### 🧊 本周冷门宝藏 Top 5"),
             ui.TextDisplay(content=coldest_list_str),
-
             accent_colour=discord.Color.from_rgb(114, 137, 218)
         )
 

@@ -15,7 +15,8 @@ async def fetch_forum_stats(forum: discord.ForumChannel) -> dict:
     all_threads_with_stats = []
 
     # --- 数据抓取 ---
-    threads_to_scan = forum.threads
+    # 【修复】现在传入的 forum 对象是完整的 ForumChannel，可以安全地访问 .threads
+    threads_to_scan = forum.threads.copy() # 使用 .copy() 避免修改原始列表
     try:
         async for thread in forum.archived_threads(limit=1000):
             threads_to_scan.append(thread)
@@ -41,19 +42,18 @@ async def fetch_forum_stats(forum: discord.ForumChannel) -> dict:
                 starter_message = thread.starter_message
                 if not starter_message:
                     try:
-                        starter_message = (await thread.history(limit=1, oldest_first=True).flatten())[0]
-                    except (IndexError, discord.Forbidden):
-                        return None
+                        # 【修复】正确地从异步生成器中获取消息
+                        history = thread.history(limit=1, oldest_first=True)
+                        starter_message = await history.__anext__()
+                    except (StopAsyncIteration, IndexError, discord.Forbidden):
+                        return None # 获取不到起始消息
 
                 likes = 0
                 if starter_message.reactions:
                     for reaction in starter_message.reactions:
                         likes += reaction.count
 
-                # message_count 包含起始消息，所以评论数是它减1
                 comments = thread.message_count - 1 if thread.message_count else 0
-
-                # 如果评论数小于0，修正为0
                 if comments < 0:
                     comments = 0
 
@@ -75,7 +75,7 @@ async def fetch_forum_stats(forum: discord.ForumChannel) -> dict:
     # --- 最终返回的数据结构 ---
     return {
         "total_posts": total_posts,
-        "recent_posts_count": recent_posts_count, # 新增字段
+        "recent_posts_count": recent_posts_count,
         "hottest_posts": sorted_by_likes[:5],
         "coldest_posts": sorted_by_likes[-5:][::-1]
     }
