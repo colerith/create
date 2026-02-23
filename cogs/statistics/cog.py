@@ -11,13 +11,9 @@ from config import TZ_SHANGHAI
 class StatisticsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # cog_load 中添加视图，这里不需要
         self.update_panels_task.start()
 
     async def cog_load(self):
-        # 将持久化视图的注册放在 cog_load 中，确保只在启动时添加一次
-        self.bot.add_view(ForumSelectView(self))
-        # StatisticsContainerView 是动态创建的，不需要在这里注册
         print("✅ [StatisticsCog] 已成功加载并注册了 ForumSelectView。")
 
     async def cog_unload(self):
