@@ -1,69 +1,82 @@
-# cogs/statistics/db.py
-
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timedelta
 from ..core.db import get_db
-from config import TZ_SHANGHAI
 
 async def init_statistics_db():
-    """初始化统计面板和顶帖日志数据库表"""
+    """初始化统计功能所需的数据库表"""
     async with get_db() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS statistics_panels (
                 message_id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                guild_id INTEGER NOT NULL,
-                target_forum_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                panel_channel_id INTEGER NOT NULL,
+                forum_channel_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS bump_log (
+            CREATE TABLE IF NOT EXISTS bump_logs (
                 thread_id INTEGER PRIMARY KEY,
-                guild_id INTEGER NOT NULL,
-                last_bumped_at TEXT NOT NULL
+                last_bump_timestamp TEXT NOT NULL
             )
         """)
         await db.commit()
 
-async def record_bump(thread_id: int, guild_id: int):
-    """记录或更新一个帖子的顶帖时间"""
-    timestamp = datetime.now(TZ_SHANGHAI).isoformat()
+# --- 统计面板管理 ---
+
+async def add_statistics_panel(message_id: int, panel_channel_id: int, forum_channel_id: int, guild_id: int):
+    """记录一个统计面板信息"""
     async with get_db() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO bump_log (thread_id, guild_id, last_bumped_at) VALUES (?, ?, ?)",
-            (thread_id, guild_id, timestamp)
+            "INSERT OR REPLACE INTO statistics_panels (message_id, panel_channel_id, forum_channel_id, guild_id) VALUES (?, ?, ?, ?)",
+            (message_id, panel_channel_id, forum_channel_id, guild_id)
         )
         await db.commit()
 
-async def get_last_bumped_time(thread_id: int) -> datetime | None:
-    """获取一个帖子的最后顶帖时间"""
-    async with get_db() as db:
-        cursor = await db.execute("SELECT last_bumped_at FROM bump_log WHERE thread_id = ?", (thread_id,))
-        row = await cursor.fetchone()
-        if row:
-            return datetime.fromisoformat(row[0])
-    return None
-
-async def add_panel_record(message_id: int, channel_id: int, guild_id: int, target_forum_id: int):
-    """添加一个新的统计面板记录"""
-    timestamp = datetime.now(TZ_SHANGHAI).isoformat()
-    async with get_db() as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO statistics_panels (message_id, channel_id, guild_id, target_forum_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (message_id, channel_id, guild_id, target_forum_id, timestamp)
-        )
-        await db.commit()
-
-async def get_all_panels():
-    """获取所有已记录的统计面板信息"""
+async def get_all_statistics_panels():
+    """获取所有已记录的统计面板"""
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM statistics_panels")
         return await cursor.fetchall()
 
-async def remove_panel_record(message_id: int):
-    """根据消息ID移除一个统计面板记录"""
+# --- 顶帖记录管理 ---
+
+async def log_thread_bump(thread_id: int):
+    """记录一次顶帖操作"""
+    timestamp = datetime.utcnow().isoformat()
     async with get_db() as db:
-        await db.execute("DELETE FROM statistics_panels WHERE message_id = ?", (message_id,))
+        await db.execute(
+            "INSERT OR REPLACE INTO bump_logs (thread_id, last_bump_timestamp) VALUES (?, ?)",
+            (thread_id, timestamp)
+        )
         await db.commit()
+
+async def get_recently_bumped_threads(days: int = 7) -> set:
+    """获取最近X天内被顶过的帖子ID集合，用于排除"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT thread_id, last_bump_timestamp FROM bump_logs")
+        rows = await cursor.fetchall()
+
+        recently_bumped_ids = set()
+        if not rows: return recently_bumped_ids
+
+        now_utc = datetime.utcnow()
+        threshold_date = now_utc - timedelta(days=days)
+
+        for row in rows:
+            # 确保时间字符串能被正确解析
+            try:
+                # fromisoformat 支持多种ISO 8601格式
+                bump_time_utc = datetime.fromisoformat(row['last_bump_timestamp'].replace('Z', '+00:00'))
+                # 统一转为无时区的UTC时间进行比较
+                if bump_time_utc.replace(tzinfo=None) > threshold_date:
+                    recently_bumped_ids.add(row['thread_id'])
+            except ValueError:
+                # 兼容可能不带时区信息的旧数据
+                if len(row['last_bump_timestamp']) == 19: # YYYY-MM-DDTHH:MM:SS
+                    bump_time_utc = datetime.strptime(row['last_bump_timestamp'], "%Y-%m-%dT%H:%M:%S")
+                    if bump_time_utc > threshold_date:
+                        recently_bumped_ids.add(row['thread_id'])
+
+        return recently_bumped_ids
