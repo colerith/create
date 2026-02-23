@@ -22,7 +22,10 @@ async def check_user_drawn_today(user_id: int) -> bool:
     today_str = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d")
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT 1 FROM daily_gacha_records WHERE user_id = ? AND last_draw_date = ?", (user_id,))
+        cursor = await db.execute(
+            "SELECT 1 FROM daily_gacha_records WHERE user_id = ? AND last_draw_date = ?",
+            (user_id, today_str)
+        )
         return await cursor.fetchone() is not None
 
 async def mark_user_drawn(user_id: int):
