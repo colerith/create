@@ -1,3 +1,5 @@
+# cogs/statics/__init__.py
+
 from discord.ext import commands
 from .cog import StatisticsCog
 
