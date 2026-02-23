@@ -22,7 +22,7 @@ class StatisticsContainerView(ui.LayoutView):
     def update_view(self):
         self.clear_items()
         elements = []
-        MAX_THREADS_PER_PAGE = 15
+        MAX_THREADS_PER_PAGE = 5
 
         # === 1. 静态顶部内容 (不变) ===
         elements.append(
