@@ -4,6 +4,7 @@ import discord
 from discord import ui
 from datetime import datetime
 import asyncio
+import math
 
 from config import TZ_SHANGHAI
 
@@ -12,11 +13,13 @@ from config import TZ_SHANGHAI
 # ==========================================
 
 async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
+    # 立即响应，避免超时
     await interaction.response.send_message(
-        "收到指令惹！正在全速启动搜索引擎... (0%)",
+        "🔍 正在全速检索中...",
         ephemeral=True
     )
 
+    # 1. 确定搜索范围
     target_forums = []
     if selected_channels:
         for ch in selected_channels:
@@ -24,14 +27,17 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
             if full_channel and isinstance(full_channel, discord.ForumChannel):
                 target_forums.append(full_channel)
     else:
+        # 默认搜索所有论坛
         target_forums = [ch for ch in interaction.guild.forums if isinstance(ch, discord.ForumChannel)]
 
+    # 2. 收集所有帖子
     all_threads = [t for forum in target_forums for t in forum.threads]
 
     if not all_threads:
         return await interaction.edit_original_response(content="呜呜，当前范围内没有帖子可以搜捏...")
 
-    sem = asyncio.Semaphore(8)
+    # 3. 异步并发过滤
+    sem = asyncio.Semaphore(10) # 稍微提高并发
     results = []
     processed_count = 0
     total_count = len(all_threads)
@@ -41,190 +47,338 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
         nonlocal processed_count
         try:
             async with sem:
-                if target_tags_set and not ({tag.id for tag in thread.applied_tags} & target_tags_set):
-                    return None
+                # 标签筛选
+                if target_tags_set:
+                    thread_tags = {tag.id for tag in thread.applied_tags}
+                    if not (thread_tags & target_tags_set):
+                        return None
 
-                if search_type == "user" and thread.owner_id == query_data.id: return thread
+                # 核心匹配逻辑
+                if search_type == "user":
+                    if thread.owner_id == query_data.id:
+                        return thread
                 elif search_type == "keyword":
                     keyword = query_data.lower()
-                    if keyword in thread.name.lower(): return thread
+                    # 匹配标题
+                    if keyword in thread.name.lower():
+                        return thread
+                    # 匹配首楼内容 (需获取消息，较慢)
                     try:
-                        starter = thread.starter_message or (await thread.history(limit=1, oldest_first=True).flatten())[0]
-                        if starter and starter.content and keyword in starter.content.lower(): return thread
-                    except IndexError: pass # 帖子可能没有起始消息
+                        starter = thread.starter_message
+                        if not starter:
+                            # 尝试获取历史第一条
+                            history = [m async for m in thread.history(limit=1, oldest_first=True)]
+                            if history:
+                                starter = history[0]
+
+                        if starter and starter.content and keyword in starter.content.lower():
+                            return thread
+                    except Exception:
+                        pass
         except Exception:
             return None
         finally:
             processed_count += 1
         return None
 
-
     tasks_list = [check_thread(t) for t in all_threads]
-    last_update_time = datetime.now()
 
     for future in asyncio.as_completed(tasks_list):
         result = await future
-        if result: results.append(result)
+        if result:
+            results.append(result)
 
-        now = datetime.now()
-        if (now - last_update_time).total_seconds() > 1.5 or processed_count == total_count:
-            percent = int((processed_count / total_count) * 100)
-            try:
-                await interaction.edit_original_response(
-                    content=f"正在全速搜索中... 咻咻咻！\n进度：{percent}% ({processed_count}/{total_count})\n已找到：{len(results)} 个匹配"
-                )
-                last_update_time = now
-            except discord.NotFound: break
-
+    # 4. 结果展示
     if not results:
-        return await interaction.edit_original_response(content=f"呜呜，翻遍了 {total_count} 个帖子也没找到捏...")
+        return await interaction.edit_original_response(content=f"呜呜，翻遍了 {total_count} 个帖子也没找到符合条件的内容捏...")
 
+    # 按时间倒序排列
+    results.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
+
+    # 构建 Container 视图
     extra_info = f" (含标签筛选)" if selected_tag_ids else ""
-    paginator = PaginatorView(results, title=f"🔍 搜索结果: {len(results)}条{extra_info}", is_daily=False)
-    await interaction.edit_original_response(
-        content="搜索完成惹！找到以下内容：",
-        embed=paginator.get_embed(),
-        view=paginator
-    )
+    title = f"🔍 搜索结果: {len(results)}条{extra_info}"
+
+    view = SearchResultContainer(results, title, interaction.user)
+    await interaction.edit_original_response(content="", view=view)
 
 
 # ==========================================
-# Part 2. UI 组件
+# Part 2. UI 组件 (Container 化)
 # ==========================================
 
-class PaginatorView(ui.View):
-    def __init__(self, data_list, title, is_daily=False):
-        super().__init__(timeout=None)
+class SearchResultContainer(ui.LayoutView):
+    """
+    通用搜索结果/日报容器
+    支持分页显示帖子列表
+    """
+    def __init__(self, data_list, title, user, is_daily=False):
+        super().__init__(timeout=None if is_daily else 300) # 日报永久有效，搜索结果有时效
         self.data_list = data_list
         self.title = title
+        self.user = user
         self.is_daily = is_daily
-        self.per_page = 10
+
+        self.per_page = 5 # Container 每个 Section 比较大，建议一页 5 个
         self.current_page = 0
-        self.total_pages = (len(data_list) - 1) // self.per_page + 1 if data_list else 1
-        self.update_buttons()
+        self.total_pages = math.ceil(len(data_list) / self.per_page) if data_list else 1
 
-    def update_buttons(self):
-        self.prev_btn.disabled = (self.current_page == 0)
-        self.next_btn.disabled = (self.current_page >= self.total_pages - 1)
-        self.page_counter.label = f"第 {self.current_page + 1} / {self.total_pages} 页"
+        # --- 控制按钮 ---
+        self.btn_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id=f"page_prev_{id(self)}")
+        self.btn_prev.callback = self.on_prev
 
-    def get_embed(self):
+        self.btn_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary, custom_id=f"page_next_{id(self)}")
+        self.btn_next.callback = self.on_next
+
+        self.btn_indicator = ui.Button(label=f"1/{self.total_pages}", disabled=True, style=discord.ButtonStyle.secondary)
+
+        # 初始化构建
+        self.update_container()
+
+    def update_container(self):
+        self.clear_items()
+
+        # 1. 顶部状态栏
+        timestamp = datetime.now(TZ_SHANGHAI).strftime('%H:%M')
+        header_desc = "今天好安静唷，还没有新帖子捏... 🈚️" if not self.data_list and self.is_daily else self.title
+        if self.is_daily and self.data_list:
+             header_desc = f"📅 **今日新帖**: 已在全服发现 {len(self.data_list)} 个新话题！"
+
+        # 使用一个图标作为 header accessory
+        icon_url = "https://cdn.discordapp.com/embed/avatars/0.png"
+        if self.user:
+            icon_url = self.user.display_avatar.url
+
+        header_section = ui.Section(
+            ui.TextDisplay(content=f"### {header_desc}"),
+            ui.TextDisplay(content=f"-# 最后更新: {timestamp}"),
+            accessory=ui.Thumbnail(media=icon_url)
+        )
+
+        elements = [header_section, ui.Separator()]
+
+        # 2. 帖子列表 (当前页)
         start = self.current_page * self.per_page
         end = start + self.per_page
-        page_items = self.data_list[start:end]
+        current_items = self.data_list[start:end]
 
-        desc_text = ""
-        if self.is_daily:
-            if not self.data_list: desc_text = "今天好安静唷，还没有新帖子捏... 🈚️"
-            else: desc_text = f"哇！今天全服新增了 {len(self.data_list)} 个有趣的帖子！"
+        if not current_items:
+             # 空状态
+             elements.append(ui.Section(
+                 ui.TextDisplay(content="*暂无数据*"),
+                 accessory=ui.Button(label="Waiting", disabled=True)
+             ))
         else:
-            if not self.data_list: desc_text = "没有找到相关结果捏..."
+            for thread in current_items:
+                author = thread.owner
+                author_name = author.display_name if author else "未知作者"
+                author_avatar = author.display_avatar.url if author else None
 
-        embed = discord.Embed(title=self.title, description=desc_text, color=0xffa07a if self.is_daily else 0x98fb98)
+                # 处理标签
+                tags_str = ""
+                if thread.applied_tags:
+                    tags = [t.name for t in thread.applied_tags[:3]]
+                    tags_str = "🏷️ " + " ".join(tags)
 
-        for thread in page_items:
-            author_name = thread.owner.display_name if thread.owner else "神秘蛋"
-            category_name = thread.parent.name if thread.parent else "未知分区"
-            tags_str = ""
-            if thread.applied_tags:
-                tags_str = " | ".join([f"🏷️{t.name}" for t in thread.applied_tags[:3]])
-                tags_str = f"\n{tags_str}"
+                category_name = thread.parent.name if thread.parent else "未知分区"
 
-            embed.add_field(
-                name=f"📄 {thread.name}",
-                value=f"👤 作者: {author_name}\n📂 分区: {category_name}{tags_str}\n🔗 [点击跳转]({thread.jump_url})",
-                inline=False
-            )
+                # 每个帖子一个 Section
+                # Accessory 放跳转按钮
+                jump_btn = ui.Button(label="👀 查看", url=thread.jump_url, style=discord.ButtonStyle.link)
 
-        if self.is_daily:
-            time_str = datetime.now(TZ_SHANGHAI).strftime('%H:%M')
-            embed.set_footer(text=f"最后更新于: {time_str} (每10分钟刷新)")
-        else:
-            embed.set_footer(text=f"共找到 {len(self.data_list)} 个结果 | 翻页看更多来捉")
-        return embed
+                section_content = [
+                    ui.TextDisplay(content=f"**{thread.name}**"),
+                    ui.TextDisplay(content=f"👤 {author_name} · 📂 {category_name}"),
+                ]
+                if tags_str:
+                    section_content.append(ui.TextDisplay(content=f"-# {tags_str}"))
 
-    @ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id="paginator_prev")
-    async def prev_btn(self, i: discord.Interaction, button: ui.Button):
-        if self.current_page > 0: self.current_page -= 1; self.update_buttons(); await i.response.edit_message(embed=self.get_embed(), view=self)
+                elements.append(ui.Section(
+                    *section_content,
+                    accessory=jump_btn
+                ))
 
-    @ui.button(label="1/1", style=discord.ButtonStyle.gray, disabled=True, custom_id="paginator_count")
-    async def page_counter(self, i: discord.Interaction, button: ui.Button): pass
+        # 3. 底部导航栏 (ActionRow)
+        # 更新按钮状态
+        self.btn_prev.disabled = (self.current_page == 0)
+        self.btn_next.disabled = (self.current_page >= self.total_pages - 1)
+        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
 
-    @ui.button(emoji="➡️", style=discord.ButtonStyle.secondary, custom_id="paginator_next")
-    async def next_btn(self, i: discord.Interaction, button: ui.Button):
-        if self.current_page < self.total_pages - 1: self.current_page += 1; self.update_buttons(); await i.response.edit_message(embed=self.get_embed(), view=self)
+        # 只有在多页时才显示翻页按钮
+        action_rows = []
+        if self.total_pages > 1:
+            action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+
+        # 4. 组装 Container
+        container = ui.Container(
+            *elements,
+            *action_rows,
+            accent_colour=discord.Color.from_rgb(135, 206, 235) if not self.is_daily else discord.Color.gold()
+        )
+        self.add_item(container)
+
+    async def on_prev(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_container()
+            await interaction.response.edit_message(view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_container()
+            await interaction.response.edit_message(view=self)
 
 
-class TagSelect(ui.Select):
-    """动态生成的标签选择器"""
-    def __init__(self, tags):
-        options = [discord.SelectOption(label=tag.name, value=str(tag.id), emoji=tag.emoji) for tag in tags[:25]]
-        super().__init__(placeholder="[可选] 进一步筛选标签 (多选)", min_values=0, max_values=len(options), options=options, row=1)
-    async def callback(self, interaction: discord.Interaction): await interaction.response.defer()
+class SearchPanelContainer(ui.LayoutView):
+    """
+    永久搜索面板 (Container版)
+    """
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        # 定义按钮
+        self.btn_keyword = ui.Button(
+            label="关键词搜索",
+            style=discord.ButtonStyle.success,
+            emoji="📝",
+            custom_id="search_panel_btn_keyword_v2"
+        )
+        self.btn_keyword.callback = self.on_keyword
+
+        self.btn_user = ui.Button(
+            label="按用户搜索",
+            style=discord.ButtonStyle.primary,
+            emoji="👤",
+            custom_id="search_panel_btn_user_v2"
+        )
+        self.btn_user.callback = self.on_user
+
+        # 定义 Container
+        # 使用一张装饰性的图片作为 accessory
+        # 这里使用一个通用的搜索图标或者 Bot 头像
+        deco_img = "https://cdn-icons-png.flaticon.com/512/622/622669.png" # 示例放大镜图标
+
+        container = ui.Container(
+            ui.Section(
+                ui.TextDisplay(content="### 🔍 奇米蛋搜索雷达"),
+                ui.TextDisplay(content="欢迎使用全服务器资源检索系统。"),
+                ui.TextDisplay(content="-# 支持跨频道搜索、标签筛选与用户定位。"),
+                accessory=ui.Thumbnail(media=deco_img)
+            ),
+            ui.Separator(),
+            ui.ActionRow(self.btn_keyword, self.btn_user),
+            accent_colour=discord.Color.from_rgb(100, 149, 237) # Cornflower Blue
+        )
+        self.add_item(container)
+
+    async def on_keyword(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(KeywordInputModal())
+
+    async def on_user(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "请选择你要查找的用户：",
+            view=UserSelectView(),
+            ephemeral=True
+        )
 
 
 class ChannelFilterView(ui.View):
-    """频道与标签筛选视图"""
+    """
+    频道与标签筛选视图 (保持原 ui.View 逻辑，因为需要动态交互 Select)
+    Container 目前主要用于展示，复杂的表单交互用 View + Select/Modal 依然更灵活
+    """
     def __init__(self, search_type: str, query_data):
         super().__init__(timeout=180)
         self.search_type = search_type
         self.query_data = query_data
 
-        self.channel_select = ui.ChannelSelect(placeholder="[可选] 选择特定的论坛分区...", channel_types=[discord.ChannelType.forum], min_values=0, max_values=25, row=0)
+        self.channel_select = ui.ChannelSelect(
+            placeholder="[可选] 选择特定的论坛分区...",
+            channel_types=[discord.ChannelType.forum],
+            min_values=0,
+            max_values=25,
+            row=0
+        )
         self.channel_select.callback = self.on_channel_select
         self.add_item(self.channel_select)
 
     async def on_channel_select(self, interaction: discord.Interaction):
+        # 移除旧的标签选择器
         for item in self.children[:]:
-            if isinstance(item, TagSelect): self.remove_item(item)
+            if isinstance(item, TagSelect):
+                self.remove_item(item)
 
+        # 尝试获取选中频道的标签
+        # 注意：ChannelSelect 返回的是 AppCommandChannel，可能只有部分信息
         selected_channels = self.channel_select.values
         if len(selected_channels) == 1:
-            channel = interaction.guild.get_channel(selected_channels[0].id)
-            if isinstance(channel, discord.ForumChannel) and channel.available_tags:
-                self.add_item(TagSelect(channel.available_tags))
+            try:
+                channel = interaction.guild.get_channel(selected_channels[0].id)
+                if isinstance(channel, discord.ForumChannel) and channel.available_tags:
+                    self.add_item(TagSelect(channel.available_tags))
+            except:
+                pass
+
         await interaction.response.edit_message(view=self)
 
     @ui.button(label="开始搜索", style=discord.ButtonStyle.primary, row=2, emoji="🔎")
     async def confirm_search(self, interaction: discord.Interaction, button: ui.Button):
         selected_tag_ids = []
         for item in self.children:
-            if isinstance(item, TagSelect): selected_tag_ids = item.values; break
-        await execute_search(interaction, self.search_type, self.query_data, self.channel_select.values, selected_tag_ids)
+            if isinstance(item, TagSelect):
+                selected_tag_ids = item.values
+                break
+
+        # 触发核心搜索逻辑
+        await execute_search(
+            interaction,
+            self.search_type,
+            self.query_data,
+            self.channel_select.values,
+            selected_tag_ids
+        )
+
+
+class TagSelect(ui.Select):
+    """动态生成的标签选择器"""
+    def __init__(self, tags):
+        # 限制标签数量防止报错
+        options = [discord.SelectOption(label=tag.name, value=str(tag.id), emoji=tag.emoji) for tag in tags[:25]]
+        super().__init__(
+            placeholder="[可选] 进一步筛选标签 (多选)",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
 
 
 class KeywordInputModal(ui.Modal, title="关键词搜索"):
-    keyword = ui.TextInput(label="关键词", placeholder="请输入帖子标题或内容关键词...", min_length=1)
+    keyword = ui.TextInput(label="关键词", placeholder="请输入帖子标题或内容...", min_length=1)
+
     async def on_submit(self, interaction: discord.Interaction):
         view = ChannelFilterView(search_type="keyword", query_data=self.keyword.value)
         await interaction.response.send_message(
-            f"关键词“{self.keyword.value}”记录下来惹！\n请选择搜索范围：",
-            view=view, ephemeral=True
+            f"🔍 关键词 **“{self.keyword.value}”** 已记录。\n请配置搜索范围（留空则搜索全站）：",
+            view=view,
+            ephemeral=True
         )
 
 
 class UserSelectView(ui.View):
-    def __init__(self): super().__init__(timeout=180)
+    def __init__(self):
+        super().__init__(timeout=180)
+
     @ui.select(cls=ui.UserSelect, placeholder="选择帖子的作者...", min_values=1, max_values=1)
     async def select_user(self, interaction: discord.Interaction, select: ui.UserSelect):
-        view = ChannelFilterView(search_type="user", query_data=select.values[0])
+        target_user = select.values[0]
+        view = ChannelFilterView(search_type="user", query_data=target_user)
         await interaction.response.send_message(
-            f"原来是找 {select.values[0].display_name} 嘟帖子...\n请选择搜索范围：",
-            view=view, ephemeral=True
-        )
-
-
-class SearchMethodView(ui.View):
-    """初始搜索方式选择视图"""
-    def __init__(self): super().__init__(timeout=None)
-
-    @ui.button(label="按关键词搜索", style=discord.ButtonStyle.success, emoji="📝", custom_id="search_panel_btn_keyword")
-    async def by_keyword(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(KeywordInputModal())
-
-    @ui.button(label="按用户搜索", style=discord.ButtonStyle.primary, emoji="👤", custom_id="search_panel_btn_user")
-    async def by_user(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_message(
-            "请选择你要查找的用户来捉：",
-            view=UserSelectView(), ephemeral=True
+            f"👤 目标用户: **{target_user.display_name}**\n请配置搜索范围：",
+            view=view,
+            ephemeral=True
         )
