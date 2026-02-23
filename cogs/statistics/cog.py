@@ -3,64 +3,28 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta, timezone, time
 import asyncio
+import random
 
 from . import db as statistics_db
 from .views import ForumSelectView, StatisticsContainerView
-from config import TZ_SHANGHAI
+from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS
 
 class StatisticsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.update_panels_task.start()
+        # 启动新的任务
+        self.daily_stats_refresh.start()
+        self.bumping_task.start()
 
     async def cog_load(self):
+        # 确保数据库表已创建
+        await statistics_db.init_statistics_db()
         print("✅ [StatisticsCog] 已成功加载。")
 
     async def cog_unload(self):
-        self.update_panels_task.cancel()
-
-    @tasks.loop(time=time(hour=4, minute=0, tzinfo=TZ_SHANGHAI))
-    async def update_panels_task(self):
-        """定时任务：每天凌晨4点自动更新所有已创建的统计面板"""
-        await self.bot.wait_until_ready()
-        print("⏰ [StatisticsCog] 开始执行每日面板自动更新任务...")
-
-        all_panels = await statistics_db.get_all_statistics_panels()
-        if not all_panels:
-            print("ℹ️ [StatisticsCog] 数据库中没有需要更新的面板。")
-            return
-
-        success_count = 0
-        for panel_data in all_panels:
-            try:
-                guild = self.bot.get_guild(panel_data['guild_id'])
-                if not guild: continue
-
-                post_channel = guild.get_channel(panel_data['post_channel_id'])
-                # 修正：如果post_channel也找不到了，应该跳过
-                if not post_channel:
-                    print(f"⚠️ [StatisticsCog] 找不到面板所在的频道 ID: {panel_data['post_channel_id']}，跳过。")
-                    continue
-
-                forum_channel = guild.get_channel(panel_data['forum_channel_id'])
-                if not isinstance(forum_channel, discord.ForumChannel): continue
-
-                message = await post_channel.fetch_message(panel_data['message_id'])
-
-                stats_data = await self.gather_statistics(forum_channel)
-                if stats_data:
-                    new_view = StatisticsContainerView(stats_data)
-                    await message.edit(view=new_view)
-                    success_count += 1
-                await asyncio.sleep(2)
-
-            except discord.NotFound:
-                await statistics_db.remove_statistics_panel(panel_data['message_id'])
-            except Exception as e:
-                print(f"❌ [StatisticsCog] 更新面板 (ID: {panel_data.get('message_id')}) 时出错: {e}")
-
-        print(f"✅ [StatisticsCog] 每日面板更新任务完成，成功更新 {success_count}/{len(all_panels)} 个面板。")
-
+        # 停止新的任务
+        self.daily_stats_refresh.cancel()
+        self.bumping_task.cancel()
 
     async def gather_statistics(self, forum: discord.ForumChannel):
         """
@@ -69,7 +33,9 @@ class StatisticsCog(commands.Cog):
         if not forum:
             return None
 
-        threads = forum.threads
+        # 仅获取未归档的帖子
+        threads = [t for t in forum.threads if not t.archived]
+
         if not threads:
             return {
                 "channel_name": forum.name, "channel_icon_url": forum.guild.icon.url if forum.guild.icon else None,
@@ -85,11 +51,8 @@ class StatisticsCog(commands.Cog):
             starter = t.starter_message
             if not starter:
                 try:
-                    # --- 核心修复 ---
-                    # `.flatten()` 已被移除，使用列表推导式来获取消息
                     history = [msg async for msg in t.history(limit=1, oldest_first=True)]
                     starter = history[0] if history else None
-                    # --- 修复结束 ---
                 except (discord.errors.Forbidden, IndexError):
                     starter = None
 
@@ -119,7 +82,9 @@ class StatisticsCog(commands.Cog):
             "hot_threads": hot_threads, "cold_threads": cold_threads
         }
 
-    # 斜杠命令
+    # ==========================================
+    # Part 1. 斜杠命令
+    # ==========================================
     statistics_group = app_commands.Group(name="统计", description="统计面板相关命令")
 
     @statistics_group.command(name="发送选择器", description="[管理] 发送一个用于创建统计面板的频道选择器")
@@ -142,7 +107,7 @@ class StatisticsCog(commands.Cog):
         cleaned_count = 0
         for panel_data in all_panels:
             try:
-                channel = self.bot.get_channel(panel_data['post_channel_id'])
+                channel = self.bot.get_channel(panel_data['panel_channel_id'])
                 if channel:
                     await channel.fetch_message(panel_data['message_id'])
                 else:
@@ -152,3 +117,104 @@ class StatisticsCog(commands.Cog):
                 cleaned_count += 1
 
         await interaction.followup.send(f"✅ 清理完成！共移除了 **{cleaned_count}** 条无效的面板记录。", ephemeral=True)
+
+
+    # ==========================================
+    # Part 2. 后台任务
+    # ==========================================
+    @tasks.loop(time=time(hour=0, minute=0, tzinfo=TZ_SHANGHAI))
+    async def daily_stats_refresh(self):
+        print(f"[{datetime.now(TZ_SHANGHAI)}] 启动每日统计刷新任务...")
+        panels = await statistics_db.get_all_statistics_panels()
+
+        for panel_info in panels:
+            try:
+                guild = self.bot.get_guild(panel_info['guild_id'])
+                if not guild: continue
+
+                panel_channel = guild.get_channel(panel_info['panel_channel_id'])
+                forum_channel = guild.get_channel(panel_info['forum_channel_id'])
+
+                if not panel_channel or not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+                    continue
+
+                stats_data = await self.gather_statistics(forum_channel)
+                if not stats_data: continue
+
+                try:
+                    msg = await panel_channel.fetch_message(panel_info['message_id'])
+                    new_view = StatisticsContainerView(stats_data=stats_data)
+                    await msg.edit(view=new_view)
+                    print(f"- [成功] 已刷新版面 {msg.id} (关于 {forum_channel.name})")
+                except discord.NotFound:
+                    await statistics_db.remove_statistics_panel(panel_info['message_id'])
+                    print(f"- [警告] 找不到统计面板消息 {panel_info['message_id']}，已从数据库移除。")
+                except discord.Forbidden:
+                    print(f"- [错误] 没有权限编辑消息 {panel_info['message_id']}。")
+                except Exception as e:
+                    print(f"编辑面板 {panel_info['message_id']} 时发生错误: {e}")
+
+
+            except Exception as e:
+                print(f"刷新统计面板时发生未知错误: {e}")
+
+    @daily_stats_refresh.before_loop
+    async def before_daily_stats_refresh(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=3)
+    async def bumping_task(self):
+        print(f"[{datetime.now(TZ_SHANGHAI)}] 启动帖子顶帖任务...")
+
+        forums_to_scan = []
+        for guild in self.bot.guilds:
+            for forum in guild.forums:
+                if any(keyword in forum.name for keyword in RECOMMEND_TARGET_KEYWORDS):
+                    forums_to_scan.append(forum)
+
+        if not forums_to_scan: return
+
+        recently_bumped_ids = await statistics_db.get_recently_bumped_threads(days=7)
+        three_days_ago_utc = datetime.now(timezone.utc) - timedelta(days=3)
+
+        for forum in forums_to_scan:
+            eligible_threads = []
+            try:
+                for thread in forum.threads:
+                    if thread.id in recently_bumped_ids or thread.archived:
+                        continue
+
+                    last_msg_time = None
+                    try:
+                        # 【关键修复】使用列表推导式代替 .flatten()
+                        last_messages = [msg async for msg in thread.history(limit=1)]
+                        if not last_messages: continue
+                        last_message = last_messages[0]
+                        last_msg_time = last_message.created_at
+                    except (IndexError, discord.Forbidden):
+                        continue
+
+                    if last_msg_time and last_msg_time < three_days_ago_utc:
+                        eligible_threads.append(thread)
+
+            except discord.Forbidden:
+                continue
+
+            if not eligible_threads: continue
+
+            num_to_bump = random.randint(5, 10)
+            threads_to_bump = random.sample(eligible_threads, min(len(eligible_threads), num_to_bump))
+
+            print(f"- 在频道 '{forum.name}' 中找到 {len(threads_to_bump)} 个帖子准备顶帖。")
+            for thread in threads_to_bump:
+                try:
+                    msg = await thread.send(f"Bumping thread... ({random.randint(1000,9999)})")
+                    await msg.delete()
+                    await statistics_db.log_thread_bump(thread.id)
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    print(f"  - 顶帖失败: {thread.name} ({thread.id}) - {e}")
+
+    @bumping_task.before_loop
+    async def before_bumping_task(self):
+        await self.bot.wait_until_ready()
