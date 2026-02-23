@@ -50,26 +50,9 @@ class GachaContainerView(ui.LayoutView):
         self.btn_draw_ten.callback = lambda i: self.execute_draw(i, 10)
 
         # 3. 初始显示内容
-        init_accessory = ui.Thumbnail(media=self.user.display_avatar.url)
-
-        self.display_section = ui.Section(
-            ui.TextDisplay(content="### 🎴 缘分感应控制台"),
-            ui.TextDisplay(content="请选择资源池，然后点击按钮开始抽卡。"),
-            ui.TextDisplay(content="-# 每天仅限 1 次机会 (测试员除外)"),
-            accessory=init_accessory # ✅ 必填
-        )
-
-        placeholder_accessory = ui.Button(label="等待中", disabled=True, style=discord.ButtonStyle.secondary)
-
-        self.result_section = ui.Section(
-            ui.TextDisplay(content="*等待抽卡结果...*"),
-            accessory=placeholder_accessory # ✅ 必填
-        )
-
-        # --- 构建初始 Container ---
         self.update_container()
 
-    def update_container(self, result_content=None, result_embeds=None):
+    def update_container(self, result_content=None):
         """重新构建 Container"""
         self.clear_items()
 
@@ -85,7 +68,7 @@ class GachaContainerView(ui.LayoutView):
             ui.TextDisplay(content="### 🎴 缘分感应控制台"),
             ui.TextDisplay(content=f"**当前卡池:** {pool_name}"),
             ui.TextDisplay(content="-# 每天仅限 1 次机会 (测试员除外)"),
-            accessory=user_avatar # ✅ 必填
+            accessory=user_avatar
         )
 
         # 动作区
@@ -98,31 +81,20 @@ class GachaContainerView(ui.LayoutView):
         elements = [header_section, ui.Separator()]
 
         if result_content:
-            # 简单的结果标题
             elements.append(ui.TextDisplay(content="### ✨ 感应结果"))
+            desc = result_content if isinstance(result_content, str) else "\n".join(result_content)
 
-            # 处理结果内容
-            desc = result_content
-            if isinstance(result_content, list):
-                desc = "\n".join(result_content)
-
-            # 结果展示 Section 必须有 accessory
-            # 这里我们放一个 decorative 的按钮，或者复用占位按钮
-            result_accessory = ui.Button(label="查收结果", disabled=True, style=discord.ButtonStyle.success)
-
+            result_accessory = ui.Button(label="已查收", disabled=True, style=discord.ButtonStyle.success)
             elements.append(ui.Section(
                 ui.TextDisplay(content=desc),
-                accessory=result_accessory # ✅ 必填
+                accessory=result_accessory
             ))
-
         else:
-             # 空状态 Section 也必须有 accessory
              empty_accessory = ui.Button(label="等待中", disabled=True, style=discord.ButtonStyle.secondary)
              elements.append(ui.Section(
                  ui.TextDisplay(content="*等待抽卡...*"),
-                 accessory=empty_accessory # ✅ 必填
+                 accessory=empty_accessory
              ))
-
 
         container = ui.Container(
             *elements,
@@ -134,8 +106,6 @@ class GachaContainerView(ui.LayoutView):
     async def on_select_change(self, interaction: discord.Interaction):
         val = self.channel_select.values[0]
         self.selected_channel_id = int(val) if val != "all" else None
-
-        # 刷新界面显示当前卡池
         self.update_container()
         await interaction.response.edit_message(view=self)
 
@@ -156,37 +126,43 @@ class GachaContainerView(ui.LayoutView):
         if not is_tester:
             await db.mark_user_drawn(interaction.user.id)
 
-        # 生成结果内容
         result_lines = []
         if len(drawn_threads) == 1:
             info = await utils.fetch_thread_details(drawn_threads[0])
             result_lines.append(f"**[{info['title']}]({info['url']})**")
             result_lines.append(f"👤 {info['author_mention']} | 📂 {info['category']}")
-            result_lines.append(f"-# {info['intro'][:100]}...") # 截断简介
+            result_lines.append(f"-# {info['intro'][:100].replace(chr(10), ' ')}...")
         else:
             result_lines.append(f"💫 **恭喜获得 {len(drawn_threads)} 连抽结果！**")
             for i, t in enumerate(drawn_threads):
                 result_lines.append(f"{i+1}. [{t.name}]({t.jump_url})")
 
-        # 更新容器显示结果
         self.update_container(result_content=result_lines)
         await interaction.edit_original_response(view=self)
 
 
 # =================================================================
-#  Daily Recommendation (每日推荐) - 使用 Container 布局 (二次修改)
+#  Daily Recommendation (每日推荐) - 使用 Container 布局
 # =================================================================
 
 class DailyRecommendContainer(ui.LayoutView):
     def __init__(self, thread_info: dict, is_empty=False):
         super().__init__(timeout=None) # 持久化视图
 
+        # --- 按钮定义 ---
         self.btn_gacha = ui.Button(
             label="🔮 抽取今日缘分",
             style=discord.ButtonStyle.primary,
             custom_id="daily_gacha_open_btn"
         )
         self.btn_gacha.callback = self.open_gacha
+
+        self.btn_jump = ui.Button(
+            label="查看原帖",
+            style=discord.ButtonStyle.secondary,
+            # URL 将在下方动态设置
+        )
+
 
         if is_empty:
              empty_accessory = ui.Button(label="暂无", disabled=True)
@@ -196,64 +172,56 @@ class DailyRecommendContainer(ui.LayoutView):
                     ui.TextDisplay(content="今天资源库里空空如也..."),
                     accessory=empty_accessory
                 ),
+                ui.ActionRow(self.btn_gacha), # 即使是空面板，也保留抽卡按钮
                 accent_colour=discord.Color.light_grey()
             )
         else:
+            # --- 【核心修改区域】 ---
             components = []
 
-            # --- 【核心修改区域】 ---
             # 准备数据
-            author_avatar_url = thread_info['author_avatar'] or thread_info['image'] or "https://cdn.discordapp.com/embed/avatars/0.png"
+            author_avatar_url = thread_info['author_avatar'] or "https://cdn.discordapp.com/embed/avatars/0.png"
             tags_str = " / ".join(thread_info['tags'][:5])
             intro_md = thread_info['intro']
-            clean_intro = intro_md[:100] + "..." if len(intro_md) > 100 else intro_md
+            # 保留 Markdown 换行，仅截断长度
+            clean_intro = intro_md[:150] + "..." if len(intro_md) > 150 else intro_md
 
-            # 1. 第一个 Section: 标题、作者、分区、标签等文本信息
-            # 按照你的要求重新排序和格式化
+            # 为跳转按钮设置链接
+            self.btn_jump.url = thread_info['url']
+
+            # Section 1: 最顶部的标题、作者、分区、标签信息
+            # 头像 Thumbnail 作为点缀放在右侧
             header_section = ui.Section(
-                ui.TextDisplay(content="### 📅 每日精选"),
-                ui.TextDisplay(content=f"## {thread_info['title']}"), # 帖子标题用大号字体
-                ui.TextDisplay(content=f"👤 作者: {thread_info['author_mention']}"),
-                # 使用 accessory 巧妙地放置跳转按钮
-                accessory=ui.Button(label="查看原帖", url=thread_info['url'], style=discord.ButtonStyle.link)
+                ui.TextDisplay(content="**📅 每日精选**"),
+                ui.TextDisplay(content=f"## {thread_info['title']}"),
+                ui.TextDisplay(content=f"👤 **作者:** {thread_info['author_mention']}"),
+                ui.TextDisplay(content=f"📂 **分区:** {thread_info['category']}"),
+                ui.TextDisplay(content=f"🏷️ **标签:** {tags_str}"),
+                accessory=ui.Thumbnail(media=author_avatar_url)
             )
             components.append(header_section)
 
-            # 2. 第二个 Section: 承载分区、标签和作者头像
-            info_section = ui.Section(
-                 ui.TextDisplay(content=f"📂 **分区**: {thread_info['category']}"),
-                 ui.TextDisplay(content=f"🏷️ **标签**: {tags_str}"),
-                 # 将作者头像作为这个区域的 accessory
-                 accessory=ui.Thumbnail(media=author_avatar_url)
-            )
-            components.append(info_section)
+            # Section 2: 简介和帖子预览图
+            # 如果有图，则使用 MediaGallery，否则只显示简介
+            components.append(ui.Separator())
+            components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**")) # 简介小标题
 
-            # 3. 第三个 Section 或 MediaGallery: 展示图片和简介
-            # 如果有图片，就创建一个图片画廊，然后把简介单独放在一个 Section
             if thread_info['image']:
-                components.append(ui.Separator())
-                components.append(ui.MediaGallery(discord.MediaGalleryItem(media=thread_info['image'], description="帖子预览图")))
-                components.append(ui.Separator())
+                # 将图片和简介文本放在同一个 MediaGallery 中
                 components.append(
-                    ui.TextDisplay(content=f"-# {clean_intro}") # 图片下的简介
-                )
-            else:
-                # 如果没有图片，简介就直接放在一个 Section 里
-                components.append(ui.Separator())
-                components.append(
-                     ui.Section(
-                        ui.TextDisplay(content="**▶︎ 简介**"),
-                        ui.TextDisplay(content=f"-# {clean_intro}"),
-                        # 这里可以放一个装饰性的 accessory
-                        accessory=ui.Button(label="Details", disabled=True, style=discord.ButtonStyle.secondary)
+                    ui.MediaGallery(
+                       discord.MediaGalleryItem(
+                           media=thread_info['image'],
+                           description=clean_intro
+                       )
                     )
                 )
-            # --- 【修改结束】 ---
+            else:
+                components.append(ui.TextDisplay(content=f"-# {clean_intro}"))
 
-
-            # 底部按钮区 (ActionRow)
+            # 最后一个 Section: 放置两个核心交互按钮
             components.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
-            components.append(ui.ActionRow(self.btn_gacha))
+            components.append(ui.ActionRow(self.btn_gacha, self.btn_jump))
 
             container = ui.Container(
                 *components,
