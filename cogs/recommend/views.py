@@ -149,18 +149,15 @@ class DailyRecommendContainer(ui.LayoutView):
     def __init__(self, thread_info: dict, is_empty=False):
         super().__init__(timeout=None) # 持久化视图
 
-        # --- 按钮定义 ---
-        self.btn_gacha = ui.Button(
+        # --- 【核心修复区域】 ---
+
+        # 按钮1: 抽卡按钮 (有 custom_id 和 callback)
+        btn_gacha = ui.Button(
             label="🔮 抽取今日缘分",
             style=discord.ButtonStyle.primary,
-            custom_id="daily_gacha_open_btn"
+            custom_id="daily_gacha_open_btn" # 确保这个ID是唯一的
         )
-        self.btn_gacha.callback = self.open_gacha
-
-        self.btn_jump = ui.Button(
-            label="查看原帖",
-            style=discord.ButtonStyle.secondary,
-        )
+        btn_gacha.callback = self.open_gacha
 
         if is_empty:
              empty_accessory = ui.Button(label="暂无", disabled=True)
@@ -170,11 +167,18 @@ class DailyRecommendContainer(ui.LayoutView):
                     ui.TextDisplay(content="今天资源库里空空如也..."),
                     accessory=empty_accessory
                 ),
-                ui.ActionRow(self.btn_gacha),
+                ui.ActionRow(btn_gacha), # 即使是空面板，也保留抽卡按钮
                 accent_colour=discord.Color.light_grey()
             )
         else:
-            # --- 【核心修改区域】 ---
+            # 按钮2: 跳转按钮 (只有 url)
+            # 在这里直接创建，不再作为 self.btn_jump 成员变量
+            btn_jump = ui.Button(
+                label="查看原帖",
+                style=discord.ButtonStyle.secondary,
+                url=thread_info['url']
+            )
+
             components = []
 
             # 准备数据
@@ -182,10 +186,8 @@ class DailyRecommendContainer(ui.LayoutView):
             tags_str = " / ".join(thread_info['tags'][:5])
             intro_md = thread_info['intro']
             clean_intro = intro_md[:150] + "..." if len(intro_md) > 150 else intro_md
-            self.btn_jump.url = thread_info['url']
 
-            # Section 1: 最顶部的标题、作者、分区、标签信息
-            # 将信息合并到3个 TextDisplay 中
+            # Section 1: 标题和详细信息
             info_line_1 = f"**📅 每日精选**"
             info_line_2 = f"## {thread_info['title']}"
             info_line_3 = f"👤 **作者:** {thread_info['author_mention']} | 📂 **分区:** {thread_info['category']} | 🏷️ **标签:** {tags_str}"
@@ -197,9 +199,8 @@ class DailyRecommendContainer(ui.LayoutView):
                 accessory=ui.Thumbnail(media=author_avatar_url)
             )
             components.append(header_section)
-            # --- 【修改结束】 ---
 
-            # Section 2: 简介和帖子预览图
+            # Section 2: 简介和预览图
             components.append(ui.Separator())
             components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**"))
 
@@ -215,9 +216,9 @@ class DailyRecommendContainer(ui.LayoutView):
             else:
                 components.append(ui.TextDisplay(content=f"-# {clean_intro}"))
 
-            # 最后一个 Section: 放置两个核心交互按钮
+            # 最后 ActionRow: 放置两个按钮
             components.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
-            components.append(ui.ActionRow(self.btn_gacha, self.btn_jump))
+            components.append(ui.ActionRow(btn_gacha, btn_jump))
 
             container = ui.Container(
                 *components,
