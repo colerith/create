@@ -5,75 +5,93 @@ from . import db as statistics_db
 import asyncio
 
 class StatisticsContainerView(ui.LayoutView):
+    """
+    【已升级为分页视图】
+    通过内部状态和按钮切换，将热门和冷门列表分在不同页面展示，
+    确保任何时候组件数量都远低于40个的上限。
+    """
     def __init__(self, stats_data: dict):
         super().__init__(timeout=None)
+        self.stats_data = stats_data
+        self.current_page = "hot"  # 默认显示热门帖子页面
+
+        # 首次构建视图
+        self.update_view()
+
+    def update_view(self):
+        """
+        核心函数：根据当前页面状态 (self.current_page) 重新构建整个容器。
+        """
         self.clear_items()
-
         elements = []
-        MAX_HOT_THREADS = 6  # 最多显示的热门帖子数
-        MAX_COLD_THREADS = 5  # 最多显示的冷门帖子数
+        MAX_THREADS_PER_PAGE = 15  # 每页最多显示的帖子数，可以适当调高
 
-        # --- 1. 顶部主标题 ---
+        # === 1. 静态顶部内容 (所有页面共用) ===
         elements.append(
             ui.Section(
-                ui.TextDisplay(content=f"### 📊 频道统计 · {stats_data.get('channel_name', '加载中')}"),
-                ui.TextDisplay(content="深入洞察频道的活跃趋势与内容价值。"),
-                accessory=ui.Thumbnail(media=stats_data.get('channel_icon_url', "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"))
+                ui.TextDisplay(content=f"### 📊 频道统计 · {self.stats_data.get('channel_name', '加载中')}"),
+                ui.TextDisplay(content="😋来看看有什么好帖子吧！"),
+                accessory=ui.Thumbnail(media=self.stats_data.get('channel_icon_url', "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"))
             )
         )
-
-        # --- 2. 数据总览 ---
         elements.append(
             ui.Section(
-                ui.TextDisplay(content=f"**总帖子数:** {stats_data.get('total_threads', 0)}"),
-                ui.TextDisplay(content=f"**近7日新增:** {stats_data.get('new_threads_7d', 0)}"),
+                ui.TextDisplay(content=f"**总帖子数:** {self.stats_data.get('total_threads', 0)}"),
+                ui.TextDisplay(content=f"**近7日新增:** {self.stats_data.get('new_threads_7d', 0)}"),
                 accessory=ui.Button(label="数据概览", style=discord.ButtonStyle.success, disabled=True, custom_id="stats_overview_placeholder")
             )
         )
-
-        # --- 3. 热门帖子列表 ---
         elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="#### 近期热门"))
 
-        hot_threads = stats_data.get('hot_threads', [])
-        if hot_threads:
-            # 【修复】限制显示数量，防止超限
-            for th in hot_threads[:MAX_HOT_THREADS]:
-                elements.append(
-                    ui.Section(
-                        # 【修复】合并两个 TextDisplay 为一个，减少组件数
-                        ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
-                        accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
+        # === 2. 页面切换按钮 (分页核心) ===
+        self.btn_hot = ui.Button(
+            label="近期热门",
+            style=discord.ButtonStyle.primary,
+            custom_id="stats_page_hot",
+            disabled=(self.current_page == "hot") # 当前页的按钮禁用
+        )
+        self.btn_hot.callback = self.on_page_switch
+
+        self.btn_cold = ui.Button(
+            label="💎 冷门遗珠",
+            style=discord.ButtonStyle.primary,
+            custom_id="stats_page_cold",
+            disabled=(self.current_page == "cold") # 当前页的按钮禁用
+        )
+        self.btn_cold.callback = self.on_page_switch
+        elements.append(ui.ActionRow(self.btn_hot, self.btn_cold))
+
+
+        # === 3. 动态内容区 (根据 self.current_page 决定显示什么) ===
+        if self.current_page == "hot":
+            hot_threads = self.stats_data.get('hot_threads', [])
+            if hot_threads:
+                for th in hot_threads[:MAX_THREADS_PER_PAGE]:
+                    elements.append(
+                        ui.Section(
+                            ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
+                            accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
+                        )
                     )
-                )
-        else:
-            elements.append(ui.TextDisplay(content="-# 暂无热门帖子..."))
+            else:
+                elements.append(ui.TextDisplay(content="-# 暂无热门帖子..."))
 
-        # --- 4. 冷门宝藏列表 ---
-        elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="#### 💎 冷门遗珠"))
-
-        cold_threads = stats_data.get('cold_threads', [])
-        if cold_threads:
-            # 【修复】限制显示数量，防止超限
-            for th in cold_threads[:MAX_COLD_THREADS]:
-                relative_time = "未知"
-                if th.get('created_at'):
-                    relative_time = discord.utils.format_dt(th['created_at'], style='R')
-
-                elements.append(
-                    ui.Section(
-                        # 【修复】合并两个 TextDisplay 为一个，减少组件数
-                        ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 发布于 {relative_time}"),
-                        accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
+        elif self.current_page == "cold":
+            cold_threads = self.stats_data.get('cold_threads', [])
+            if cold_threads:
+                for th in cold_threads[:MAX_THREADS_PER_PAGE]:
+                    relative_time = discord.utils.format_dt(th['created_at'], style='R') if th.get('created_at') else "未知"
+                    elements.append(
+                        ui.Section(
+                            ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 发布于 {relative_time}"),
+                            accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
+                        )
                     )
-                )
-        else:
-            elements.append(ui.TextDisplay(content="-# 暂无冷门帖子..."))
+            else:
+                elements.append(ui.TextDisplay(content="-# 暂无冷门帖子..."))
 
-        # --- 5. 底部刷新按钮 ---
+        # === 4. 静态底部内容 (所有页面共用) ===
         elements.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
-
         self.btn_refresh_info = ui.Button(
             label=f"数据更新于 {datetime.now().strftime('%H:%M')}",
             style=discord.ButtonStyle.secondary,
@@ -83,15 +101,28 @@ class StatisticsContainerView(ui.LayoutView):
         self.btn_refresh_info.callback = self.on_refresh_button_click
         elements.append(ui.ActionRow(self.btn_refresh_info))
 
-        # --- 组合并构建容器 ---
+        # --- 最终组合并构建容器 ---
         container = ui.Container(
             *elements,
             accent_colour=discord.Color.from_rgb(113, 135, 212)
         )
         self.add_item(container)
 
+    async def on_page_switch(self, interaction: discord.Interaction):
+        """处理分页按钮点击事件"""
+        # 从按钮的 custom_id 中提取要切换到的页面
+        page_to_switch = interaction.data['custom_id'].split('_')[-1]
+
+        if self.current_page != page_to_switch:
+            self.current_page = page_to_switch
+            self.update_view() # 重新构建视图
+            await interaction.response.edit_message(view=self)
+        else:
+            # 如果点的就是当前页，可以无响应或者给个提示
+            await interaction.response.defer()
+
     async def on_refresh_button_click(self, interaction: discord.Interaction):
-        """点击刷新按钮时的回调"""
+        """处理刷新按钮点击事件 (功能不变)"""
         await interaction.response.send_message(
             "📋 **关于数据刷新**\n"
             "此面板的数据由机器人每日凌晨自动更新。\n"
@@ -101,6 +132,9 @@ class StatisticsContainerView(ui.LayoutView):
 
 
 class ForumSelectView(ui.View):
+    """
+    这个视图保持不变，它的职责是选择频道并触发面板的创建。
+    """
     def __init__(self, cog_instance):
         super().__init__(timeout=180)
         self.cog = cog_instance
@@ -136,6 +170,7 @@ class ForumSelectView(ui.View):
                 await interaction.followup.send(f"❌ 无法访问频道 {channel.mention} 或读取其内容。", ephemeral=True)
                 continue
 
+            # 创建新的分页视图实例
             view = StatisticsContainerView(stats_data=stats_data)
             msg = await interaction.channel.send(view=view)
             await statistics_db.add_statistics_panel(msg.id, msg.channel.id, channel.id, interaction.guild.id)
