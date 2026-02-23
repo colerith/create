@@ -160,9 +160,7 @@ class DailyRecommendContainer(ui.LayoutView):
         self.btn_jump = ui.Button(
             label="查看原帖",
             style=discord.ButtonStyle.secondary,
-            # URL 将在下方动态设置
         )
-
 
         if is_empty:
              empty_accessory = ui.Button(label="暂无", disabled=True)
@@ -172,7 +170,7 @@ class DailyRecommendContainer(ui.LayoutView):
                     ui.TextDisplay(content="今天资源库里空空如也..."),
                     accessory=empty_accessory
                 ),
-                ui.ActionRow(self.btn_gacha), # 即使是空面板，也保留抽卡按钮
+                ui.ActionRow(self.btn_gacha),
                 accent_colour=discord.Color.light_grey()
             )
         else:
@@ -183,31 +181,29 @@ class DailyRecommendContainer(ui.LayoutView):
             author_avatar_url = thread_info['author_avatar'] or "https://cdn.discordapp.com/embed/avatars/0.png"
             tags_str = " / ".join(thread_info['tags'][:5])
             intro_md = thread_info['intro']
-            # 保留 Markdown 换行，仅截断长度
             clean_intro = intro_md[:150] + "..." if len(intro_md) > 150 else intro_md
-
-            # 为跳转按钮设置链接
             self.btn_jump.url = thread_info['url']
 
             # Section 1: 最顶部的标题、作者、分区、标签信息
-            # 头像 Thumbnail 作为点缀放在右侧
+            # 将信息合并到3个 TextDisplay 中
+            info_line_1 = f"**📅 每日精选**"
+            info_line_2 = f"## {thread_info['title']}"
+            info_line_3 = f"👤 **作者:** {thread_info['author_mention']} | 📂 **分区:** {thread_info['category']} | 🏷️ **标签:** {tags_str}"
+
             header_section = ui.Section(
-                ui.TextDisplay(content="**📅 每日精选**"),
-                ui.TextDisplay(content=f"## {thread_info['title']}"),
-                ui.TextDisplay(content=f"👤 **作者:** {thread_info['author_mention']}"),
-                ui.TextDisplay(content=f"📂 **分区:** {thread_info['category']}"),
-                ui.TextDisplay(content=f"🏷️ **标签:** {tags_str}"),
+                ui.TextDisplay(content=info_line_1),
+                ui.TextDisplay(content=info_line_2),
+                ui.TextDisplay(content=info_line_3),
                 accessory=ui.Thumbnail(media=author_avatar_url)
             )
             components.append(header_section)
+            # --- 【修改结束】 ---
 
             # Section 2: 简介和帖子预览图
-            # 如果有图，则使用 MediaGallery，否则只显示简介
             components.append(ui.Separator())
-            components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**")) # 简介小标题
+            components.append(ui.TextDisplay(content="**˚⭒⁺. 简介 .⁺⭒˚**"))
 
             if thread_info['image']:
-                # 将图片和简介文本放在同一个 MediaGallery 中
                 components.append(
                     ui.MediaGallery(
                        discord.MediaGalleryItem(
