@@ -10,13 +10,14 @@ class StatisticsContainerView(ui.LayoutView):
         self.clear_items()
 
         elements = []
+        MAX_HOT_THREADS = 6  # 最多显示的热门帖子数
+        MAX_COLD_THREADS = 5  # 最多显示的冷门帖子数
 
         # --- 1. 顶部主标题 ---
-        # 移除了 size 参数
         elements.append(
             ui.Section(
                 ui.TextDisplay(content=f"### 📊 频道统计 · {stats_data.get('channel_name', '加载中')}"),
-                ui.TextDisplay(content="😋来看看服务器内有什么好帖子吧！"),
+                ui.TextDisplay(content="深入洞察频道的活跃趋势与内容价值。"),
                 accessory=ui.Thumbnail(media=stats_data.get('channel_icon_url', "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"))
             )
         )
@@ -32,16 +33,16 @@ class StatisticsContainerView(ui.LayoutView):
 
         # --- 3. 热门帖子列表 ---
         elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="### 🔥近期热门"))
+        elements.append(ui.TextDisplay(content="#### 近期热门"))
 
         hot_threads = stats_data.get('hot_threads', [])
         if hot_threads:
-            for th in hot_threads:
+            # 【修复】限制显示数量，防止超限
+            for th in hot_threads[:MAX_HOT_THREADS]:
                 elements.append(
                     ui.Section(
-                        ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"), # 限制标题长度防止溢出
-                        # 移除了 size 参数
-                        ui.TextDisplay(content=f"👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
+                        # 【修复】合并两个 TextDisplay 为一个，减少组件数
+                        ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
                         accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
                     )
                 )
@@ -50,20 +51,20 @@ class StatisticsContainerView(ui.LayoutView):
 
         # --- 4. 冷门宝藏列表 ---
         elements.append(ui.Separator())
-        elements.append(ui.TextDisplay(content="### 💎 冷门宝藏"))
+        elements.append(ui.TextDisplay(content="#### 💎 冷门遗珠"))
 
         cold_threads = stats_data.get('cold_threads', [])
         if cold_threads:
-            for th in cold_threads:
+            # 【修复】限制显示数量，防止超限
+            for th in cold_threads[:MAX_COLD_THREADS]:
                 relative_time = "未知"
                 if th.get('created_at'):
                     relative_time = discord.utils.format_dt(th['created_at'], style='R')
 
                 elements.append(
                     ui.Section(
-                        ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"),
-                        # 移除了 size 参数
-                        ui.TextDisplay(content=f"发布于 {relative_time}"),
+                        # 【修复】合并两个 TextDisplay 为一个，减少组件数
+                        ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 发布于 {relative_time}"),
                         accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
                     )
                 )
@@ -73,7 +74,6 @@ class StatisticsContainerView(ui.LayoutView):
         # --- 5. 底部刷新按钮 ---
         elements.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
 
-        # 这个按钮需要 custom_id 因为它没有 url 且视图是持久的
         self.btn_refresh_info = ui.Button(
             label=f"数据更新于 {datetime.now().strftime('%H:%M')}",
             style=discord.ButtonStyle.secondary,
@@ -86,7 +86,7 @@ class StatisticsContainerView(ui.LayoutView):
         # --- 组合并构建容器 ---
         container = ui.Container(
             *elements,
-            accent_colour=discord.Color.from_rgb(113, 135, 212) # 自定义颜色
+            accent_colour=discord.Color.from_rgb(113, 135, 212)
         )
         self.add_item(container)
 
@@ -120,7 +120,6 @@ class ForumSelectView(ui.View):
 
         selected_channels = self.channel_select.values
 
-        # 禁用按钮防止重复点击
         button.disabled = True
         self.channel_select.disabled = True
         await interaction.response.edit_message(content="收到指令，正在处理，请稍候...", view=self)
