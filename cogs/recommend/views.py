@@ -239,7 +239,7 @@ class DailyRecommendContainer(ui.LayoutView):
                  ui.Section(
                     ui.TextDisplay(content=f"📂 **分区**: {thread_info['category']}"),
                     ui.TextDisplay(content=f"🏷️ **标签**: {tags_str}"),
-                    accessory=empty_accessory
+                    accessory=ui.Button(label="查看详情", url=thread_info['url'], style=discord.ButtonStyle.secondary, disabled=True) # ✅ 必填
                 )
             )
 
