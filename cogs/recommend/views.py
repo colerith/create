@@ -156,7 +156,6 @@ class GachaContainerView(ui.LayoutView):
         self.update_container(result_content=result_lines)
         await interaction.edit_original_response(view=self)
 
-
 # =================================================================
 #  Daily Recommendation (每日推荐) - 使用 Container 布局
 # =================================================================
@@ -174,11 +173,14 @@ class DailyRecommendContainer(ui.LayoutView):
 
         # 构建容器
         if is_empty:
+             # 创建一个禁用的按钮作为占位 accessory
+             empty_accessory = ui.Button(label="暂无", disabled=True, style=discord.ButtonStyle.secondary)
+
              container = ui.Container(
                 ui.Section(
                     ui.TextDisplay(content="### 📅 每日推荐"),
                     ui.TextDisplay(content="今天资源库里空空如也..."),
-                    accessory=ui.Button(label="暂无", disabled=True, style=discord.ButtonStyle.secondary)
+                    accessory=empty_accessory
                 ),
                 accent_colour=discord.Color.light_grey()
             )
@@ -189,11 +191,11 @@ class DailyRecommendContainer(ui.LayoutView):
             header_section = ui.Section(
                 ui.TextDisplay(content=f"### 📅 每日精选 · {thread_info['title']}"),
                 ui.TextDisplay(content=f"👤 作者: {thread_info['author_mention']}"),
+                # 这里原逻辑已有 accessory
                 accessory=ui.Button(label="跳转原帖", url=thread_info['url'], style=discord.ButtonStyle.link)
             )
 
             # 2. 简介区
-            # intro 可能很长，截取一下，Container 不适合放超长文本
             clean_intro = thread_info['intro'][:200] + "..." if len(thread_info['intro']) > 200 else thread_info['intro']
 
             components = [header_section]
@@ -211,6 +213,7 @@ class DailyRecommendContainer(ui.LayoutView):
                 ui.Section(
                     ui.TextDisplay(content="**简介:**"),
                     ui.TextDisplay(content=clean_intro),
+                    accessory=ui.Thumbnail(media=thread_info['author_avatar'] or thread_info['image'] or "https://cdn.discordapp.com/embed/avatars/0.png")
                 )
             )
 
@@ -220,10 +223,11 @@ class DailyRecommendContainer(ui.LayoutView):
                  ui.Section(
                     ui.TextDisplay(content=f"📂 **分区**: {thread_info['category']}"),
                     ui.TextDisplay(content=f"🏷️ **标签**: {tags_str}"),
+                    accessory=ui.Button(label="查看详情", url=thread_info['url'], style=discord.ButtonStyle.secondary, disabled=True)
                 )
             )
 
-            # 按钮区
+            # 按钮区 (ActionRow)
             components.append(ui.Separator())
             components.append(ui.ActionRow(self.btn_gacha))
 
@@ -240,5 +244,4 @@ class DailyRecommendContainer(ui.LayoutView):
             return await interaction.response.send_message("本服未配置资源频道。", ephemeral=True)
 
         view = GachaContainerView(forums, interaction.user)
-        # 使用 Container View 发送时，不需要 content/embed，直接发 view
         await interaction.response.send_message(view=view, ephemeral=True)
