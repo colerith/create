@@ -4,29 +4,27 @@ from datetime import datetime
 from . import db as statistics_db
 import asyncio
 
+# 导入时区配置
+from config import TZ_SHANGHAI
+
 class StatisticsContainerView(ui.LayoutView):
     """
-    【已升级为分页视图】
-    通过内部状态和按钮切换，将热门和冷门列表分在不同页面展示，
-    确保任何时候组件数量都远低于40个的上限。
+    【最终版分页视图】
+    - 显示作者和标签
+    - 使用东八区时间
     """
     def __init__(self, stats_data: dict):
         super().__init__(timeout=None)
         self.stats_data = stats_data
-        self.current_page = "hot"  # 默认显示热门帖子页面
-
-        # 首次构建视图
+        self.current_page = "hot"
         self.update_view()
 
     def update_view(self):
-        """
-        核心函数：根据当前页面状态 (self.current_page) 重新构建整个容器。
-        """
         self.clear_items()
         elements = []
-        MAX_THREADS_PER_PAGE = 15  # 每页最多显示的帖子数，可以适当调高
+        MAX_THREADS_PER_PAGE = 15
 
-        # === 1. 静态顶部内容 (所有页面共用) ===
+        # === 1. 静态顶部内容 (不变) ===
         elements.append(
             ui.Section(
                 ui.TextDisplay(content=f"### 📊 频道统计 · {self.stats_data.get('channel_name', '加载中')}"),
@@ -43,33 +41,31 @@ class StatisticsContainerView(ui.LayoutView):
         )
         elements.append(ui.Separator())
 
-        # === 2. 页面切换按钮 (分页核心) ===
-        self.btn_hot = ui.Button(
-            label="近期热门",
-            style=discord.ButtonStyle.primary,
-            custom_id="stats_page_hot",
-            disabled=(self.current_page == "hot") # 当前页的按钮禁用
-        )
+        # === 2. 页面切换按钮 (不变) ===
+        self.btn_hot = ui.Button(label="🔥 近期热门", style=discord.ButtonStyle.primary, custom_id="stats_page_hot", disabled=(self.current_page == "hot"))
         self.btn_hot.callback = self.on_page_switch
-
-        self.btn_cold = ui.Button(
-            label="💎 冷门遗珠",
-            style=discord.ButtonStyle.primary,
-            custom_id="stats_page_cold",
-            disabled=(self.current_page == "cold") # 当前页的按钮禁用
-        )
+        self.btn_cold = ui.Button(label="💎 冷门遗珠", style=discord.ButtonStyle.primary, custom_id="stats_page_cold", disabled=(self.current_page == "cold"))
         self.btn_cold.callback = self.on_page_switch
         elements.append(ui.ActionRow(self.btn_hot, self.btn_cold))
 
-
-        # === 3. 动态内容区 (根据 self.current_page 决定显示什么) ===
+        # === 3. 动态内容区 (核心修改) ===
         if self.current_page == "hot":
             hot_threads = self.stats_data.get('hot_threads', [])
             if hot_threads:
                 for th in hot_threads[:MAX_THREADS_PER_PAGE]:
+                    # 【新增】处理标签显示
+                    tags_str = " · ".join(th.get('tags', []))
+                    if tags_str:
+                        tags_str = f" · {tags_str}" # 加个分隔符
+
+                    info_line = (
+                        f"**{th.get('name', '无标题')[:60]}**\n"
+                        # 【修改】添加作者、点赞、评论和标签
+                        f"-# 👤 {th.get('author_name', '佚名')} · 👍 {th.get('likes', 0)} · 💬 {th.get('comments', 0)}{tags_str}"
+                    )
                     elements.append(
                         ui.Section(
-                            ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}"),
+                            ui.TextDisplay(content=info_line),
                             accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
                         )
                     )
@@ -81,19 +77,32 @@ class StatisticsContainerView(ui.LayoutView):
             if cold_threads:
                 for th in cold_threads[:MAX_THREADS_PER_PAGE]:
                     relative_time = discord.utils.format_dt(th['created_at'], style='R') if th.get('created_at') else "未知"
+                    # 【新增】处理标签显示
+                    tags_str = " · ".join(th.get('tags', []))
+                    if tags_str:
+                        tags_str = f" · {tags_str}"
+
+                    info_line = (
+                        f"**{th.get('name', '无标题')[:60]}**\n"
+                        # 【修改】添加作者、发布时间和标签
+                        f"-# 👤 {th.get('author_name', '佚名')} · 发布于 {relative_time}{tags_str}"
+                    )
                     elements.append(
                         ui.Section(
-                            ui.TextDisplay(content=f"**{th.get('name', '无标题')[:70]}**\n-# 发布于 {relative_time}"),
+                            ui.TextDisplay(content=info_line),
                             accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
                         )
                     )
             else:
                 elements.append(ui.TextDisplay(content="-# 暂无冷门帖子..."))
 
-        # === 4. 静态底部内容 (所有页面共用) ===
+        # === 4. 静态底部内容 (核心修改) ===
         elements.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
+
+        # 【修改】使用带时区的时间
+        update_time_str = datetime.now(TZ_SHANGHAI).strftime('%H:%M')
         self.btn_refresh_info = ui.Button(
-            label=f"数据更新于 {datetime.now().strftime('%H:%M')}",
+            label=f"数据更新于 {update_time_str} (UTC+8)",
             style=discord.ButtonStyle.secondary,
             custom_id="stats_manual_refresh_btn",
             emoji="🔄"
@@ -101,28 +110,20 @@ class StatisticsContainerView(ui.LayoutView):
         self.btn_refresh_info.callback = self.on_refresh_button_click
         elements.append(ui.ActionRow(self.btn_refresh_info))
 
-        # --- 最终组合并构建容器 ---
-        container = ui.Container(
-            *elements,
-            accent_colour=discord.Color.from_rgb(113, 135, 212)
-        )
+        # --- 最终组合 ---
+        container = ui.Container(*elements, accent_colour=discord.Color.from_rgb(113, 135, 212))
         self.add_item(container)
 
     async def on_page_switch(self, interaction: discord.Interaction):
-        """处理分页按钮点击事件"""
-        # 从按钮的 custom_id 中提取要切换到的页面
         page_to_switch = interaction.data['custom_id'].split('_')[-1]
-
         if self.current_page != page_to_switch:
             self.current_page = page_to_switch
-            self.update_view() # 重新构建视图
+            self.update_view()
             await interaction.response.edit_message(view=self)
         else:
-            # 如果点的就是当前页，可以无响应或者给个提示
             await interaction.response.defer()
 
     async def on_refresh_button_click(self, interaction: discord.Interaction):
-        """处理刷新按钮点击事件 (功能不变)"""
         await interaction.response.send_message(
             "📋 **关于数据刷新**\n"
             "此面板的数据由机器人每日凌晨自动更新。\n"
@@ -133,7 +134,7 @@ class StatisticsContainerView(ui.LayoutView):
 
 class ForumSelectView(ui.View):
     """
-    这个视图保持不变，它的职责是选择频道并触发面板的创建。
+    这个视图保持不变。
     """
     def __init__(self, cog_instance):
         super().__init__(timeout=180)
@@ -153,11 +154,9 @@ class ForumSelectView(ui.View):
             return await interaction.response.send_message("你还没有选择任何频道！", ephemeral=True)
 
         selected_channels = self.channel_select.values
-
         button.disabled = True
         self.channel_select.disabled = True
         await interaction.response.edit_message(content="收到指令，正在处理，请稍候...", view=self)
-
         await interaction.followup.send(f"⏳ 开始为 **{len(selected_channels)}** 个频道生成统计面板...", ephemeral=True)
 
         for channel_stub in selected_channels:
@@ -165,12 +164,12 @@ class ForumSelectView(ui.View):
             if not isinstance(channel, discord.ForumChannel):
                 continue
 
+            # 调用更新后的 gather_statistics
             stats_data = await self.cog.gather_statistics(channel)
             if stats_data is None:
                 await interaction.followup.send(f"❌ 无法访问频道 {channel.mention} 或读取其内容。", ephemeral=True)
                 continue
 
-            # 创建新的分页视图实例
             view = StatisticsContainerView(stats_data=stats_data)
             msg = await interaction.channel.send(view=view)
             await statistics_db.add_statistics_panel(msg.id, msg.channel.id, channel.id, interaction.guild.id)

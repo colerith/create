@@ -51,54 +51,75 @@ class StatisticsCog(commands.Cog):
         score = likes + (comments * 2)
         return likes, comments, score
 
-    async def gather_statistics(self, forum: discord.ForumChannel) -> dict:
-        """为指定的论坛频道收集和处理统计数据"""
-        now = datetime.now(TZ_SHANGHAI)
-        seven_days_ago = now - timedelta(days=7)
+    async def gather_statistics(self, forum: discord.ForumChannel):
+        """
+        [已更新] 收集单个论坛的统计数据, 包括作者和标签。
+        """
+        if not forum:
+            return None
 
-        all_threads = []
-        try:
-            all_threads.extend(forum.threads)
-            async for thread in forum.archived_threads(limit=None):
-                all_threads.append(thread)
-        except discord.Forbidden:
-             return None
+        threads = forum.threads
+        if not threads:
+            return {
+                "channel_name": forum.name,
+                "channel_icon_url": forum.guild.icon.url if forum.guild.icon else None,
+                "total_threads": 0, "new_threads_7d": 0,
+                "hot_threads": [], "cold_threads": []
+            }
 
-        sem = asyncio.Semaphore(10)
-        tasks = []
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        total_threads = len(threads)
+        new_threads_7d = sum(1 for t in threads if t.created_at > seven_days_ago)
 
-        async def process_thread(thread):
-            async with sem:
-                creation_time_aware = thread.created_at.astimezone(TZ_SHANGHAI)
-                is_new = creation_time_aware > seven_days_ago
-                likes, comments, score = await self._get_thread_interaction(thread)
-                return {
-                    'is_new': is_new, 'name': thread.name, 'url': thread.jump_url,
-                    'likes': likes, 'comments': comments, 'score': score,
-                    'created_at': creation_time_aware
-                }
+        threads_with_stats = []
+        for t in threads:
+            starter = t.starter_message
+            if not starter:
+                try: # 兜底获取
+                    history = await t.history(limit=1, oldest_first=True).flatten()
+                    starter = history[0] if history else None
+                except (discord.errors.Forbidden, IndexError):
+                    starter = None
 
-        processed_threads = await asyncio.gather(*(process_thread(t) for t in all_threads if t))
+            likes = sum(r.count for r in starter.reactions) if starter else 0
+            comments = t.message_count -1 if t.message_count > 0 else 0
 
-        thread_details = [t for t in processed_threads if t]
+            # 【新增】获取作者和标签
+            author_name = t.owner.display_name if t.owner else "未知作者"
+            tags = [tag.name for tag in t.applied_tags]
 
-        new_threads_7d = sum(1 for t in thread_details if t['is_new'])
-        thread_details.sort(key=lambda x: x['score'], reverse=True)
-        hot_threads = thread_details[:5]
+            threads_with_stats.append({
+                "id": t.id,
+                "name": t.name,
+                "url": t.jump_url,
+                "created_at": t.created_at,
+                "likes": likes,
+                "comments": comments,
+                "score": likes * 1.5 + comments,
+                "author_name": author_name, # <-- 新增
+                "tags": tags # <-- 新增
+            })
 
-        three_days_ago = now - timedelta(days=3)
-        potential_cold = [t for t in thread_details if t['created_at'] < three_days_ago and t['score'] > 0]
-        potential_cold.sort(key=lambda x: x['score'])
-        cold_threads = potential_cold[:5]
+        # 排序
+        threads_with_stats.sort(key=lambda x: x['score'], reverse=True)
+        hot_threads = threads_with_stats[:15]
+
+        now = datetime.utcnow()
+        thirty_days_ago = now - timedelta(days=30)
+        older_threads = [t for t in threads_with_stats if t['created_at'] < thirty_days_ago]
+        older_threads.sort(key=lambda x: x['score'], reverse=False) # 按分数从低到高
+        cold_threads = older_threads[:15]
+
 
         return {
-            'channel_name': forum.name,
-            'channel_icon_url': forum.guild.icon.url if forum.guild.icon else None,
-            'total_threads': len(all_threads),
-            'new_threads_7d': new_threads_7d,
-            'hot_threads': hot_threads,
-            'cold_threads': cold_threads
+            "channel_name": forum.name,
+            "channel_icon_url": forum.guild.icon.url if forum.guild.icon else None,
+            "total_threads": total_threads,
+            "new_threads_7d": new_threads_7d,
+            "hot_threads": hot_threads,
+            "cold_threads": cold_threads
         }
+
 
     # ==========================================
     # Part 2. 斜杠命令
