@@ -12,13 +12,10 @@ from .views import StatisticsContainerView, ForumSelectView
 class StatisticsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # 在Bot启动时注册持久化视图
-        # 使用一个临时的、结构有效的数据添加视图，以便 custom_id 被注册
         self.bot.add_view(StatisticsContainerView(stats_data={
             'channel_name': '加载中', 'total_threads': 0, 'new_threads_7d': 0,
             'hot_threads': [], 'cold_threads': []
         }))
-        self.bot.add_view(ForumSelectView(self))
 
 
     async def cog_load(self):
@@ -43,15 +40,12 @@ class StatisticsCog(commands.Cog):
         try:
             starter_message = thread.starter_message
             if not starter_message:
-                # 降级方案：如果拿不到 starter_message，尝试用 fetch
-                # 注意：这可能会增加API调用，但在多数情况下是必要的
                 history = thread.history(limit=1, oldest_first=True)
                 starter_message = await history.__anext__()
 
             if starter_message and starter_message.reactions:
                 likes = sum(r.count for r in starter_message.reactions)
         except (StopAsyncIteration, discord.NotFound, discord.Forbidden):
-            # 帖子可能被删或Bot无权限
             pass
 
         score = likes + (comments * 2)
@@ -86,7 +80,7 @@ class StatisticsCog(commands.Cog):
 
         processed_threads = await asyncio.gather(*(process_thread(t) for t in all_threads if t))
 
-        thread_details = [t for t in processed_threads if t] # 过滤掉可能失败的结果
+        thread_details = [t for t in processed_threads if t]
 
         new_threads_7d = sum(1 for t in thread_details if t['is_new'])
         thread_details.sort(key=lambda x: x['score'], reverse=True)
@@ -107,12 +101,13 @@ class StatisticsCog(commands.Cog):
         }
 
     # ==========================================
-    # Part 2. 斜杠命令 (已修正)
+    # Part 2. 斜杠命令
     # ==========================================
     @app_commands.command(name="创建统计面板", description="[管理] 为指定的论坛频道创建一份数据统计报告")
     @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def create_stats_panel(self, interaction: discord.Interaction):
+        # 每次调用命令时，都创建一个新的、临时的 ForumSelectView 实例
         view = ForumSelectView(self)
         await interaction.response.send_message(
             "请在下方选择你想要生成统计报告的论坛频道 (可多选)，然后点击按钮确认。",
