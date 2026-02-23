@@ -59,9 +59,11 @@ class GachaContainerView(ui.LayoutView):
             accessory=init_accessory # ✅ 必填
         )
 
-        # 4. 结果展示区域 (初始为空或占位)
+        placeholder_accessory = ui.Button(label="等待中", disabled=True, style=discord.ButtonStyle.secondary)
+
         self.result_section = ui.Section(
-            ui.TextDisplay(content="*等待抽卡结果...*")
+            ui.TextDisplay(content="*等待抽卡结果...*"),
+            accessory=placeholder_accessory # ✅ 必填
         )
 
         # --- 构建初始 Container ---
@@ -99,17 +101,27 @@ class GachaContainerView(ui.LayoutView):
             # 简单的结果标题
             elements.append(ui.TextDisplay(content="### ✨ 感应结果"))
 
-            # 处理结果内容 (如果是列表)
+            # 处理结果内容
+            desc = result_content
             if isinstance(result_content, list):
-                # 如果是多条结果，我们可能需要用多个 Section 或拼合文本
-                # 简单起见，拼合文本
                 desc = "\n".join(result_content)
-                elements.append(ui.TextDisplay(content=desc))
-            else:
-                elements.append(ui.TextDisplay(content=str(result_content)))
+
+            # 结果展示 Section 必须有 accessory
+            # 这里我们放一个 decorative 的按钮，或者复用占位按钮
+            result_accessory = ui.Button(label="查收结果", disabled=True, style=discord.ButtonStyle.success)
+
+            elements.append(ui.Section(
+                ui.TextDisplay(content=desc),
+                accessory=result_accessory # ✅ 必填
+            ))
 
         else:
-             elements.append(ui.TextDisplay(content="*等待抽卡...*"))
+             # 空状态 Section 也必须有 accessory
+             empty_accessory = ui.Button(label="等待中", disabled=True, style=discord.ButtonStyle.secondary)
+             elements.append(ui.Section(
+                 ui.TextDisplay(content="*等待抽卡...*"),
+                 accessory=empty_accessory # ✅ 必填
+             ))
 
 
         container = ui.Container(
@@ -160,6 +172,7 @@ class GachaContainerView(ui.LayoutView):
         self.update_container(result_content=result_lines)
         await interaction.edit_original_response(view=self)
 
+
 # =================================================================
 #  Daily Recommendation (每日推荐) - 使用 Container 布局
 # =================================================================
@@ -184,7 +197,7 @@ class DailyRecommendContainer(ui.LayoutView):
                 ui.Section(
                     ui.TextDisplay(content="### 📅 每日推荐"),
                     ui.TextDisplay(content="今天资源库里空空如也..."),
-                    accessory=empty_accessory
+                    accessory=empty_accessory # ✅ 必填
                 ),
                 accent_colour=discord.Color.light_grey()
             )
@@ -195,8 +208,7 @@ class DailyRecommendContainer(ui.LayoutView):
             header_section = ui.Section(
                 ui.TextDisplay(content=f"### 📅 每日精选 · {thread_info['title']}"),
                 ui.TextDisplay(content=f"👤 作者: {thread_info['author_mention']}"),
-                # 这里原逻辑已有 accessory
-                accessory=ui.Button(label="跳转原帖", url=thread_info['url'], style=discord.ButtonStyle.link)
+                accessory=ui.Button(label="跳转原帖", url=thread_info['url'], style=discord.ButtonStyle.link) # ✅ 必填
             )
 
             # 2. 简介区
@@ -217,7 +229,7 @@ class DailyRecommendContainer(ui.LayoutView):
                 ui.Section(
                     ui.TextDisplay(content="**简介:**"),
                     ui.TextDisplay(content=clean_intro),
-                    accessory=ui.Thumbnail(media=thread_info['author_avatar'] or thread_info['image'] or "https://cdn.discordapp.com/embed/avatars/0.png")
+                    accessory=ui.Thumbnail(media=thread_info['author_avatar'] or thread_info['image'] or "https://cdn.discordapp.com/embed/avatars/0.png") # ✅ 必填
                 )
             )
 
@@ -227,7 +239,7 @@ class DailyRecommendContainer(ui.LayoutView):
                  ui.Section(
                     ui.TextDisplay(content=f"📂 **分区**: {thread_info['category']}"),
                     ui.TextDisplay(content=f"🏷️ **标签**: {tags_str}"),
-                    accessory=ui.Button(label="查看详情", url=thread_info['url'], style=discord.ButtonStyle.secondary, disabled=True)
+                    accessory=empty_accessory
                 )
             )
 
