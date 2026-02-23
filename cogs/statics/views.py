@@ -16,7 +16,7 @@ class ForumSelectView(ui.View):
             placeholder="请选择一个论坛频道...",
             channel_types=[discord.ChannelType.forum],
             min_values=1,
-            max_values=1
+            max_values=10
         )
         self.add_item(self.channel_select)
 
@@ -25,9 +25,15 @@ class ForumSelectView(ui.View):
         if not self.channel_select.values:
             return await interaction.response.send_message("你还没有选择任何频道！", ephemeral=True)
 
-        app_command_channel = self.channel_select.values[0]
-        # 完整的 channel 对象在 .values[0] 中直接获取
-        target_forum = app_command_channel
+        selected_channel_stub = self.channel_select.values[0]
+
+        target_forum = interaction.guild.get_channel(selected_channel_stub.id)
+
+        if not target_forum:
+            try:
+                target_forum = await interaction.guild.fetch_channel(selected_channel_stub.id)
+            except (discord.NotFound, discord.Forbidden):
+                return await interaction.response.send_message("❌ 无法访问您选择的频道，请检查权限或频道是否存在。", ephemeral=True)
 
         if not isinstance(target_forum, discord.ForumChannel):
              return await interaction.response.send_message("❌ 您选择的不是一个有效的论坛频道。", ephemeral=True)
@@ -35,15 +41,16 @@ class ForumSelectView(ui.View):
         await interaction.response.defer()
 
         view = StatisticsContainerView(self.bot, target_forum.id)
-        await view.refresh_data_and_update() # 此方法不再处理消息发送
+        await view.refresh_data_and_update()
 
-        msg = await interaction.followup.send(view=view, ephemeral=False)
-
-        if msg:
-            from . import db
-            await db.add_panel_record(msg.id, msg.channel.id, msg.guild.id, target_forum.id)
-        else:
-            print("❌ [StatisticsCog] Followup message is None, failed to record panel to DB.")
+        try:
+            msg = await interaction.followup.send(view=view, ephemeral=False)
+            if msg:
+                # 假设您有 `db` 模块
+                from . import db
+                await db.add_panel_record(msg.id, msg.channel.id, msg.guild.id, target_forum.id)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 生成面板时出错: {e}", ephemeral=True)
 
 
 class StatisticsContainerView(ui.LayoutView):
@@ -86,7 +93,6 @@ class StatisticsContainerView(ui.LayoutView):
             style=discord.ButtonStyle.link,
             url=thread.jump_url
         )
-        #【修正】为了让按钮显示出来，需要将 accessory 放到 Section 里
         return ui.Section(
             ui.TextDisplay(content=f"**{thread.name}**"),
             ui.TextDisplay(content=stats_description),
@@ -134,7 +140,6 @@ class StatisticsContainerView(ui.LayoutView):
         cold_sections = [self.create_item_section(p, is_hot=False) for p in stats['coldest_posts']]
 
         update_time_str = datetime.now(TZ_SHANGHAI).strftime('%Y年%m月%d日 %H:%M')
-        #【修正】为了确保有accessory，给footer也加上一个禁用的按钮
         footer_section = ui.Section(
             ui.TextDisplay(content=f"数据更新于：{update_time_str}"),
             accessory=ui.Button(label=" ", style=discord.ButtonStyle.secondary, disabled=True)
