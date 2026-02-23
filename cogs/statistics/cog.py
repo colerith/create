@@ -7,18 +7,19 @@ import random
 
 from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS
 from . import db as statistics_db
-from .views import StatisticsContainerView
+from .views import StatisticsContainerView, ForumSelectView
 
 class StatisticsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # 在Bot启动时，用一个临时的、结构有效的数据添加视图，以便 custom_id 被注册
-        # 实际显示的数据将在发送时或刷新时生成
-        placeholder_data = {
+        # 在Bot启动时注册持久化视图
+        # 使用一个临时的、结构有效的数据添加视图，以便 custom_id 被注册
+        self.bot.add_view(StatisticsContainerView(stats_data={
             'channel_name': '加载中', 'total_threads': 0, 'new_threads_7d': 0,
             'hot_threads': [], 'cold_threads': []
-        }
-        self.bot.add_view(StatisticsContainerView(stats_data=placeholder_data))
+        }))
+        self.bot.add_view(ForumSelectView(self))
+
 
     async def cog_load(self):
         """Cog加载时初始化数据库并启动后台任务"""
@@ -38,21 +39,21 @@ class StatisticsCog(commands.Cog):
     async def _get_thread_interaction(self, thread: discord.Thread):
         """辅助函数：获取单个帖子的点赞、评论和热度分"""
         likes = 0
-        # 评论数 = 消息总数 - 1 (起始帖)
         comments = thread.message_count - 1 if thread.message_count and thread.message_count > 0 else 0
         try:
-            # 尝试获取起始消息以统计点赞
             starter_message = thread.starter_message
             if not starter_message:
-                starter_message = await thread.fetch_message(thread.id)
+                # 降级方案：如果拿不到 starter_message，尝试用 fetch
+                # 注意：这可能会增加API调用，但在多数情况下是必要的
+                history = thread.history(limit=1, oldest_first=True)
+                starter_message = await history.__anext__()
 
             if starter_message and starter_message.reactions:
                 likes = sum(r.count for r in starter_message.reactions)
-        except (discord.NotFound, discord.Forbidden):
+        except (StopAsyncIteration, discord.NotFound, discord.Forbidden):
             # 帖子可能被删或Bot无权限
             pass
 
-        # 热度计分：评论的权重更高
         score = likes + (comments * 2)
         return likes, comments, score
 
@@ -63,50 +64,37 @@ class StatisticsCog(commands.Cog):
 
         all_threads = []
         try:
-            # 同时获取活跃和已归档的帖子以获得真实数量
             all_threads.extend(forum.threads)
             async for thread in forum.archived_threads(limit=None):
                 all_threads.append(thread)
         except discord.Forbidden:
-             return None # 无法访问此频道
+             return None
 
-        new_threads_7d = 0
-
-        sem = asyncio.Semaphore(10) # 限制并发以避免API速率限制
+        sem = asyncio.Semaphore(10)
         tasks = []
 
         async def process_thread(thread):
             async with sem:
-                # 检查创建时间
                 creation_time_aware = thread.created_at.astimezone(TZ_SHANGHAI)
                 is_new = creation_time_aware > seven_days_ago
-
                 likes, comments, score = await self._get_thread_interaction(thread)
                 return {
-                    'is_new': is_new,
-                    'name': thread.name,
-                    'url': thread.jump_url,
-                    'likes': likes,
-                    'comments': comments,
-                    'score': score,
+                    'is_new': is_new, 'name': thread.name, 'url': thread.jump_url,
+                    'likes': likes, 'comments': comments, 'score': score,
                     'created_at': creation_time_aware
                 }
 
-        thread_details = await asyncio.gather(*(process_thread(t) for t in all_threads if t))
+        processed_threads = await asyncio.gather(*(process_thread(t) for t in all_threads if t))
+
+        thread_details = [t for t in processed_threads if t] # 过滤掉可能失败的结果
 
         new_threads_7d = sum(1 for t in thread_details if t['is_new'])
-
-        # 排序以获取热门和冷门帖子
         thread_details.sort(key=lambda x: x['score'], reverse=True)
         hot_threads = thread_details[:5]
 
-        # 定义冷门宝藏: 创建超过3天，有互动(分数>0)，但分数较低
         three_days_ago = now - timedelta(days=3)
-        potential_cold = [
-            t for t in thread_details
-            if t['created_at'] < three_days_ago and t['score'] > 0
-        ]
-        potential_cold.sort(key=lambda x: x['score']) # 按分数升序
+        potential_cold = [t for t in thread_details if t['created_at'] < three_days_ago and t['score'] > 0]
+        potential_cold.sort(key=lambda x: x['score'])
         cold_threads = potential_cold[:5]
 
         return {
@@ -119,29 +107,18 @@ class StatisticsCog(commands.Cog):
         }
 
     # ==========================================
-    # Part 2. 斜杠命令
+    # Part 2. 斜杠命令 (已修正)
     # ==========================================
-    @app_commands.command(name="创建统计面板", description="[管理] 为指定频道创建或更新数据统计面板")
-    @app_commands.describe(channels="选择1-5个论坛频道进行统计")
+    @app_commands.command(name="创建统计面板", description="[管理] 为指定的论坛频道创建一份数据统计报告")
+    @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def create_stats_panel(self, interaction: discord.Interaction, channels: app_commands.Range[discord.ForumChannel, 1, 5]):
-        await interaction.response.send_message(f"收到指令！正在为 {len(channels)} 个频道生成统计数据，这可能需要一点时间...", ephemeral=True)
-
-        for channel in channels:
-            stats_data = await self.gather_statistics(channel)
-            if stats_data is None:
-                await interaction.followup.send(f"❌ 无法访问频道 {channel.mention} 或读取其内容。", ephemeral=True)
-                continue
-
-            view = StatisticsContainerView(stats_data=stats_data)
-            # 将面板发送在命令执行的频道
-            msg = await interaction.channel.send(view=view)
-
-            # 记录到数据库以便每日刷新
-            await statistics_db.add_statistics_panel(msg.id, msg.channel.id, channel.id, interaction.guild.id)
-
-        await interaction.followup.send("✅ 所有统计面板均已创建！它们将每日自动刷新。", ephemeral=True)
+    async def create_stats_panel(self, interaction: discord.Interaction):
+        view = ForumSelectView(self)
+        await interaction.response.send_message(
+            "请在下方选择你想要生成统计报告的论坛频道 (可多选)，然后点击按钮确认。",
+            view=view,
+            ephemeral=True
+        )
 
     # ==========================================
     # Part 3. 后台任务
@@ -159,8 +136,7 @@ class StatisticsCog(commands.Cog):
                 panel_channel = guild.get_channel(panel_info['panel_channel_id'])
                 forum_channel = guild.get_channel(panel_info['forum_channel_id'])
 
-                if not panel_channel or not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
-                    continue
+                if not panel_channel or not forum_channel or not isinstance(forum_channel, discord.ForumChannel): continue
 
                 stats_data = await self.gather_statistics(forum_channel)
                 if not stats_data: continue
@@ -171,10 +147,10 @@ class StatisticsCog(commands.Cog):
                     await msg.edit(view=new_view)
                     print(f"- [成功] 已刷新版面 {msg.id} (关于 {forum_channel.name})")
                 except discord.NotFound:
-                    # 如果消息被删除，可以考虑从数据库移除记录
-                    print(f"- [警告] 找不到统计面板消息 {panel_info['message_id']}，可能已被删除。")
-                except discord.Forbidden:
-                    print(f"- [错误] 没有权限编辑消息 {panel_info['message_id']}。")
+                    await statistics_db.remove_statistics_panel(panel_info['message_id'])
+                    print(f"- [警告] 找不到统计面板消息 {panel_info['message_id']}，已从数据库移除。")
+                except Exception as e:
+                    print(f"- [错误] 编辑消息时出错 {panel_info['message_id']}: {e}")
 
             except Exception as e:
                 print(f"刷新统计面板时发生未知错误: {e}")
@@ -186,39 +162,23 @@ class StatisticsCog(commands.Cog):
     @tasks.loop(hours=3)
     async def bumping_task(self):
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动帖子顶帖任务...")
-
-        forums_to_scan = []
-        for guild in self.bot.guilds:
-            for forum in guild.forums:
-                if any(keyword in forum.name for keyword in RECOMMEND_TARGET_KEYWORDS):
-                    forums_to_scan.append(forum)
-
+        forums_to_scan = [f for g in self.bot.guilds for f in g.forums if any(k in f.name for k in RECOMMEND_TARGET_KEYWORDS)]
         if not forums_to_scan: return
 
-        # 获取7天内顶过的帖子，避免重复
         recently_bumped_ids = await statistics_db.get_recently_bumped_threads(days=7)
         three_days_ago_utc = datetime.utcnow() - timedelta(days=3)
 
         for forum in forums_to_scan:
             eligible_threads = []
             try:
-                # 只处理未归档的帖子
                 for thread in forum.threads:
-                    if thread.id in recently_bumped_ids or thread.archived:
-                        continue
-
-                    last_msg_time = None
+                    if thread.id in recently_bumped_ids or thread.archived: continue
                     try:
-                        # history比last_message更可靠
                         last_message = (await thread.history(limit=1).flatten())[0]
-                        last_msg_time = last_message.created_at # UTC aware
-                    except (IndexError, discord.Forbidden):
-                        continue # 没有消息或权限
-
-                    if last_msg_time.replace(tzinfo=None) < three_days_ago_utc:
-                        eligible_threads.append(thread)
-            except discord.Forbidden:
-                continue
+                        if last_message.created_at.replace(tzinfo=None) < three_days_ago_utc:
+                            eligible_threads.append(thread)
+                    except (IndexError, discord.Forbidden): continue
+            except discord.Forbidden: continue
 
             if not eligible_threads: continue
 
@@ -231,7 +191,7 @@ class StatisticsCog(commands.Cog):
                     msg = await thread.send(f"Bumping thread... ({random.randint(1000,9999)})")
                     await msg.delete()
                     await statistics_db.log_thread_bump(thread.id)
-                    await asyncio.sleep(3) # API友好
+                    await asyncio.sleep(3)
                 except Exception as e:
                     print(f"  - 顶帖失败: {thread.name} ({thread.id}) - {e}")
 
