@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone, time
 import asyncio
 
 from . import db as statistics_db
-from .views import ForumSelectView, StatisticsContainerView 
+from .views import ForumSelectView, StatisticsContainerView
 from config import TZ_SHANGHAI
 
 class StatisticsCog(commands.Cog):
@@ -14,12 +14,11 @@ class StatisticsCog(commands.Cog):
         self.update_panels_task.start()
 
     async def cog_load(self):
-        print("✅ [StatisticsCog] 已成功加载并注册了 ForumSelectView。")
+        print("✅ [StatisticsCog] 已成功加载。")
 
     async def cog_unload(self):
         self.update_panels_task.cancel()
 
-    # 核心修改：修正 tasks.loop 的 time 参数
     @tasks.loop(time=time(hour=4, minute=0, tzinfo=TZ_SHANGHAI))
     async def update_panels_task(self):
         """定时任务：每天凌晨4点自动更新所有已创建的统计面板"""
@@ -33,39 +32,39 @@ class StatisticsCog(commands.Cog):
 
         success_count = 0
         for panel_data in all_panels:
-            guild = self.bot.get_guild(panel_data['guild_id'])
-            if not guild: continue
-
-            post_channel = guild.get_channel(panel_data['post_channel_id'])
-            if not post_channel: continue
-
-            forum_channel = guild.get_channel(panel_data['forum_channel_id'])
-            if not isinstance(forum_channel, discord.ForumChannel): continue
-
             try:
+                guild = self.bot.get_guild(panel_data['guild_id'])
+                if not guild: continue
+
+                post_channel = guild.get_channel(panel_data['post_channel_id'])
+                # 修正：如果post_channel也找不到了，应该跳过
+                if not post_channel:
+                    print(f"⚠️ [StatisticsCog] 找不到面板所在的频道 ID: {panel_data['post_channel_id']}，跳过。")
+                    continue
+
+                forum_channel = guild.get_channel(panel_data['forum_channel_id'])
+                if not isinstance(forum_channel, discord.ForumChannel): continue
+
                 message = await post_channel.fetch_message(panel_data['message_id'])
 
-                # 更新核心逻辑
                 stats_data = await self.gather_statistics(forum_channel)
                 if stats_data:
-                    # 注意：这里直接使用导入的 StatisticsContainerView
                     new_view = StatisticsContainerView(stats_data)
                     await message.edit(view=new_view)
                     success_count += 1
-
-                await asyncio.sleep(2) # 防止速率限制
+                await asyncio.sleep(2)
 
             except discord.NotFound:
-                await statistics_db.remove_statistics_panel(panel_data['message_id']) # 如果消息找不到了就从数据库移除
+                await statistics_db.remove_statistics_panel(panel_data['message_id'])
             except Exception as e:
-                print(f"❌ [StatisticsCog] 更新面板 (ID: {panel_data['message_id']}) 时出错: {e}")
+                print(f"❌ [StatisticsCog] 更新面板 (ID: {panel_data.get('message_id')}) 时出错: {e}")
 
         print(f"✅ [StatisticsCog] 每日面板更新任务完成，成功更新 {success_count}/{len(all_panels)} 个面板。")
 
 
     async def gather_statistics(self, forum: discord.ForumChannel):
         """
-        [已修复] 收集单个论坛的统计数据, 包括作者和标签。
+        收集单个论坛的统计数据。
         """
         if not forum:
             return None
@@ -85,14 +84,17 @@ class StatisticsCog(commands.Cog):
         for t in threads:
             starter = t.starter_message
             if not starter:
-                try: # 兜底获取
-                    history = await t.history(limit=1, oldest_first=True).flatten()
+                try:
+                    # --- 核心修复 ---
+                    # `.flatten()` 已被移除，使用列表推导式来获取消息
+                    history = [msg async for msg in t.history(limit=1, oldest_first=True)]
                     starter = history[0] if history else None
+                    # --- 修复结束 ---
                 except (discord.errors.Forbidden, IndexError):
                     starter = None
 
             likes = sum(r.count for r in starter.reactions) if starter else 0
-            comments = t.message_count -1 if t.message_count > 0 else 0
+            comments = t.message_count - 1 if t.message_count > 0 else 0
             author_name = t.owner.display_name if t.owner else "未知作者"
             tags = [tag.name for tag in t.applied_tags]
 
@@ -143,7 +145,7 @@ class StatisticsCog(commands.Cog):
                 channel = self.bot.get_channel(panel_data['post_channel_id'])
                 if channel:
                     await channel.fetch_message(panel_data['message_id'])
-                else: # 如果连频道都找不到了，也算作无效
+                else:
                     raise discord.NotFound(None, "Channel not found")
             except discord.NotFound:
                 await statistics_db.remove_statistics_panel(panel_data['message_id'])
