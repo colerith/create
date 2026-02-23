@@ -1,61 +1,81 @@
+# cogs/statistics/utils.py
+
 import discord
-from datetime import datetime, timedelta
 import asyncio
+from datetime import datetime, timedelta
+
 from config import TZ_SHANGHAI
 
 async def fetch_forum_stats(forum: discord.ForumChannel) -> dict:
-    """
-    获取单个论坛频道的统计数据。
+    """获取一个论坛频道的综合统计数据"""
 
-    返回一个字典，包含:
-    - total_count: 帖子总数
-    - weekly_count: 近7日新增帖子数
-    - hot_threads: 回复最多的前5个帖子
-    - cold_gems: 创建超过14天且回复数少于3的随机5个帖子
-    """
-    if not forum:
-        return {}
+    # --- 初始化统计变量 ---
+    total_posts = 0
+    recent_posts_count = 0 # 7天内新增
+    all_threads_with_stats = []
 
-    # 为了效率，我们尽可能一次性获取所有帖子
-    # 注意: 如果论坛帖子数万，guild.fetch_threads() 可能更优，但 forum.threads 对于大多数场景足够
-    all_threads = forum.threads
-    if not all_threads:
-        return {
-            'total_count': 0,
-            'weekly_count': 0,
-            'hot_threads': [],
-            'cold_gems': [],
-        }
+    # --- 数据抓取 ---
+    threads_to_scan = forum.threads
+    try:
+        async for thread in forum.archived_threads(limit=1000):
+            threads_to_scan.append(thread)
+    except discord.Forbidden:
+        print(f"权限不足，无法获取 {forum.name} 的归档帖子进行统计。")
+    except Exception as e:
+        print(f"获取 {forum.name} 归档帖子时出错: {e}")
 
-    now = datetime.now(TZ_SHANGHAI)
-    seven_days_ago = now - timedelta(days=7)
-    fourteen_days_ago = now - timedelta(days=14)
+    total_posts = len(threads_to_scan)
 
-    weekly_threads = []
+    # 计算7天内新增
+    seven_days_ago = datetime.now(TZ_SHANGHAI) - timedelta(days=7)
+    for thread in threads_to_scan:
+        if thread.created_at.astimezone(TZ_SHANGHAI) >= seven_days_ago:
+            recent_posts_count += 1
 
-    # Python 3.12+ 可以用 aiter/anext，但为了兼容性，普通 for 循环更安全
-    for thread in all_threads:
-        if thread.created_at.astimezone(TZ_SHANGHAI) > seven_days_ago:
-            weekly_threads.append(thread)
+    # --- 异步处理每个帖子 ---
+    sem = asyncio.Semaphore(10)
 
-    # 统计热门帖子 (按消息数排序)
-    # starter_message 不计入 message_count，所以这个值约等于回复数
-    hot_threads = sorted(all_threads, key=lambda t: t.message_count, reverse=True)[:3]
+    async def process_thread(thread: discord.Thread):
+        try:
+            async with sem:
+                starter_message = thread.starter_message
+                if not starter_message:
+                    try:
+                        starter_message = (await thread.history(limit=1, oldest_first=True).flatten())[0]
+                    except (IndexError, discord.Forbidden):
+                        return None
 
-    # 统计冷门好帖
-    # 定义：创建超过14天，且回复数少于3 (message_count < 3)
-    potential_gems = [
-        t for t in all_threads
-        if t.created_at.astimezone(TZ_SHANGHAI) < fourteen_days_ago and t.message_count < 3
-    ]
+                likes = 0
+                if starter_message.reactions:
+                    for reaction in starter_message.reactions:
+                        likes += reaction.count
 
-    # 随机选3个，如果不够就全选
-    import random
-    cold_gems = random.sample(potential_gems, min(len(potential_gems), 5))
+                # message_count 包含起始消息，所以评论数是它减1
+                comments = thread.message_count - 1 if thread.message_count else 0
 
+                # 如果评论数小于0，修正为0
+                if comments < 0:
+                    comments = 0
+
+                return {
+                    "thread": thread,
+                    "likes": likes,
+                    "comments": comments
+                }
+        except Exception:
+            return None
+
+    tasks = [process_thread(thread) for thread in threads_to_scan]
+    results = await asyncio.gather(*tasks)
+    all_threads_with_stats = [res for res in results if res is not None]
+
+    # --- 数据排序 ---
+    sorted_by_likes = sorted(all_threads_with_stats, key=lambda x: x['likes'], reverse=True)
+
+    # --- 最终返回的数据结构 ---
     return {
-        'total_count': len(all_threads),
-        'weekly_count': len(weekly_threads),
-        'hot_threads': hot_threads,
-        'cold_gems': cold_gems,
+        "total_posts": total_posts,
+        "recent_posts_count": recent_posts_count, # 新增字段
+        "hottest_posts": sorted_by_likes[:5],
+        "coldest_posts": sorted_by_likes[-5:][::-1]
     }
