@@ -26,33 +26,21 @@ class ForumSelectView(ui.View):
             return await interaction.response.send_message("你还没有选择任何频道！", ephemeral=True)
 
         app_command_channel = self.channel_select.values[0]
-        target_forum = interaction.guild.get_channel(app_command_channel.id)
-
-        if not target_forum:
-            try:
-                target_forum = await interaction.guild.fetch_channel(app_command_channel.id)
-            except:
-                 return await interaction.response.send_message("❌ 无法获取有效的频道信息，请重试。", ephemeral=True)
+        # 完整的 channel 对象在 .values[0] 中直接获取
+        target_forum = app_command_channel
 
         if not isinstance(target_forum, discord.ForumChannel):
              return await interaction.response.send_message("❌ 您选择的不是一个有效的论坛频道。", ephemeral=True)
 
-        # 【修复】调整交互流程
-        await interaction.response.defer() # 1. 立即响应交互，防止超时
+        await interaction.response.defer()
 
-        # 2. 创建视图实例
         view = StatisticsContainerView(self.bot, target_forum.id)
+        await view.refresh_data_and_update() # 此方法不再处理消息发送
 
-        # 3. 让视图实例自己去获取数据并构建组件，但不发送消息
-        await view.refresh_data_and_update() # 此方法现在不再处理消息发送
-
-        # 4. 在回调函数中统一发送消息
         msg = await interaction.followup.send(view=view, ephemeral=False)
 
-        # 5. 确保 msg 不是 None 后再存入数据库
         if msg:
             from . import db
-            # 注意：followup.send() 返回的是 WebhookMessage, 它有 id, channel, guild 等属性，可以直接用
             await db.add_panel_record(msg.id, msg.channel.id, msg.guild.id, target_forum.id)
         else:
             print("❌ [StatisticsCog] Followup message is None, failed to record panel to DB.")
@@ -66,7 +54,6 @@ class StatisticsContainerView(ui.LayoutView):
         super().__init__(timeout=None)
         self.bot = bot
         self.forum_id = forum_id
-        # 此处不再添加按钮，而是在 refresh_data_and_update 中动态构建
 
     def create_refresh_button(self):
         """创建一个固定的手动刷新按钮"""
@@ -74,14 +61,13 @@ class StatisticsContainerView(ui.LayoutView):
             label="手动刷新",
             style=discord.ButtonStyle.secondary,
             emoji="🔄",
-            custom_id=f"stats_refresh_{self.forum_id}"
+            custom_id=f"stats_refresh_{self.forum_id}" # Custom ID 必须唯一
         )
         btn.callback = self.manual_refresh_callback
         return btn
 
     async def manual_refresh_callback(self, interaction: discord.Interaction):
         """手动刷新按钮的回调函数"""
-        # 按钮的回调不能用 followup，要用 interaction.response.edit_message
         await interaction.response.defer()
         await self.refresh_data_and_update(interaction_to_edit=interaction)
 
@@ -98,36 +84,30 @@ class StatisticsContainerView(ui.LayoutView):
         button = ui.Button(
             label="直达" if is_hot else "考古",
             style=discord.ButtonStyle.link,
-            url=thread.jump_url,
-            emoji="🔗"
+            url=thread.jump_url
         )
+        #【修正】为了让按钮显示出来，需要将 accessory 放到 Section 里
         return ui.Section(
             ui.TextDisplay(content=f"**{thread.name}**"),
             ui.TextDisplay(content=stats_description),
             accessory=button
         )
 
-    # 【修复】修改方法签名，让其更通用
     async def refresh_data_and_update(self, *, interaction_to_edit: discord.Interaction = None, message_to_edit: discord.Message = None):
         """
         核心函数：获取数据并更新整个 View。
-         interaction_to_edit: 从按钮点击触发的交互
-         message_to_edit: 从后台任务触发的消息对象
         """
         guild = None
-        current_guild_id = None
-
-        # 统一获取 guild 对象和 ID 的方式
         if interaction_to_edit:
-             guild = interaction_to_edit.guild
+            guild = interaction_to_edit.guild
         elif message_to_edit:
             guild = message_to_edit.guild
 
         if not guild:
-            # 如果都找不到，尝试从 bot 的缓存中获取
             try:
-                guild = self.bot.get_guild(self.bot.get_channel(self.forum_id).guild.id)
-            except:
+                forum = self.bot.get_channel(self.forum_id) or await self.bot.fetch_channel(self.forum_id)
+                guild = forum.guild
+            except (AttributeError, discord.NotFound):
                 print(f"❌ 无法确定服务器来刷新统计面板 (Forum ID: {self.forum_id})")
                 return
 
@@ -135,9 +115,9 @@ class StatisticsContainerView(ui.LayoutView):
         if not isinstance(forum, discord.ForumChannel): return
 
         stats = await utils.fetch_forum_stats(forum)
-
         self.clear_items()
 
+        #--- 组件构建 ---
         header_section = ui.Section(
             ui.TextDisplay(content=f"### 📊 频道统计・{forum.name}"),
             ui.TextDisplay(content="深入洞察频道的活跃趋势与内容价值。"),
@@ -154,6 +134,7 @@ class StatisticsContainerView(ui.LayoutView):
         cold_sections = [self.create_item_section(p, is_hot=False) for p in stats['coldest_posts']]
 
         update_time_str = datetime.now(TZ_SHANGHAI).strftime('%Y年%m月%d日 %H:%M')
+        #【修正】为了确保有accessory，给footer也加上一个禁用的按钮
         footer_section = ui.Section(
             ui.TextDisplay(content=f"数据更新于：{update_time_str}"),
             accessory=ui.Button(label=" ", style=discord.ButtonStyle.secondary, disabled=True)
@@ -161,11 +142,20 @@ class StatisticsContainerView(ui.LayoutView):
 
         refresh_button_row = ui.ActionRow(self.create_refresh_button())
 
+        # 根据热度和冷度帖子的实际数量动态构建
+        components_to_add = [header_section, overview_section, ui.Separator()]
+        if hot_sections:
+            components_to_add.append(ui.TextDisplay(content="### 🔥 近期热门"))
+            components_to_add.extend(hot_sections)
+        if cold_sections:
+            components_to_add.append(ui.Separator())
+            components_to_add.append(ui.TextDisplay(content="### 🧊 冷门遗珠"))
+            components_to_add.extend(cold_sections)
+
+        components_to_add.extend([ui.Separator(), footer_section, refresh_button_row])
+
         container = ui.Container(
-            header_section, overview_section,
-            ui.Separator(), ui.TextDisplay(content="### 🔥 近期热门"), *hot_sections,
-            ui.Separator(), ui.TextDisplay(content="### 🧊 冷门遗珠"), *cold_sections,
-            ui.Separator(), footer_section, refresh_button_row,
+            *components_to_add,
             accent_colour=discord.Color.blue()
         )
         self.add_item(container)
