@@ -7,68 +7,124 @@ import asyncio
 class StatisticsContainerView(ui.LayoutView):
     def __init__(self, stats_data: dict):
         super().__init__(timeout=None)
-
-        self.btn_refresh_info = ui.Button(
-            label=f"数据更新于 {datetime.now().strftime('%H:%M:%S')}",
-            style=discord.ButtonStyle.secondary,
-            disabled=True,
-            custom_id="stats_panel_info_btn"
-        )
         self.clear_items()
 
-        header_section = ui.Section(
-            ui.TextDisplay(content=f"### 📊 频道统计: {stats_data['channel_name']}"),
-            ui.TextDisplay(content=f"**总帖子数:** {stats_data['total_threads']} | **近7日新增:** {stats_data['new_threads_7d']}"),
-            accessory=ui.Thumbnail(media=stats_data.get('channel_icon_url', "https://cdn.discordapp.com/embed/avatars/0.png"))
+        elements = []
+
+        # --- 1. 顶部主标题 ---
+        elements.append(
+            ui.Section(
+                ui.TextDisplay(content=f"### 📊 频道统计 · {stats_data.get('channel_name', '加载中')}", size=discord.UITextSize.large),
+                ui.TextDisplay(content="😋来看看服务器内有什么好帖子吧！"),
+                accessory=ui.Thumbnail(media=stats_data.get('channel_icon_url', "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"))
+            )
         )
 
-        elements = [header_section]
+        # --- 2. 数据总览 ---
+        elements.append(
+            ui.Section(
+                ui.TextDisplay(content=f"**总帖子数:** {stats_data.get('total_threads', 0)}"),
+                ui.TextDisplay(content=f"**近7日新增:** {stats_data.get('new_threads_7d', 0)}"),
+                accessory=ui.Button(label="数据概览", style=discord.ButtonStyle.success, disabled=True, custom_id="stats_overview_placeholder")
+            )
+        )
+
+        # --- 3. 热门帖子列表 ---
+        elements.append(ui.Separator())
+        elements.append(ui.TextDisplay(content="### 近期热门"))
 
         hot_threads = stats_data.get('hot_threads', [])
         if hot_threads:
-            # Markdown链接现在直接在 TextDisplay 中受支持
-            hot_content = "\n".join([f"[`👍{th['likes']} | 💬{th['comments']}`] [{th['name']}]({th['url']})" for th in hot_threads])
-            elements.extend([ui.Separator(), ui.TextDisplay(content="#### 🔥 热门帖子"), ui.TextDisplay(content=hot_content or "暂无数据")])
+            for th in hot_threads:
+                elements.append(
+                    ui.Section(
+                        ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"), # 限制标题长度防止溢出
+                        ui.TextDisplay(content=f"👍 {th.get('likes', 0)}  ·  💬 {th.get('comments', 0)}", size=discord.UITextSize.small),
+                        accessory=ui.Button(label="直达", style=discord.ButtonStyle.secondary, url=th.get('url'))
+                    )
+                )
+        else:
+            elements.append(ui.TextDisplay(content="-# 暂无热门帖子..."))
+
+        # --- 4. 冷门宝藏列表 ---
+        elements.append(ui.Separator())
+        elements.append(ui.TextDisplay(content="### 💎 冷门遗珠"))
 
         cold_threads = stats_data.get('cold_threads', [])
         if cold_threads:
-            cold_content = "\n".join([f"[`👍{th['likes']} | 💬{th['comments']}`] [{th['name']}]({th['url']})" for th in cold_threads])
-            elements.extend([ui.Separator(), ui.TextDisplay(content="#### 💎 冷门宝藏"), ui.TextDisplay(content=cold_content or "暂无数据")])
+            for th in cold_threads:
+                relative_time = "未知"
+                if th.get('created_at'):
+                    relative_time = discord.utils.format_dt(th['created_at'], style='R')
 
-        elements.extend([ui.Separator(spacing=discord.SeparatorSpacing.large), ui.ActionRow(self.btn_refresh_info)])
+                elements.append(
+                    ui.Section(
+                        ui.TextDisplay(content=f"{th.get('name', '无标题')[:80]}"),
+                        ui.TextDisplay(content=f"发布于 {relative_time}", size=discord.UITextSize.small),
+                        accessory=ui.Button(label="考古", style=discord.ButtonStyle.secondary, url=th.get('url'))
+                    )
+                )
+        else:
+            elements.append(ui.TextDisplay(content="-# 暂无冷门帖子..."))
 
-        container = ui.Container(*elements, accent_colour=discord.Color.from_rgb(88, 101, 242))
+        # --- 5. 底部刷新按钮 ---
+        elements.append(ui.Separator(spacing=discord.SeparatorSpacing.large))
+
+        # 这个按钮需要 custom_id 因为它没有 url 且视图是持久的
+        self.btn_refresh_info = ui.Button(
+            label=f"数据更新于 {datetime.now().strftime('%H:%M')}",
+            style=discord.ButtonStyle.secondary,
+            custom_id="stats_manual_refresh_btn",
+            emoji="🔄"
+        )
+        self.btn_refresh_info.callback = self.on_refresh_button_click
+        elements.append(ui.ActionRow(self.btn_refresh_info))
+
+        # --- 组合并构建容器 ---
+        container = ui.Container(
+            *elements,
+            accent_colour=discord.Color.from_rgb(113, 135, 212) # 自定义颜色
+        )
         self.add_item(container)
+
+    async def on_refresh_button_click(self, interaction: discord.Interaction):
+        """点击刷新按钮时的回调"""
+        await interaction.response.send_message(
+            "📋 **关于数据刷新**\n"
+            "此面板的数据由机器人每日凌晨自动更新。\n"
+            "此按钮仅用于展示最近一次的更新时间，再次点击不会触发即时刷新哦。",
+            ephemeral=True
+        )
 
 
 class ForumSelectView(ui.View):
     def __init__(self, cog_instance):
         super().__init__(timeout=180)
-        # 将cog实例作为参数传入，以便调用其方法
         self.cog = cog_instance
         self.channel_select = ui.ChannelSelect(
             placeholder="请选择1-5个论坛频道...",
             channel_types=[discord.ChannelType.forum],
             min_values=1,
-            max_values=5, # 限制最多选5个
+            max_values=5,
             custom_id="stats_forum_selector"
         )
         self.add_item(self.channel_select)
 
-    @ui.button(label="生成统计面板", style=discord.ButtonStyle.success)
+    @ui.button(label="生成统计面板", style=discord.ButtonStyle.success, custom_id="stats_confirm_generation_btn")
     async def confirm_button(self, interaction: discord.Interaction, button: ui.Button):
         if not self.channel_select.values:
             return await interaction.response.send_message("你还没有选择任何频道！", ephemeral=True)
 
         selected_channels = self.channel_select.values
 
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        # 编辑原始的 ephemeral 消息，移除视图
-        await interaction.edit_original_response(content=f"收到指令！正在为 {len(selected_channels)} 个频道生成统计面板，请稍候...", view=None)
+        # 禁用按钮防止重复点击
+        button.disabled = True
+        self.channel_select.disabled = True
+        await interaction.response.edit_message(content="收到指令，正在处理，请稍候...", view=self)
 
-        # 循环处理每个选择的频道
+        await interaction.followup.send(f"⏳ 开始为 **{len(selected_channels)}** 个频道生成统计面板...", ephemeral=True)
+
         for channel_stub in selected_channels:
-            # channel_stub 是一个简化的对象，需要获取完整的频道对象
             channel = interaction.guild.get_channel(channel_stub.id)
             if not isinstance(channel, discord.ForumChannel):
                 continue
@@ -79,13 +135,9 @@ class ForumSelectView(ui.View):
                 continue
 
             view = StatisticsContainerView(stats_data=stats_data)
-
-            # 在执行命令的频道发送面板
             msg = await interaction.channel.send(view=view)
-
-            # 记录到数据库以便每日刷新
             await statistics_db.add_statistics_panel(msg.id, msg.channel.id, channel.id, interaction.guild.id)
-            await asyncio.sleep(1) # API友好
+            await asyncio.sleep(1)
 
-        await interaction.followup.send("✅ 所有统计面板均已创建！", ephemeral=True)
+        await interaction.edit_original_response(content="✅ 操作完成。", view=None)
         self.stop()
