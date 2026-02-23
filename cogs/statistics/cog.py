@@ -1,32 +1,30 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-# 核心修改：从 datetime 导入 timezone
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 import asyncio
 
 from . import db as statistics_db
-from .views import ForumSelectView
-from config import TZ_SHANGHAI # 确保导入了时区配置
+from .views import ForumSelectView, StatisticsContainerView 
+from config import TZ_SHANGHAI
 
 class StatisticsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # 删除了对 add_view 的重复调用，因为这会在 Cog 加载时重复添加持久化视图
-        # self.bot.add_view(ForumSelectView(self))
-
-        # 启动后台任务
+        # cog_load 中添加视图，这里不需要
         self.update_panels_task.start()
 
     async def cog_load(self):
         # 将持久化视图的注册放在 cog_load 中，确保只在启动时添加一次
         self.bot.add_view(ForumSelectView(self))
+        # StatisticsContainerView 是动态创建的，不需要在这里注册
         print("✅ [StatisticsCog] 已成功加载并注册了 ForumSelectView。")
 
     async def cog_unload(self):
         self.update_panels_task.cancel()
 
-    @tasks.loop(hours=24, time=datetime.strptime("04:00", "%H:%M").time(tz=TZ_SHANGHAI))
+    # 核心修改：修正 tasks.loop 的 time 参数
+    @tasks.loop(time=time(hour=4, minute=0, tzinfo=TZ_SHANGHAI))
     async def update_panels_task(self):
         """定时任务：每天凌晨4点自动更新所有已创建的统计面板"""
         await self.bot.wait_until_ready()
@@ -54,7 +52,8 @@ class StatisticsCog(commands.Cog):
                 # 更新核心逻辑
                 stats_data = await self.gather_statistics(forum_channel)
                 if stats_data:
-                    new_view = ForumSelectView.StatisticsContainerView(stats_data)
+                    # 注意：这里直接使用导入的 StatisticsContainerView
+                    new_view = StatisticsContainerView(stats_data)
                     await message.edit(view=new_view)
                     success_count += 1
 
@@ -82,7 +81,6 @@ class StatisticsCog(commands.Cog):
                 "total_threads": 0, "new_threads_7d": 0, "hot_threads": [], "cold_threads": []
             }
 
-        # 核心修改：使用 datetime.now(timezone.utc) 来创建时区感知的时间对象
         seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
         total_threads = len(threads)
         new_threads_7d = sum(1 for t in threads if t.created_at > seven_days_ago)
@@ -111,7 +109,6 @@ class StatisticsCog(commands.Cog):
         threads_with_stats.sort(key=lambda x: x['score'], reverse=True)
         hot_threads = threads_with_stats[:15]
 
-        # 核心修改：同样在这里使用时区感知的时间
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
         older_threads = [t for t in threads_with_stats if t['created_at'] < thirty_days_ago]
