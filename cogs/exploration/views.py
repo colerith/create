@@ -184,7 +184,7 @@ class SearchResultContainer(ui.LayoutView):
 
                 # 每个帖子一个 Section
                 # Accessory 放跳转按钮
-                jump_btn = ui.Button(label="👀 查看", url=thread.jump_url, style=discord.ButtonStyle.link)
+                jump_btn = ui.Button(label="传送", url=thread.jump_url, style=discord.ButtonStyle.link)
 
                 section_content = [
                     ui.TextDisplay(content=f"**{thread.name}**"),
