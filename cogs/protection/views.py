@@ -10,6 +10,7 @@ import aiosqlite
 
 from datetime import datetime
 from ..core.db import get_db
+from .import db as protection_db
 from .db import log_file_trace
 from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 from .utils import (
@@ -559,23 +560,20 @@ class BumpButtonView(discord.ui.View):
         super().__init__(timeout=None)
         self.bot = bot
 
-    @classmethod
-    def create_layout(cls, bot, origin_id=None):
+    def create_layout(self):
         """
-        静态方法：生成【纯文字版】的置底消息参数。
+        生成置底消息的参数. 返回一个包含视图实例的字典.
         """
-        view = cls(bot)
-
         message_content = (
             "⬇️ **本频道有受保护的附件** ⬇️\n"
-            "为了防止资源被聊天记录淹没，请点击下方按钮查看下载列表。"
+            "为了防止资源被聊天记录淹没，请点击下方按钮查看下载列表。\n"
             "如果本按钮失效，也可以使用`/保护附件 获取附件`命令获取。"
         )
 
         return {
             "content": message_content,
             "embed": None,
-            "view": view
+            "view": self # 直接返回当前实例
         }
 
     @discord.ui.button(
@@ -588,16 +586,9 @@ class BumpButtonView(discord.ui.View):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
-        from ..core.db import get_db
 
-        rows = []
-        async with get_db() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM protected_items WHERE channel_id = ? ORDER BY created_at DESC LIMIT 5",
-                (interaction.channel.id,)
-            )
-            rows = await cursor.fetchall()
+        bot = interaction.client
+        rows = await protection_db.get_items_in_channel(interaction.channel_id, limit=25)
 
         if not rows:
             return await interaction.response.send_message(
@@ -605,7 +596,7 @@ class BumpButtonView(discord.ui.View):
                 ephemeral=True
             )
 
-        view = PostListView(self.bot, rows)
+        view = PostListView(bot, rows)
 
         result_embed = discord.Embed(
             title="📂 附件获取列表",

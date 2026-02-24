@@ -8,6 +8,7 @@ import aiohttp
 import asyncio
 
 from cogs.core.db import init_db
+from cogs.protection.views import BumpButtonView
 
 load_dotenv()
 
@@ -29,6 +30,8 @@ class ChimidanBot(commands.Bot):
 
     async def setup_hook(self):
         self.http_session = aiohttp.ClientSession()
+        self.add_view(BumpButtonView(self))
+        print("🔧 持久化视图 [BumpButtonView] 已注册。")
 
         await init_db()
         print("✅ 全局数据库检查完毕。")
