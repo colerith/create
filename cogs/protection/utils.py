@@ -91,10 +91,14 @@ def inject_smart_trace(file_bytes, filename, trace_id):
                     # A. 生成隐形水印 (零宽字符)
 
                     target_key = None
-                    for k, v in json_obj.items():
-                        if isinstance(v, str) and len(v) > 0:
-                            target_key = k
-                            break
+                    # 优先寻找 'name' 字段，避免破坏 'type' 等关键标识字段
+                    if 'name' in json_obj and isinstance(json_obj['name'], str):
+                        target_key = 'name'
+                    else:
+                        for k, v in json_obj.items():
+                            if isinstance(v, str) and len(v) > 0 and k != 'type':
+                                target_key = k
+                                break
 
                     hidden_mark = text_to_zw(f"TRACE:{trace_id}")
 
