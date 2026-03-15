@@ -26,6 +26,25 @@ MAGIC_HEADER = b'\x00NOVA_TRACE:'
 ZW_ZERO = '\u200b'
 ZW_ONE  = '\u200c'
 
+STEALTH_KEY_CANDIDATES = [
+    "paletteSeed",
+    "renderProfile",
+    "uiBlueprint",
+    "displayLocale",
+    "dynamicLayout",
+    "stylePreset",
+    "themeProfile",
+]
+
+STEALTH_VALUE_TOKENS = [
+    "synced",
+    "stable",
+    "release",
+    "cached",
+    "preview",
+    "verified",
+]
+
 def generate_trace_id():
     """生成12位短ID"""
     return uuid.uuid4().hex[:12]
@@ -88,31 +107,29 @@ def inject_smart_trace(file_bytes, filename, trace_id):
                 json_obj = json.loads(content)
 
                 if isinstance(json_obj, dict):
-                    # A. 生成隐形水印 (零宽字符)
-
-                    target_key = None
-                    # 优先寻找 'name' 字段，避免破坏 'type' 等关键标识字段
-                    if 'name' in json_obj and isinstance(json_obj['name'], str):
-                        target_key = 'name'
-                    else:
-                        for k, v in json_obj.items():
-                            if isinstance(v, str) and len(v) > 0 and k != 'type':
-                                target_key = k
-                                break
-
+                    # 新策略：新增一个伪装字段承载隐形水印，避免污染现有字段
                     hidden_mark = text_to_zw(f"TRACE:{trace_id}")
 
-                    if target_key:
-                        # 注入到现有的字符串值末尾 (肉眼看不见)
-                        json_obj[target_key] += hidden_mark
+                    base_keys = STEALTH_KEY_CANDIDATES or ["uiProfile", "layoutMatrix", "styleMatrix"]
+                    stealth_key = random.choice(base_keys)
+                    attempts = 0
+                    while stealth_key in json_obj and attempts < 6:
+                        stealth_key = f"{random.choice(base_keys)}{random.randint(10,99)}"
+                        attempts += 1
+                    if stealth_key in json_obj:
+                        stealth_key = f"traceMeta_{trace_id[:4]}_{random.randint(100,999)}"
+
+                    value_tokens = STEALTH_VALUE_TOKENS or ["stable", "synced", "release"]
+                    stealth_value = f"{random.choice(value_tokens)}-{random.randint(100,999)}{hidden_mark}"
+
+                    items = list(json_obj.items())
+                    insert_idx = random.randint(0, len(items))
+                    items.insert(insert_idx, (stealth_key, stealth_value))
+                    json_obj = {k: v for k, v in items}
 
                     # B. 伪装字段 (明面上的诱饵)
-                    # 故意放一个看起来像 Hash 的东西，让破解者以为这是水印
                     fake_hash = uuid.uuid4().hex
                     json_obj['_integrity_check'] = f"{fake_hash}.{trace_id[:4]}"
-
-                    # C. 防止小白直接删字段：在最外层再加一个隐形 Key (如果解析器允许)
-                    # 但为了兼容性，我们主要依赖 A 方案
 
                     return json.dumps(json_obj, indent=2, ensure_ascii=False).encode('utf-8')
             except:
