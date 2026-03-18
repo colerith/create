@@ -21,11 +21,23 @@ async def init_db():
                 storage_urls TEXT,
                 title TEXT,
                 log TEXT,
+                update_log TEXT,
+                mention_users INTEGER DEFAULT 0,
                 password TEXT,
                 created_at TEXT,
                 download_count INTEGER DEFAULT 0
             )
         """)
+        # 1.1 兼容旧表结构：补充更新日志与艾特配置列
+        try:
+            await db.execute("ALTER TABLE protected_items ADD COLUMN update_log TEXT")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE protected_items ADD COLUMN mention_users INTEGER DEFAULT 0")
+        except:
+            pass
+
         # 2. 点赞记录表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_likes (

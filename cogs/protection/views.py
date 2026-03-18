@@ -21,7 +21,7 @@ from .utils import (
     inject_smart_trace, 
     generate_trace_id 
 )
-from .modals import DraftTitleModal, DraftNoteModal, DraftPasswordModal, RenameFileModal, PasswordUnlockModal
+from .modals import DraftTitleModal, DraftNoteModal, DraftPasswordModal, RenameFileModal, PasswordUnlockModal, DraftUpdateLogModal
 
 # --- 延迟下载视图 (核心修改区域) ---
 class AuthorNoteView(ui.View):
@@ -175,6 +175,8 @@ class ProtectionDraftView(ui.View):
         self.target_message = target_message
         self.draft_title = f"{user.display_name} 的保护附件"
         self.draft_log = default_log
+        self.draft_update_log = None
+        self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
         self.custom_names = {}
@@ -185,10 +187,17 @@ class ProtectionDraftView(ui.View):
         file_status = f"{len(self.attachments)} 个"
         if renamed_count > 0: file_status += f" (已改名 {renamed_count} 个)"
 
-        status_desc = (f"📦 **已传文件**: {file_status}\n🏷️ **当前标题**: {self.draft_title}\n📝 **作者提示**: {'✅ ' + log_preview if self.draft_log else '⚪ 未设置'}\n")
+        update_log_preview = self.draft_update_log[:50] + "..." if self.draft_update_log and len(self.draft_update_log) > 50 else self.draft_update_log
+        status_desc = (
+            f"📦 **已传文件**: {file_status}\n"
+            f"🏷️ **当前标题**: {self.draft_title}\n"
+            f"📝 **作者提示**: {'✅ ' + log_preview if self.draft_log else '⚪ 未设置'}\n"
+            f"🗒️ **更新日志**: {'✅ ' + update_log_preview if self.draft_update_log else '⚪ 未设置'}\n"
+            f"📣 **艾特贴内用户**: {'✅ 开启' if self.mention_users else '⚪ 关闭'}\n"
+        )
         mode_map = {"like": "👍 点赞解锁", "like_comment": "💬 点赞+评论", "like_password": f"🔐 点赞+口令 (口令: ||{self.draft_password}||)", "like_comment_password": f"🔐💬 点赞+评论+口令 (口令: ||{self.draft_password}||)"}
         status_desc += f"⚙️ **获取方式**: {mode_map.get(self.draft_mode)}"
-        guide_desc = ("1️⃣ 点击 **第一排** 修改标题、说明或 **修改文件名**。\n2️⃣ 点击 **第二排** 选择解锁条件。\n3️⃣ 确认无误后，点击底部的 **🚀 确认发布**。")
+        guide_desc = ("1️⃣ 点击 **第一排** 修改标题、说明、**更新日志** 或 **修改文件名**。\n2️⃣ 点击 **第二排** 选择解锁条件或配置 **艾特贴内用户**。\n3️⃣ 确认无误后，点击底部的 **🚀 确认发布**。")
         embed = discord.Embed(title="🛠️ 附件保护控制台", color=0x87ceeb); embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False); embed.add_field(name="📖 操作指引", value=guide_desc, inline=False); embed.set_footer(text="此面板仅你自己可见")
 
         if interaction.response.is_done():
@@ -200,6 +209,8 @@ class ProtectionDraftView(ui.View):
     async def btn_set_title(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftTitleModal(self))
     @ui.button(label="作者提示", style=discord.ButtonStyle.secondary, row=0, emoji="📝")
     async def btn_set_note(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftNoteModal(self))
+    @ui.button(label="更新日志", style=discord.ButtonStyle.secondary, row=0, emoji="🗒️")
+    async def btn_set_update_log(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftUpdateLogModal(self))
     @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
     async def btn_rename_files(self, i: discord.Interaction, b: ui.Button): await i.response.send_message("请选择要重命名的文件：", view=FileSelectView(self), ephemeral=True)
     @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
@@ -218,6 +229,10 @@ class ProtectionDraftView(ui.View):
     async def mode_like_pass(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftPasswordModal(self, "like_password"))
     @ui.button(label="点赞+评论+口令", style=discord.ButtonStyle.success, row=1, emoji="🔐")
     async def mode_like_comm_pass(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftPasswordModal(self, "like_comment_password"))
+    @ui.button(label="艾特贴内用户", style=discord.ButtonStyle.secondary, row=1, emoji="📣")
+    async def toggle_mention_users(self, i: discord.Interaction, b: ui.Button):
+        self.mention_users = not self.mention_users
+        await self.update_dashboard(i)
 
     @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=2, emoji="🚀")
     async def btn_confirm(self, i: discord.Interaction, b: ui.Button):
@@ -280,10 +295,36 @@ class ProtectionDraftView(ui.View):
 
         async with get_db() as db:
             await db.execute(
-                """INSERT INTO protected_items (message_id, channel_id, owner_id, unlock_type, storage_urls, title, log, password, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (final_msg.id, final_msg.channel.id, self.user.id, self.draft_mode, json.dumps(stored_data), self.draft_title, self.draft_log, self.draft_password, datetime.now(TZ_SHANGHAI).isoformat())
+                """INSERT INTO protected_items (message_id, channel_id, owner_id, unlock_type, storage_urls, title, log, update_log, mention_users, password, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (final_msg.id, final_msg.channel.id, self.user.id, self.draft_mode, json.dumps(stored_data), self.draft_title, self.draft_log, self.draft_update_log, int(self.mention_users), self.draft_password, datetime.now(TZ_SHANGHAI).isoformat())
             )
             await db.commit()
+
+        # 自动开启置底（兼容手动开关）
+        try:
+            channel_id = interaction.channel.id
+            if channel_id not in self.bot.get_cog("ProtectionCog").bump_tasks:
+                task = self.bot.loop.create_task(self.bot.get_cog("ProtectionCog")._bump_loop(interaction.channel))
+                self.bot.get_cog("ProtectionCog").bump_tasks[channel_id] = task
+            await protection_db.add_bump_config(channel_id)
+            await self.bot.get_cog("ProtectionCog")._execute_bump_once(interaction.channel)
+        except Exception:
+            pass
+
+        # 发布更新通知（若配置）
+        if self.mention_users or self.draft_update_log:
+            mention_text = "@everyone" if self.mention_users else ""
+
+            if mention_text:
+                await interaction.channel.send(f"📣 **更新通知** {mention_text}")
+
+            if self.draft_update_log:
+                update_header = f"🗒️ **{self.draft_title} 更新日志**"
+                update_msg = await interaction.channel.send(f"{update_header}\n{self.draft_update_log}")
+                try:
+                    await update_msg.pin(reason="附件更新日志标注")
+                except:
+                    await interaction.followup.send("提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True)
 
         await interaction.followup.send("✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True)
 
@@ -605,4 +646,3 @@ class BumpButtonView(discord.ui.View):
         )
 
         await interaction.response.send_message(embed=result_embed, view=view, ephemeral=True)
-

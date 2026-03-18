@@ -17,6 +17,16 @@ class DraftNoteModal(ui.Modal, title="设置作者提示"):
     def __init__(self, view): super().__init__(); self.view_ref = view; self.log_input.default = view.draft_log[:4000] if view.draft_log else None
     async def on_submit(self, i: discord.Interaction): self.view_ref.draft_log = i.data['components'][0]['components'][0]['value']; await self.view_ref.update_dashboard(i)
 
+class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
+    update_log_input = ui.TextInput(label="更新日志 (支持 Markdown)", style=discord.TextStyle.paragraph, placeholder="请输入更新内容...", max_length=8000, required=False)
+    def __init__(self, view):
+        super().__init__()
+        self.view_ref = view
+        self.update_log_input.default = view.draft_update_log[:8000] if view.draft_update_log else None
+    async def on_submit(self, i: discord.Interaction):
+        self.view_ref.draft_update_log = i.data['components'][0]['components'][0]['value']
+        await self.view_ref.update_dashboard(i)
+
 class DraftPasswordModal(ui.Modal, title="设置口令"):
     pwd_input = ui.TextInput(label="下载口令", placeholder="1-100字", min_length=1, max_length=100)
     def __init__(self, view, next_mode): super().__init__(); self.view_ref = view; self.next_mode = next_mode; self.pwd_input.default = view.draft_password
