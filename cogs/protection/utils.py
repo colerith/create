@@ -11,6 +11,7 @@ import binascii
 import os
 import uuid
 import random
+import zipfile
 
 from datetime import datetime
 from ..core.db import get_db
@@ -19,6 +20,10 @@ from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 # --- 魔法签名与隐写配置 ---
 # 格式: 0x00 + NOVA_TRACE: + UUID(12)
 MAGIC_HEADER = b'\x00NOVA_TRACE:'
+ZIP_COMMENT_PREFIX = b'NOVA_TRACE:'
+ZIP_MANIFEST_NAME = '.nova_trace.json'
+ZIP_SCAN_MAX_FILES = 200
+ZIP_SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
 # 零宽字符映射表：用于将二进制 0/1 转换为不可见字符
 # \u200b (Zero Width Space) -> 0
@@ -88,6 +93,90 @@ def _inject_png_text_chunk(data, key, text):
     if iend_pos == -1: return data + chunk
     return data[:iend_pos] + chunk + data[iend_pos:]
 
+def _inject_zip_trace(file_bytes, trace_id):
+    """
+    ZIP 溯源增强：
+    1) 写入 zip comment（包级标记）
+    2) 写入隐藏 manifest（便于直接溯源压缩包）
+    3) 对每个普通文件做二次注入（便于解压后单文件溯源）
+    """
+    try:
+        src = io.BytesIO(file_bytes)
+        out = io.BytesIO()
+
+        with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out, 'w') as zout:
+            infos = zin.infolist()
+            for info in infos:
+                raw = zin.read(info.filename)
+
+                if info.is_dir():
+                    zout.writestr(info, raw)
+                    continue
+
+                base_name = os.path.basename(info.filename)
+                if base_name == ZIP_MANIFEST_NAME:
+                    continue
+
+                new_raw = inject_smart_trace(raw, base_name, trace_id)
+                zout.writestr(info, new_raw)
+
+            manifest = {
+                "trace_id": trace_id,
+                "issuer": "ProtectionBot",
+                "version": 1
+            }
+            zout.writestr(ZIP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False))
+            zout.comment = ZIP_COMMENT_PREFIX + trace_id.encode('ascii')
+
+        return out.getvalue()
+    except Exception as e:
+        print(f"ZIP Injection Error: {e}")
+        return file_bytes + MAGIC_HEADER + trace_id.encode('ascii')
+
+def _extract_trace_from_zip_bytes(file_bytes):
+    """从 ZIP 本体或 ZIP 内文件中提取 TraceID。"""
+    try:
+        total_scanned = 0
+        with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zf:
+            comment = zf.comment or b''
+            if comment.startswith(ZIP_COMMENT_PREFIX):
+                tid = comment[len(ZIP_COMMENT_PREFIX):len(ZIP_COMMENT_PREFIX)+12].decode('ascii', errors='ignore')
+                if re.fullmatch(r'[a-f0-9]{12}', tid):
+                    return tid
+
+            if ZIP_MANIFEST_NAME in zf.namelist():
+                try:
+                    manifest_raw = zf.read(ZIP_MANIFEST_NAME)
+                    manifest = json.loads(manifest_raw.decode('utf-8', errors='ignore'))
+                    tid = str(manifest.get('trace_id', ''))
+                    if re.fullmatch(r'[a-f0-9]{12}', tid):
+                        return tid
+                except Exception:
+                    pass
+
+            for i, info in enumerate(zf.infolist()):
+                if i >= ZIP_SCAN_MAX_FILES:
+                    break
+                if info.is_dir():
+                    continue
+                if info.filename.endswith('/') or os.path.basename(info.filename) == ZIP_MANIFEST_NAME:
+                    continue
+                if info.file_size <= 0:
+                    continue
+                if total_scanned > ZIP_SCAN_MAX_TOTAL_BYTES:
+                    break
+
+                raw = zf.read(info.filename)
+                total_scanned += len(raw)
+                inner_name = os.path.basename(info.filename)
+                inner_tid = extract_trace_from_bytes(raw, inner_name)
+                if inner_tid and re.fullmatch(r'[a-f0-9]{12}', inner_tid):
+                    return inner_tid
+    except Exception:
+        return None
+
+    return None
+
 def inject_smart_trace(file_bytes, filename, trace_id):
     """
     智能注入溯源信息 (升级版：支持隐形水印)
@@ -96,6 +185,9 @@ def inject_smart_trace(file_bytes, filename, trace_id):
 
     try:
         # 策略 1: PNG 隐写
+        if ext == '.zip':
+            print(f"Injecting ZIP Trace: {trace_id}")
+            return _inject_zip_trace(file_bytes, trace_id)
         if ext == '.png':
             print(f"Injecting PNG Trace: {trace_id}")
             return _inject_png_text_chunk(file_bytes, "Software", f"ProtectionBot | ID:{trace_id}")
@@ -152,6 +244,10 @@ def extract_trace_from_bytes(file_bytes, filename):
     try:
         ext = os.path.splitext(filename)[1].lower()
         trace_id = None
+        if ext == '.zip':
+            zip_tid = _extract_trace_from_zip_bytes(file_bytes)
+            if zip_tid:
+                return zip_tid
 
         # 1. 优先检查 JSON 隐形水印 (最高优先级)
         if ext == '.json':
