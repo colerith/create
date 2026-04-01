@@ -86,6 +86,13 @@ class DownloadRecordResultView(ui.View):
         self.btn_next.disabled = self.current_page >= self.total_pages - 1
         self.btn_page.label = f"{self.current_page + 1} / {self.total_pages}"
 
+    @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        text = "" if text is None else str(text)
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message("这个查询面板只能由命令发起者操作。", ephemeral=True)
@@ -141,10 +148,15 @@ class DownloadRecordResultView(ui.View):
                 ts_text = ts_raw or "未知时间"
 
             link_text = f"[原帖跳转]({jump_url})" if jump_url else "原帖链接不可用"
-            line = f"**{idx}. {title}**\n文件: `{files_text}`\n时间: {ts_text} | {link_text}"
-            lines.append(line)
+            safe_title = self._clip(title, 80)
+            safe_files = self._clip(files_text, 120)
+            line = f"**{idx}. {safe_title}**\n文件: `{safe_files}`\n时间: {ts_text} | {link_text}"
+            lines.append(self._clip(line, 240))
 
-        embed.add_field(name="记录明细", value="\n\n".join(lines), inline=False)
+        joined = "\n\n".join(lines)
+        if len(joined) > 1000:
+            joined = joined[:997] + "..."
+        embed.add_field(name="记录明细", value=joined, inline=False)
         return embed
 
     @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
