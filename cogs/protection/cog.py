@@ -6,6 +6,7 @@ from discord.ext import commands
 from datetime import datetime
 import json
 import asyncio
+import random
 
 # --- 从新的地方导入 ---
 from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
@@ -47,10 +48,15 @@ class ProtectionCog(commands.Cog):
                     try: channel = await self.bot.fetch_channel(channel_id)
                     except: pass
 
+                if channel and self._is_thread_archived(channel):
+                    await protection_db.remove_bump_config(channel_id)
+                    continue
+
                 if channel and (channel.id not in self.bump_tasks):
                     task = self.bot.loop.create_task(self._bump_loop(channel))
                     self.bump_tasks[channel_id] = task
                     count += 1
+                    await asyncio.sleep(0.15)
                 elif not channel:
                      print(f"⚠️ [警告] 彻底无法找到频道 {channel_id}，跳过恢复。")
 
@@ -62,6 +68,19 @@ class ProtectionCog(commands.Cog):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
         for task in self.bump_tasks.values():
             task.cancel()
+
+    def _is_thread_archived(self, channel: discord.TextChannel | discord.Thread) -> bool:
+        return isinstance(channel, discord.Thread) and getattr(channel, "archived", False)
+
+    async def _safe_delete_message(self, message: discord.Message) -> bool:
+        try:
+            await message.delete()
+            return True
+        except discord.HTTPException as e:
+            # 50083: Thread is archive
+            if getattr(e, "code", None) == 50083:
+                return False
+            raise
 
     # --- 监听器 ---
     @commands.Cog.listener()
@@ -250,9 +269,17 @@ class ProtectionCog(commands.Cog):
     async def _execute_bump_once(self, channel: discord.TextChannel | discord.Thread):
         """单独执行一次置底循环的逻辑，用于提供即时反馈"""
         try:
+            if self._is_thread_archived(channel):
+                await protection_db.remove_bump_config(channel.id)
+                if channel.id in self.bump_tasks:
+                    self.bump_tasks.pop(channel.id, None)
+                return
             should_have_bump = bool(await protection_db.get_items_in_channel(channel.id, limit=1))
             old_bump_message = None
+            latest_message = None
             async for msg in channel.history(limit=10):
+                if latest_message is None:
+                    latest_message = msg
                 if msg.author.id == self.bot.user.id and msg.components and len(msg.components) > 0:
                     first_child = msg.components[0].children[0]
                     if hasattr(first_child, 'custom_id') and first_child.custom_id == "bump_get_attachments":
@@ -264,10 +291,15 @@ class ProtectionCog(commands.Cog):
                 await channel.send(**view.create_layout())
             elif should_have_bump and old_bump_message:
                 # 已经是最新消息，无需操作
-                if (await channel.history(limit=1).flatten())[0].id == old_bump_message.id:
+                if latest_message and latest_message.id == old_bump_message.id:
                     pass
                 else: # 不在底部，重发
-                    await old_bump_message.delete()
+                    deleted = await self._safe_delete_message(old_bump_message)
+                    if not deleted:
+                        await protection_db.remove_bump_config(channel.id)
+                        if channel.id in self.bump_tasks:
+                            self.bump_tasks.pop(channel.id, None)
+                        return
                     await asyncio.sleep(1)
                     view = BumpButtonView(self.bot)
                     await channel.send(**view.create_layout())
@@ -279,9 +311,14 @@ class ProtectionCog(commands.Cog):
         print(f"✅ [置底任务启动] 频道: {channel.name} ({channel.id})")
         try:
             # 在循环开始前等待一小段时间，确保cog完全加载
-            await asyncio.sleep(5)
+            await asyncio.sleep(5 + random.uniform(0, 8))
             while not self.bot.is_closed():
                 try:
+                    if self._is_thread_archived(channel):
+                        await protection_db.remove_bump_config(channel.id)
+                        if channel.id in self.bump_tasks:
+                            del self.bump_tasks[channel.id]
+                        break
                     # 1.【核心】每次循环都检查数据库，确认是否还需要置底
                     rows = await protection_db.get_items_in_channel(channel.id, limit=1)
                     should_have_bump = bool(rows)
@@ -311,7 +348,12 @@ class ProtectionCog(commands.Cog):
 
                         # **情况B：应该有，也有了，但不在底部 -> 删掉旧的，发送新的**
                         elif not is_at_bottom:
-                            await old_bump_message.delete()
+                            deleted = await self._safe_delete_message(old_bump_message)
+                            if not deleted:
+                                await protection_db.remove_bump_config(channel.id)
+                                if channel.id in self.bump_tasks:
+                                    del self.bump_tasks[channel.id]
+                                break
                             await asyncio.sleep(1) # 等待一下，防止竞态
                             await channel.send(**view.create_layout())
 
@@ -320,7 +362,7 @@ class ProtectionCog(commands.Cog):
                     else: # not should_have_bump
                         # **情况D：不该有，但有了 -> 删除它，并自动停止任务**
                         if old_bump_message:
-                            await old_bump_message.delete()
+                            await self._safe_delete_message(old_bump_message)
 
                         # 自动关闭
                         print(f"ℹ️ [置底任务] 频道 {channel.name} 已无附件，自动停止置底任务。")
@@ -335,13 +377,22 @@ class ProtectionCog(commands.Cog):
                     if channel.id in self.bump_tasks:
                         del self.bump_tasks[channel.id]
                     break # 没权限了直接退出循环
+                except discord.HTTPException as e:
+                    if getattr(e, "code", None) == 50083:
+                        await protection_db.remove_bump_config(channel.id)
+                        if channel.id in self.bump_tasks:
+                            del self.bump_tasks[channel.id]
+                        break
+                    import traceback
+                    print(f"- [缃簳浠诲姟] {channel.name} HTTPException: {e}")
+                    traceback.print_exc()
                 except Exception as e:
                     import traceback
                     print(f"- [置底任务] {channel.name} 循环中发生错误: {e}")
                     traceback.print_exc()
 
                 # 无论如何都等待
-                await asyncio.sleep(300) # 5分钟检查一次
+                await asyncio.sleep(300 + random.uniform(0, 30)) # 5分钟检查一次
 
         except asyncio.CancelledError:
             # 这是正常的任务取消

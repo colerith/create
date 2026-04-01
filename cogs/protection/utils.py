@@ -22,6 +22,7 @@ from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 MAGIC_HEADER = b'\x00NOVA_TRACE:'
 ZIP_COMMENT_PREFIX = b'NOVA_TRACE:'
 ZIP_MANIFEST_NAME = '.nova_trace.json'
+ZIP_WRITE_MANIFEST = False
 ZIP_SCAN_MAX_FILES = 200
 ZIP_SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 
@@ -120,12 +121,13 @@ def _inject_zip_trace(file_bytes, trace_id):
                 new_raw = inject_smart_trace(raw, base_name, trace_id)
                 zout.writestr(info, new_raw)
 
-            manifest = {
-                "trace_id": trace_id,
-                "issuer": "ProtectionBot",
-                "version": 1
-            }
-            zout.writestr(ZIP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False))
+            if ZIP_WRITE_MANIFEST:
+                manifest = {
+                    "trace_id": trace_id,
+                    "issuer": "ProtectionBot",
+                    "version": 1
+                }
+                zout.writestr(ZIP_MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False))
             zout.comment = ZIP_COMMENT_PREFIX + trace_id.encode('ascii')
 
         return out.getvalue()
