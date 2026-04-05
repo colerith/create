@@ -58,7 +58,8 @@ class ProtectionCog(commands.Cog):
                     count += 1
                     await asyncio.sleep(0.15)
                 elif not channel:
-                     print(f"⚠️ [警告] 彻底无法找到频道 {channel_id}，跳过恢复。")
+                     print(f"⚠️ [警告] 彻底无法找到频道 {channel_id}，已自动清理置底配置。")
+                     await protection_db.remove_bump_config(channel_id)
 
             print(f"✅ [ProtectionCog] 自动置底任务恢复完成！共恢复 {count} 个频道。")
         except Exception as e:
@@ -304,6 +305,16 @@ class ProtectionCog(commands.Cog):
                     view = BumpButtonView(self.bot)
                     await channel.send(**view.create_layout())
 
+        except discord.NotFound:
+            print(f"❌ [置底任务] 频道不存在或无法访问，已自动关闭置底: {getattr(channel, 'id', None)}")
+            await protection_db.remove_bump_config(channel.id)
+            if channel.id in self.bump_tasks:
+                self.bump_tasks.pop(channel.id, None)
+        except discord.Forbidden:
+            print(f"❌ [置底任务] 没有权限访问频道，已自动关闭置底: {getattr(channel, 'id', None)}")
+            await protection_db.remove_bump_config(channel.id)
+            if channel.id in self.bump_tasks:
+                self.bump_tasks.pop(channel.id, None)
         except Exception as e:
             print(f"- [置底任务] {channel.name} 首次执行中发生错误: {e}")
 
@@ -371,6 +382,12 @@ class ProtectionCog(commands.Cog):
                         await protection_db.remove_bump_config(channel.id)
                         break # 跳出 while True 循环，终止此任务
 
+                except discord.NotFound:
+                    print(f"❌ [置底任务] 频道不存在或无法访问，任务为频道 {getattr(channel, 'name', 'unknown')} 自动停止。")
+                    await protection_db.remove_bump_config(channel.id)
+                    if channel.id in self.bump_tasks:
+                        del self.bump_tasks[channel.id]
+                    break
                 except discord.Forbidden:
                     print(f"❌ [置底任务] 权限不足，任务为频道 {channel.name} 自动停止。")
                     await protection_db.remove_bump_config(channel.id)

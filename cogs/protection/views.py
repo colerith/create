@@ -244,13 +244,12 @@ class ProtectionDraftView(ui.View):
         await i.response.edit_message(content="操作已取消。", embed=None, view=None); self.stop()
 
     async def publish(self, interaction: discord.Interaction):
-        files_to_send, file_metadata = [], []
+        prepared_files = []
         try:
             for idx, att in enumerate(self.attachments):
                 file_bytes = await att.read()
                 final_filename = self.custom_names.get(idx, att.filename)
-                f = discord.File(io.BytesIO(file_bytes), filename=final_filename)
-                files_to_send.append(f)
+                prepared_files.append((file_bytes, final_filename))
         except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
 
         stored_data = []
@@ -258,12 +257,21 @@ class ProtectionDraftView(ui.View):
             # 优先私信，失败转存备份频道
             try:
                 dm = await self.user.create_dm()
-                backup_msg = await dm.send(content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)", files=files_to_send)
-            except:
+                dm_files = [discord.File(io.BytesIO(file_bytes), filename=final_filename) for file_bytes, final_filename in prepared_files]
+                backup_msg = await dm.send(
+                    content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)",
+                    files=dm_files
+                )
+            except Exception as e:
+                print(f"DM backup failed: {e}")
                 # Fallback
                 fallback_channel = self.bot.get_channel(BACKUP_CHANNEL_ID)
                 if not fallback_channel: fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
-                backup_msg = await fallback_channel.send(content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}", files=files_to_send)
+                fallback_files = [discord.File(io.BytesIO(file_bytes), filename=final_filename) for file_bytes, final_filename in prepared_files]
+                backup_msg = await fallback_channel.send(
+                    content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}",
+                    files=fallback_files
+                )
 
             for i, att in enumerate(backup_msg.attachments):
                 real_display_name = self.custom_names.get(i, self.attachments[i].filename)
