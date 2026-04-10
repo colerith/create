@@ -33,6 +33,7 @@ from .modals import (
 
 
 FILE_EDIT_PAGE_SIZE = 15
+UPLOAD_SESSION_TIMEOUT_SECONDS = 300
 FILE_TAG_OPTIONS = [
     "角色卡",
     "正则",
@@ -635,6 +636,64 @@ class PublishedTagBatchView(BaseFileTagView):
                 (json.dumps(self.file_data), self.message_id),
             )
             await db.commit()
+
+
+class UploadSessionControlView(ui.View):
+    def __init__(self, cog, user_id, channel_id):
+        super().__init__(timeout=UPLOAD_SESSION_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.user_id = user_id
+        self.channel_id = channel_id
+
+    def _build_embed(self):
+        session = self.cog.get_upload_session(self.user_id, self.channel_id)
+        if not session:
+            return discord.Embed(
+                title="📥 附件收集中",
+                description="当前收集会话已结束或已失效。",
+                color=discord.Color.red(),
+            )
+
+        attachment_count = sum(len(msg.attachments) for msg in session["messages"])
+        msg_count = len(session["messages"])
+        expire_text = discord.utils.format_dt(session["expires_at"], "R")
+        embed = discord.Embed(
+            title="📥 保护附件收集中",
+            color=0x87CEEB,
+            description=(
+                "接下来 5 分钟内，你在当前频道发送的带附件消息都会加入本次保护附件草稿。\n"
+                "推荐做法：直接正常发送文件，全部发完后点下方 `上传完毕`。"
+            ),
+        )
+        embed.add_field(name="已收集消息", value=str(msg_count), inline=True)
+        embed.add_field(name="已收集附件", value=str(attachment_count), inline=True)
+        embed.add_field(name="截止时间", value=expire_text, inline=True)
+        embed.add_field(
+            name="说明",
+            value="此流程绕开 slash 附件参数，优先保留普通消息附件原始文件名。",
+            inline=False,
+        )
+        return embed
+
+    @ui.button(label="刷新状态", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def refresh_status(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(
+            embed=self._build_embed(),
+            view=self,
+        )
+
+    @ui.button(label="上传完毕", style=discord.ButtonStyle.success, emoji="✅")
+    async def finish_upload(self, interaction: discord.Interaction, button: ui.Button):
+        await self.cog.finish_upload_session(interaction, self.user_id, self.channel_id)
+
+    @ui.button(label="取消上传", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def cancel_upload(self, interaction: discord.Interaction, button: ui.Button):
+        await self.cog.cancel_upload_session(
+            interaction,
+            self.user_id,
+            self.channel_id,
+            reason="已取消本次附件收集。",
+        )
 
 
 # --- 草稿/发布视图 ---

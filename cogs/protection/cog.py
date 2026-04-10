@@ -3,7 +3,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import asyncio
 import random
@@ -12,7 +12,14 @@ import random
 from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
 from . import db as protection_db
 from .utils import is_valid_comment, extract_trace_from_bytes
-from .views import ProtectionDraftView, PostListView, PostSelectionView, BumpButtonView
+from .views import (
+    ProtectionDraftView,
+    PostListView,
+    PostSelectionView,
+    BumpButtonView,
+    UploadSessionControlView,
+    UPLOAD_SESSION_TIMEOUT_SECONDS,
+)
 
 
 class ProtectionCog(commands.Cog):
@@ -23,6 +30,7 @@ class ProtectionCog(commands.Cog):
         )
         self.bot.tree.add_command(self.ctx_menu)
         self.bump_tasks = {}
+        self.upload_sessions = {}
 
     maker_group = app_commands.Group(
         name="贴主", description="[贴主] 附件保护发布与管理工具"
@@ -146,13 +154,119 @@ class ProtectionCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not isinstance(message.channel, discord.Thread):
+        if message.author.bot:
+            return
+
+        await self._collect_upload_session_message(message)
+
+        if not isinstance(message.channel, discord.Thread):
             return
 
         if is_valid_comment(message.content):
             await protection_db.add_or_update_comment(
                 message.author.id, message.channel.id, message.content
             )
+
+    def _session_key(self, user_id: int, channel_id: int):
+        return (user_id, channel_id)
+
+    def get_upload_session(self, user_id: int, channel_id: int):
+        return self.upload_sessions.get(self._session_key(user_id, channel_id))
+
+    async def _collect_upload_session_message(self, message: discord.Message):
+        if not message.attachments:
+            return
+
+        key = self._session_key(message.author.id, message.channel.id)
+        session = self.upload_sessions.get(key)
+        if not session:
+            return
+
+        now = datetime.now(TZ_SHANGHAI)
+        if now >= session["expires_at"]:
+            self.upload_sessions.pop(key, None)
+            return
+
+        if any(saved.id == message.id for saved in session["messages"]):
+            return
+
+        session["messages"].append(message)
+        print(
+            f"[ProtectionDebug] upload-session-collected: user={message.author.id} channel={message.channel.id} message={message.id} attachments={len(message.attachments)}"
+        )
+
+    async def _expire_upload_session(
+        self, user_id: int, channel_id: int, expires_at: datetime
+    ):
+        delay = max((expires_at - datetime.now(TZ_SHANGHAI)).total_seconds(), 0)
+        try:
+            await asyncio.sleep(delay)
+            key = self._session_key(user_id, channel_id)
+            session = self.upload_sessions.get(key)
+            if not session or session["expires_at"] != expires_at:
+                return
+            self.upload_sessions.pop(key, None)
+            print(
+                f"[ProtectionDebug] upload-session-expired: user={user_id} channel={channel_id} messages={len(session['messages'])}"
+            )
+        except asyncio.CancelledError:
+            pass
+
+    async def cancel_upload_session(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+        channel_id: int,
+        reason: str,
+    ):
+        key = self._session_key(user_id, channel_id)
+        session = self.upload_sessions.pop(key, None)
+        if session and session.get("task"):
+            session["task"].cancel()
+        await interaction.response.edit_message(content=reason, embed=None, view=None)
+
+    async def finish_upload_session(
+        self, interaction: discord.Interaction, user_id: int, channel_id: int
+    ):
+        key = self._session_key(user_id, channel_id)
+        session = self.upload_sessions.pop(key, None)
+        if not session:
+            return await interaction.response.edit_message(
+                content="❌ 当前没有可提交的附件收集会话。",
+                embed=None,
+                view=None,
+            )
+
+        if session.get("task"):
+            session["task"].cancel()
+
+        attachments = []
+        default_log_parts = []
+        source_messages = session["messages"]
+        for msg in source_messages:
+            attachments.extend(msg.attachments)
+            if msg.content:
+                default_log_parts.append(msg.content)
+
+        if not attachments:
+            return await interaction.response.edit_message(
+                content="❌ 还没有收集到任何附件，请先发送带附件的消息。",
+                embed=None,
+                view=None,
+            )
+
+        target_message = source_messages[0] if len(source_messages) == 1 else None
+        default_log = "\n\n".join(default_log_parts).strip() or None
+        view = ProtectionDraftView(
+            self.bot,
+            interaction.user,
+            attachments,
+            target_message=target_message,
+            default_log=default_log,
+        )
+        embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await view.update_dashboard(interaction)
 
     # --- 管理员命令 ---
     @admin_group.command(name="修复面板", description="移除本频道所有旧面板的按钮")
@@ -316,46 +430,41 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         await view.update_dashboard(interaction)
 
-    @maker_group.command(name="发布保护附件", description="上传文件并创建保护贴")
-    async def create_protection(
-        self,
-        interaction: discord.Interaction,
-        file1: discord.Attachment,
-        file2: discord.Attachment = None,
-        file3: discord.Attachment = None,
-        file4: discord.Attachment = None,
-        file5: discord.Attachment = None,
-        file6: discord.Attachment = None,
-        file7: discord.Attachment = None,
-        file8: discord.Attachment = None,
-        file9: discord.Attachment = None,
-        file10: discord.Attachment = None,
-    ):
-        attachments = [
-            f
-            for f in [
-                file1,
-                file2,
-                file3,
-                file4,
-                file5,
-                file6,
-                file7,
-                file8,
-                file9,
-                file10,
-            ]
-            if f
-        ]
-        if not attachments:
-            return await interaction.response.send_message(
-                "请至少上传一个文件！", ephemeral=True
-            )
+    @maker_group.command(
+        name="发布保护附件", description="开启 5 分钟附件收集并创建保护贴"
+    )
+    async def create_protection(self, interaction: discord.Interaction):
+        key = self._session_key(interaction.user.id, interaction.channel.id)
+        old_session = self.upload_sessions.pop(key, None)
+        if old_session and old_session.get("task"):
+            old_session["task"].cancel()
 
-        view = ProtectionDraftView(self.bot, interaction.user, attachments)
-        embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        await view.update_dashboard(interaction)
+        expires_at = datetime.now(TZ_SHANGHAI) + timedelta(
+            seconds=UPLOAD_SESSION_TIMEOUT_SECONDS
+        )
+        task = self.bot.loop.create_task(
+            self._expire_upload_session(
+                interaction.user.id, interaction.channel.id, expires_at
+            )
+        )
+        self.upload_sessions[key] = {
+            "messages": [],
+            "expires_at": expires_at,
+            "task": task,
+        }
+
+        print(
+            f"[ProtectionDebug] upload-session-started: user={interaction.user.id} channel={interaction.channel.id} expires_at={expires_at.isoformat()}"
+        )
+
+        view = UploadSessionControlView(
+            self, interaction.user.id, interaction.channel.id
+        )
+        await interaction.response.send_message(
+            embed=view._build_embed(),
+            view=view,
+            ephemeral=True,
+        )
 
     @maker_group.command(
         name="置底附件列表", description="开启/关闭本频道附件列表的自动置底"
