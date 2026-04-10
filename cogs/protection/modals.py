@@ -5,7 +5,6 @@ from discord import ui
 import os
 import json
 import asyncio
-import re
 from .utils import check_requirements_common
 
 
@@ -43,47 +42,6 @@ def ensure_filename_with_extension(name_text: str, fallback_filename: str):
     if fallback_ext and not os.path.splitext(clean_name)[1]:
         return f"{clean_name}{fallback_ext}"
     return clean_name
-
-
-def build_bulk_edit_text(file_entries):
-    lines = []
-    for idx, entry in enumerate(file_entries, start=1):
-        tag = entry.get("tag") or ""
-        lines.append(f"{idx}. {entry['filename']} | {tag}")
-    return "\n".join(lines)
-
-
-def apply_bulk_edit_text(file_entries, raw_text: str):
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    if not lines:
-        raise ValueError("请至少保留一行文件配置")
-
-    index_pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
-    touched = set()
-
-    for line in lines:
-        match = index_pattern.match(line)
-        if not match:
-            raise ValueError(f"无法解析这一行：{line}")
-
-        file_index = int(match.group(1)) - 1
-        if not 0 <= file_index < len(file_entries):
-            raise ValueError(f"文件序号超出范围：{file_index + 1}")
-
-        content = match.group(2).strip()
-        if "|" in content:
-            name_text, tag_text = content.split("|", 1)
-        else:
-            name_text, tag_text = content, None
-
-        entry = file_entries[file_index]
-        entry["filename"] = ensure_filename_with_extension(
-            name_text.strip(), entry.get("original_filename") or entry["filename"]
-        )
-        entry["tag"] = normalize_file_tag(tag_text)
-        touched.add(file_index)
-
-    return len(touched)
 
 
 class DraftTitleModal(ui.Modal, title="设置标题"):
@@ -192,80 +150,6 @@ class RenameFileModal(ui.Modal, title="重命名文件"):
         await self.view_ref.update_dashboard(interaction)
         await interaction.followup.send(
             f"✅ 文件已重命名为：`{new_full_name}`", ephemeral=True
-        )
-
-
-class DraftBulkFileEditModal(ui.Modal, title="批量编辑文件"):
-    entries_input = ui.TextInput(
-        label="每行: 序号. 文件名 | 标签",
-        style=discord.TextStyle.paragraph,
-        placeholder=(
-            "1. 角色卡-主包.png | 角色卡\n"
-            "2. 正则合集.json | 正则\n"
-            "标签可选: 角色卡 / 正则 / 预设 / 快速回复 / 酒馆助手脚本 / 美化 / 世界书 / 其他"
-        ),
-        max_length=4000,
-    )
-
-    def __init__(self, view_ref):
-        super().__init__()
-        self.view_ref = view_ref
-        self.entries_input.default = build_bulk_edit_text(view_ref.file_entries)[:4000]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            changed_count = apply_bulk_edit_text(
-                self.view_ref.file_entries, self.entries_input.value
-            )
-        except ValueError as exc:
-            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True)
-        await self.view_ref.update_dashboard(interaction)
-        await interaction.followup.send(
-            f"✅ 已批量更新 {changed_count} 个文件的名称/标签。",
-            ephemeral=True,
-        )
-
-
-class PublishedBulkFileEditModal(ui.Modal, title="批量编辑已发布文件"):
-    entries_input = ui.TextInput(
-        label="每行: 序号. 文件名 | 标签",
-        style=discord.TextStyle.paragraph,
-        placeholder=(
-            "1. 角色卡-主包.png | 角色卡\n"
-            "2. 正则合集.json | 正则\n"
-            "标签可选: 角色卡 / 正则 / 预设 / 快速回复 / 酒馆助手脚本 / 美化 / 世界书 / 其他"
-        ),
-        max_length=4000,
-    )
-
-    def __init__(self, message_id, file_data):
-        super().__init__()
-        self.message_id = message_id
-        self.file_data = file_data
-        self.entries_input.default = build_bulk_edit_text(file_data)[:4000]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            changed_count = apply_bulk_edit_text(
-                self.file_data, self.entries_input.value
-            )
-        except ValueError as exc:
-            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-
-        from ..core.db import get_db
-
-        async with get_db() as db:
-            await db.execute(
-                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
-                (json.dumps(self.file_data), self.message_id),
-            )
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"✅ 已批量更新 {changed_count} 个已发布文件的名称/标签。",
-            ephemeral=True,
         )
 
 

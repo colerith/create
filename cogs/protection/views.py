@@ -33,11 +33,69 @@ from .modals import (
 
 
 FILE_EDIT_PAGE_SIZE = 15
+FILE_TAG_OPTIONS = [
+    "角色卡",
+    "正则",
+    "预设",
+    "快速回复",
+    "酒馆助手脚本",
+    "美化",
+    "世界书",
+    "其他",
+]
+
+
+def log_attachment_debug(stage, attachment):
+    attr_names = [
+        "id",
+        "filename",
+        "title",
+        "description",
+        "content_type",
+        "size",
+        "url",
+        "proxy_url",
+        "ephemeral",
+    ]
+    payload = {}
+    for name in attr_names:
+        try:
+            payload[name] = getattr(attachment, name, None)
+        except Exception as exc:
+            payload[name] = f"<error:{exc}>"
+
+    try:
+        if hasattr(attachment, "to_dict"):
+            raw_dict = attachment.to_dict()
+            payload["raw_keys"] = sorted(raw_dict.keys())
+            payload["raw_title"] = raw_dict.get("title")
+            payload["raw_filename"] = raw_dict.get("filename")
+            payload["raw_description"] = raw_dict.get("description")
+    except Exception as exc:
+        payload["raw_dict_error"] = str(exc)
+
+    for extra_name in ["_payload", "__dict__"]:
+        try:
+            extra_value = getattr(attachment, extra_name, None)
+            if isinstance(extra_value, dict):
+                payload[f"{extra_name}_keys"] = sorted(extra_value.keys())
+                payload[f"{extra_name}_title"] = extra_value.get("title")
+                payload[f"{extra_name}_filename"] = extra_value.get("filename")
+                payload[f"{extra_name}_description"] = extra_value.get("description")
+        except Exception as exc:
+            payload[f"{extra_name}_error"] = str(exc)
+
+    print(f"[ProtectionDebug] {stage}: {payload}")
 
 
 def get_attachment_original_name(attachment):
+    log_attachment_debug("attachment-name-detect", attachment)
     candidate = getattr(attachment, "title", None) or getattr(
         attachment, "filename", None
+    )
+    print(
+        "[ProtectionDebug] attachment-name-result:",
+        {"chosen_name": candidate or "unknown"},
     )
     return candidate or "unknown"
 
@@ -67,6 +125,37 @@ def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
     start = page_index * page_size
     end = start + page_size
     return start, end, file_entries[start:end]
+
+
+def apply_rename_lines_to_entries(entries, raw_text, start=None, end=None):
+    import re
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("请至少保留一行文件配置")
+
+    pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
+    updated = 0
+    for line in lines:
+        match = pattern.match(line)
+        if not match:
+            raise ValueError(f"无法解析这一行：{line}")
+        absolute_index = int(match.group(1)) - 1
+        if start is not None and end is not None and not start <= absolute_index < end:
+            raise ValueError("当前弹窗只能编辑当前页的文件")
+        if not 0 <= absolute_index < len(entries):
+            raise ValueError(f"文件序号超出范围：{absolute_index + 1}")
+
+        entry = entries[absolute_index]
+        new_name = match.group(2).strip()
+        if not new_name:
+            raise ValueError("文件名不能为空")
+        ext = os.path.splitext(entry["original_filename"])[1]
+        if ext and not os.path.splitext(new_name)[1]:
+            new_name = f"{new_name}{ext}"
+        entry["filename"] = new_name
+        updated += 1
+    return updated
 
 
 # --- 延迟下载视图 (核心修改区域) ---
@@ -270,10 +359,9 @@ class DraftBatchFileView(ui.View):
         start, end, entries = chunk_file_entries(
             self.protection_view.file_entries, self.page_index
         )
-        lines = ["每行格式: 序号. 文件名 | 标签", "标签不填可留空。", ""]
+        lines = ["每行格式: 序号. 文件名", "标签请使用单独的标签面板设置。", ""]
         for idx, entry in enumerate(entries, start=start + 1):
-            tag = entry.get("tag") or "无标签"
-            lines.append(f"{idx}. {entry['filename']} | {tag}")
+            lines.append(build_file_line(entry, idx))
         preview = "\n".join(lines)
         return start, end, preview[:1900]
 
@@ -298,9 +386,9 @@ class DraftBatchFileView(ui.View):
         await interaction.response.edit_message(content=preview, view=self)
 
 
-class DraftBulkFilePageModal(ui.Modal, title="批量编辑文件页"):
+class DraftBulkFilePageModal(ui.Modal, title="批量改文件名"):
     entries_input = ui.TextInput(
-        label="每行: 序号. 文件名 | 标签",
+        label="每行: 序号. 文件名",
         style=discord.TextStyle.paragraph,
         max_length=4000,
     )
@@ -314,62 +402,25 @@ class DraftBulkFilePageModal(ui.Modal, title="批量编辑文件页"):
         for idx, entry in enumerate(
             self.protection_view.file_entries[start:end], start=start + 1
         ):
-            tag = entry.get("tag") or ""
-            default_lines.append(f"{idx}. {entry['filename']} | {tag}")
+            default_lines.append(f"{idx}. {entry['filename']}")
         self.entries_input.default = "\n".join(default_lines)[:4000]
 
     async def on_submit(self, interaction: discord.Interaction):
-        text = self.entries_input.value
-
-        import re
-
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if not lines:
-            return await interaction.response.send_message(
-                "❌ 请至少保留一行文件配置。", ephemeral=True
+        try:
+            updated = apply_rename_lines_to_entries(
+                self.protection_view.file_entries,
+                self.entries_input.value,
+                self.start,
+                self.end,
             )
-
-        pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
-        updated = 0
-        for line in lines:
-            match = pattern.match(line)
-            if not match:
-                return await interaction.response.send_message(
-                    f"❌ 无法解析这一行：{line}", ephemeral=True
-                )
-            absolute_index = int(match.group(1)) - 1
-            if not self.start <= absolute_index < self.end:
-                return await interaction.response.send_message(
-                    "❌ 当前弹窗只能编辑当前页的文件。", ephemeral=True
-                )
-            content = match.group(2).strip()
-            if "|" in content:
-                name_text, tag_text = content.split("|", 1)
-            else:
-                name_text, tag_text = content, None
-            entry = self.protection_view.file_entries[absolute_index]
-            new_name = name_text.strip()
-            if not new_name:
-                return await interaction.response.send_message(
-                    "❌ 文件名不能为空。", ephemeral=True
-                )
-            ext = os.path.splitext(entry["original_filename"])[1]
-            if ext and not os.path.splitext(new_name)[1]:
-                new_name = f"{new_name}{ext}"
-            try:
-                entry["tag"] = normalize_file_tag(tag_text)
-            except ValueError as exc:
-                return await interaction.response.send_message(
-                    f"❌ {exc}", ephemeral=True
-                )
-            entry["filename"] = new_name
-            updated += 1
+        except ValueError as exc:
+            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
 
         self.protection_view.sync_custom_names_from_entries()
         await interaction.response.defer(ephemeral=True)
         await self.protection_view.update_dashboard(interaction)
         await interaction.followup.send(
-            f"✅ 已更新当前页 {updated} 个文件。", ephemeral=True
+            f"✅ 已更新当前页 {updated} 个文件名。", ephemeral=True
         )
 
 
@@ -391,9 +442,9 @@ class PublishedBatchFileView(ui.View):
 
     def build_preview(self):
         start, end, entries = chunk_file_entries(self.file_data, self.page_index)
-        lines = ["每行格式: 序号. 文件名 | 标签", "标签不填可留空。", ""]
+        lines = ["每行格式: 序号. 文件名", "标签请用下方按钮选择。", ""]
         for idx, entry in enumerate(entries, start=start + 1):
-            lines.append(f"{idx}. {entry['filename']} | {entry.get('tag') or '无标签'}")
+            lines.append(build_file_line(entry, idx))
         return start, end, "\n".join(lines)[:1900]
 
     @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
@@ -418,9 +469,9 @@ class PublishedBatchFileView(ui.View):
         await interaction.response.edit_message(content=preview, view=self)
 
 
-class PublishedBulkFilePageModal(ui.Modal, title="批量编辑已发布文件页"):
+class PublishedBulkFilePageModal(ui.Modal, title="批量改已发布文件名"):
     entries_input = ui.TextInput(
-        label="每行: 序号. 文件名 | 标签",
+        label="每行: 序号. 文件名",
         style=discord.TextStyle.paragraph,
         max_length=4000,
     )
@@ -433,59 +484,19 @@ class PublishedBulkFilePageModal(ui.Modal, title="批量编辑已发布文件页
         self.end = end
         default_lines = []
         for idx, entry in enumerate(self.file_data[start:end], start=start + 1):
-            default_lines.append(
-                f"{idx}. {entry['filename']} | {entry.get('tag') or ''}"
-            )
+            default_lines.append(f"{idx}. {entry['filename']}")
         self.entries_input.default = "\n".join(default_lines)[:4000]
 
     async def on_submit(self, interaction: discord.Interaction):
-        import re
-
-        lines = [
-            line.strip()
-            for line in self.entries_input.value.splitlines()
-            if line.strip()
-        ]
-        if not lines:
-            return await interaction.response.send_message(
-                "❌ 请至少保留一行文件配置。", ephemeral=True
+        try:
+            updated = apply_rename_lines_to_entries(
+                self.file_data,
+                self.entries_input.value,
+                self.start,
+                self.end,
             )
-
-        pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
-        updated = 0
-        for line in lines:
-            match = pattern.match(line)
-            if not match:
-                return await interaction.response.send_message(
-                    f"❌ 无法解析这一行：{line}", ephemeral=True
-                )
-            absolute_index = int(match.group(1)) - 1
-            if not self.start <= absolute_index < self.end:
-                return await interaction.response.send_message(
-                    "❌ 当前弹窗只能编辑当前页的文件。", ephemeral=True
-                )
-            content = match.group(2).strip()
-            if "|" in content:
-                name_text, tag_text = content.split("|", 1)
-            else:
-                name_text, tag_text = content, None
-            entry = self.file_data[absolute_index]
-            new_name = name_text.strip()
-            if not new_name:
-                return await interaction.response.send_message(
-                    "❌ 文件名不能为空。", ephemeral=True
-                )
-            ext = os.path.splitext(entry["original_filename"])[1]
-            if ext and not os.path.splitext(new_name)[1]:
-                new_name = f"{new_name}{ext}"
-            try:
-                entry["tag"] = normalize_file_tag(tag_text)
-            except ValueError as exc:
-                return await interaction.response.send_message(
-                    f"❌ {exc}", ephemeral=True
-                )
-            entry["filename"] = new_name
-            updated += 1
+        except ValueError as exc:
+            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
 
         async with get_db() as db:
             await db.execute(
@@ -495,8 +506,135 @@ class PublishedBulkFilePageModal(ui.Modal, title="批量编辑已发布文件页
             await db.commit()
 
         await interaction.response.send_message(
-            f"✅ 已更新当前页 {updated} 个已发布文件。", ephemeral=True
+            f"✅ 已更新当前页 {updated} 个已发布文件名。", ephemeral=True
         )
+
+
+class FileTagSelect(ui.Select):
+    def __init__(self, owner_view, file_index):
+        self.owner_view = owner_view
+        self.file_index = file_index
+        entry = owner_view.get_entry(file_index)
+        current_tag = entry.get("tag")
+        options = [
+            discord.SelectOption(
+                label="无标签", value="__none__", default=current_tag is None
+            )
+        ]
+        for tag in FILE_TAG_OPTIONS:
+            options.append(
+                discord.SelectOption(label=tag, value=tag, default=current_tag == tag)
+            )
+        super().__init__(
+            placeholder=f"为文件 {file_index + 1} 选择标签",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        tag_value = None if selected == "__none__" else selected
+        await self.owner_view.apply_tag(interaction, self.file_index, tag_value)
+
+
+class BaseFileTagView(ui.View):
+    def __init__(self, page_index=0, timeout=120):
+        super().__init__(timeout=timeout)
+        self.page_index = page_index
+
+    def get_entries(self):
+        raise NotImplementedError
+
+    def get_entry(self, index):
+        return self.get_entries()[index]
+
+    async def persist(self):
+        return None
+
+    async def apply_tag(self, interaction, file_index, tag_value):
+        entry = self.get_entry(file_index)
+        entry["tag"] = tag_value
+        await self.persist()
+        self.refresh_components()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+    def refresh_components(self):
+        self.clear_items()
+        self._update_button_state()
+        start, end, _ = chunk_file_entries(self.get_entries(), self.page_index)
+        for file_index in range(start, end):
+            self.add_item(FileTagSelect(self, file_index))
+        self.add_item(self.btn_prev)
+        self.add_item(self.btn_next)
+
+    def _update_button_state(self):
+        self.btn_prev.disabled = self.page_index <= 0
+        self.btn_next.disabled = self.page_index >= self.total_pages - 1
+
+    def build_preview(self):
+        start, end, entries = chunk_file_entries(self.get_entries(), self.page_index)
+        lines = ["请选择每个文件的标签：", ""]
+        for idx, entry in enumerate(entries, start=start + 1):
+            lines.append(build_file_line(entry, idx))
+        return start, end, "\n".join(lines)[:1900]
+
+    @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
+    async def btn_prev(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index -= 1
+        self.refresh_components()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+    @ui.button(label="下一页", style=discord.ButtonStyle.secondary)
+    async def btn_next(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index += 1
+        self.refresh_components()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+
+class DraftTagBatchView(BaseFileTagView):
+    def __init__(self, protection_view, page_index=0):
+        self.protection_view = protection_view
+        self.total_pages = max(
+            1,
+            (len(self.protection_view.file_entries) + FILE_EDIT_PAGE_SIZE - 1)
+            // FILE_EDIT_PAGE_SIZE,
+        )
+        super().__init__(page_index=page_index, timeout=120)
+        self.refresh_components()
+
+    def get_entries(self):
+        return self.protection_view.file_entries
+
+    async def persist(self):
+        self.protection_view.sync_custom_names_from_entries()
+
+
+class PublishedTagBatchView(BaseFileTagView):
+    def __init__(self, message_id, file_data, page_index=0):
+        self.message_id = message_id
+        self.file_data = file_data
+        self.total_pages = max(
+            1,
+            (len(self.file_data) + FILE_EDIT_PAGE_SIZE - 1) // FILE_EDIT_PAGE_SIZE,
+        )
+        super().__init__(page_index=page_index, timeout=120)
+        self.refresh_components()
+
+    def get_entries(self):
+        return self.file_data
+
+    async def persist(self):
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                (json.dumps(self.file_data), self.message_id),
+            )
+            await db.commit()
 
 
 # --- 草稿/发布视图 ---
@@ -513,16 +651,18 @@ class ProtectionDraftView(ui.View):
         self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
-        self.file_entries = [
-            ensure_file_entry_defaults(
-                {
-                    "filename": get_attachment_original_name(att),
-                    "original_filename": get_attachment_original_name(att),
-                    "tag": None,
-                }
+        self.file_entries = []
+        for att in attachments:
+            original_name = get_attachment_original_name(att)
+            self.file_entries.append(
+                ensure_file_entry_defaults(
+                    {
+                        "filename": original_name,
+                        "original_filename": original_name,
+                        "tag": None,
+                    }
+                )
             )
-            for att in attachments
-        ]
         self.custom_names = {
             idx: entry["filename"]
             for idx, entry in enumerate(self.file_entries)
@@ -613,6 +753,12 @@ class ProtectionDraftView(ui.View):
     )
     async def btn_batch_edit_files(self, i: discord.Interaction, b: ui.Button):
         view = DraftBatchFileView(self)
+        _, _, preview = view.build_preview()
+        await i.response.send_message(preview, view=view, ephemeral=True)
+
+    @ui.button(label="设置标签", style=discord.ButtonStyle.secondary, row=1, emoji="🏷️")
+    async def btn_set_tags(self, i: discord.Interaction, b: ui.Button):
+        view = DraftTagBatchView(self)
         _, _, preview = view.build_preview()
         await i.response.send_message(preview, view=view, ephemeral=True)
 
@@ -1064,8 +1210,14 @@ class PostManagementView(ui.View):
         _, _, preview = view.build_preview()
         await interaction.response.send_message(preview, view=view, ephemeral=True)
 
+    @ui.button(label="设置标签", style=discord.ButtonStyle.secondary, row=1, emoji="🏷️")
+    async def set_tags(self, interaction: discord.Interaction, button: ui.Button):
+        view = PublishedTagBatchView(self.message_id, self.file_data)
+        _, _, preview = view.build_preview()
+        await interaction.response.send_message(preview, view=view, ephemeral=True)
+
     # 第二排：逻辑修改与删除
-    @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=1)
+    @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=2)
     async def change_mode(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message(
             "请选择新的验证模式：",
@@ -1073,7 +1225,7 @@ class PostManagementView(ui.View):
             ephemeral=True,
         )
 
-    @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger, row=1)
+    @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger, row=2)
     async def delete_post(self, interaction: discord.Interaction, button: ui.Button):
         # 双重确认可以防止误删，但作为管理工具直接执行也行，这里直接执行
         async with get_db() as db:
