@@ -43,12 +43,14 @@ class StatisticsContainerView(ui.LayoutView):
         stats_data: dict,
         cog_instance=None,
         panel_message_id: int | None = None,
+        forum_channel_id: int | None = None,
         current_page: str = "hot",
     ):
         super().__init__(timeout=None)
         self.stats_data = stats_data
         self.cog = cog_instance
         self.panel_message_id = panel_message_id
+        self.forum_channel_id = forum_channel_id or stats_data.get("forum_channel_id")
         self.current_page = current_page
         self.update_view()
 
@@ -175,7 +177,7 @@ class StatisticsContainerView(ui.LayoutView):
         self.btn_refresh_info = ui.Button(
             label=f"数据更新于 {update_time_str} (UTC+8)",
             style=discord.ButtonStyle.secondary,
-            custom_id="stats_manual_refresh_btn",
+            custom_id=f"stats_manual_refresh_btn:{self.forum_channel_id or 0}",
             emoji="🔄",
         )
         self.btn_refresh_info.callback = self.on_refresh_button_click
@@ -202,22 +204,36 @@ class StatisticsContainerView(ui.LayoutView):
                 "统计面板刷新实例未注册，暂时无法使用该按钮。", ephemeral=True
             )
 
-        await interaction.response.defer(thinking=True)
-        panel_info = await statistics_db.get_statistics_panel(interaction.message.id)
-        if not panel_info:
-            return await interaction.followup.send(
-                "找不到这个统计面板的绑定记录，无法刷新。", ephemeral=True
-            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        forum_channel_id = self.forum_channel_id
+        custom_id = interaction.data.get("custom_id") if interaction.data else None
+        if not forum_channel_id and custom_id and ":" in custom_id:
+            _, forum_id_raw = custom_id.split(":", 1)
+            if forum_id_raw.isdigit() and int(forum_id_raw) > 0:
+                forum_channel_id = int(forum_id_raw)
 
-        guild = interaction.client.get_guild(panel_info["guild_id"])
+        guild = interaction.guild
         forum_channel = (
-            guild.get_channel(panel_info["forum_channel_id"]) if guild else None
+            guild.get_channel(forum_channel_id) if guild and forum_channel_id else None
         )
 
         if not isinstance(forum_channel, discord.ForumChannel):
-            return await interaction.followup.send(
-                "原始论坛频道不存在或已不可访问，无法刷新。", ephemeral=True
+            panel_info = await statistics_db.get_statistics_panel(
+                interaction.message.id
             )
+            if panel_info:
+                guild = interaction.client.get_guild(panel_info["guild_id"])
+                forum_channel = (
+                    guild.get_channel(panel_info["forum_channel_id"]) if guild else None
+                )
+                forum_channel_id = panel_info["forum_channel_id"]
+
+        if not isinstance(forum_channel, discord.ForumChannel):
+            return await interaction.followup.send(
+                "找不到这个统计面板关联的论坛频道，无法刷新。", ephemeral=True
+            )
+
+        self.forum_channel_id = forum_channel_id
 
         stats_data = await self.cog.gather_statistics(forum_channel)
         if not stats_data:
@@ -229,6 +245,7 @@ class StatisticsContainerView(ui.LayoutView):
             stats_data=stats_data,
             cog_instance=self.cog,
             panel_message_id=interaction.message.id,
+            forum_channel_id=forum_channel_id,
             current_page=self.current_page,
         )
         await interaction.message.edit(view=refreshed_view)
@@ -285,8 +302,7 @@ class ForumSelectView(ui.View):
 
         button.disabled = True
         self.channel_select.disabled = True
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content=f"⏳ 开始为 **{len(selected_channels)}** 个频道生成统计面板...",
             view=self,
         )
@@ -299,13 +315,20 @@ class ForumSelectView(ui.View):
                 failed_channels.append(channel.mention)
                 continue
 
-            view = StatisticsContainerView(stats_data=stats_data, cog_instance=self.cog)
+            view = StatisticsContainerView(
+                stats_data=stats_data,
+                cog_instance=self.cog,
+                forum_channel_id=channel.id,
+            )
             msg = await interaction.channel.send(view=view)
             await statistics_db.add_statistics_panel(
                 msg.id, msg.channel.id, channel.id, interaction.guild.id
             )
             refreshed_view = StatisticsContainerView(
-                stats_data=stats_data, cog_instance=self.cog, panel_message_id=msg.id
+                stats_data=stats_data,
+                cog_instance=self.cog,
+                panel_message_id=msg.id,
+                forum_channel_id=channel.id,
             )
             await msg.edit(view=refreshed_view)
             created_channels.append(channel.mention)

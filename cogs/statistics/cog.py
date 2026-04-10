@@ -229,6 +229,7 @@ class StatisticsCog(commands.Cog):
         cached_threads = await statistics_db.get_cached_forum_threads(forum.id)
         if not cached_threads:
             return {
+                "forum_channel_id": forum.id,
                 "channel_name": forum.name,
                 "channel_icon_url": forum.guild.icon.url if forum.guild.icon else None,
                 "total_threads": 0,
@@ -276,6 +277,7 @@ class StatisticsCog(commands.Cog):
         cold_threads = older_threads[:15]
 
         return {
+            "forum_channel_id": forum.id,
             "channel_name": forum.name,
             "channel_icon_url": forum.guild.icon.url if forum.guild.icon else None,
             "total_threads": total_threads,
@@ -392,6 +394,7 @@ class StatisticsCog(commands.Cog):
                         stats_data=stats_data,
                         cog_instance=self,
                         panel_message_id=msg.id,
+                        forum_channel_id=forum_channel.id,
                     )
                     await msg.edit(view=new_view)
                     print(f"- [成功] 已刷新版面 {msg.id} (关于 {forum_channel.name})")
