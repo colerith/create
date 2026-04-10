@@ -195,6 +195,15 @@ class ProtectionCog(commands.Cog):
             f"[ProtectionDebug] upload-session-collected: user={message.author.id} channel={message.channel.id} message={message.id} attachments={len(message.attachments)}"
         )
 
+        try:
+            await message.reply(
+                "🔒 已收纳到保护附件草稿，待贴主确认发布后才会转为正式保护附件。",
+                mention_author=False,
+                delete_after=20,
+            )
+        except Exception:
+            pass
+
     async def _expire_upload_session(
         self, user_id: int, channel_id: int, expires_at: datetime
     ):
@@ -255,7 +264,15 @@ class ProtectionCog(commands.Cog):
                 view=None,
             )
 
-        target_message = source_messages[0] if len(source_messages) == 1 else None
+        for msg in source_messages:
+            try:
+                await msg.delete()
+            except Exception as exc:
+                print(
+                    f"[ProtectionDebug] upload-session-delete-source-failed: message={msg.id} error={exc}"
+                )
+
+        target_message = None
         default_log = "\n\n".join(default_log_parts).strip() or None
         view = ProtectionDraftView(
             self.bot,

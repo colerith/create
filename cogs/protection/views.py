@@ -511,10 +511,40 @@ class PublishedBulkFilePageModal(ui.Modal, title="批量改已发布文件名"):
         )
 
 
-class FileTagSelect(ui.Select):
-    def __init__(self, owner_view, file_index):
+class FileTargetSelect(ui.Select):
+    def __init__(self, owner_view):
         self.owner_view = owner_view
-        self.file_index = file_index
+        start, end, entries = chunk_file_entries(
+            owner_view.get_entries(), owner_view.page_index
+        )
+        options = []
+        for idx, entry in enumerate(entries, start=start):
+            options.append(
+                discord.SelectOption(
+                    label=build_file_line(entry, idx + 1)[:100],
+                    value=str(idx),
+                    default=idx == owner_view.selected_file_index,
+                )
+            )
+        super().__init__(
+            placeholder="选择要设置标签的文件",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.owner_view.selected_file_index = int(self.values[0])
+        self.owner_view.refresh_components()
+        _, _, preview = self.owner_view.build_preview()
+        await interaction.response.edit_message(content=preview, view=self.owner_view)
+
+
+class FileTagSelect(ui.Select):
+    def __init__(self, owner_view):
+        self.owner_view = owner_view
+        file_index = owner_view.selected_file_index
         entry = owner_view.get_entry(file_index)
         current_tag = entry.get("tag")
         options = [
@@ -531,19 +561,22 @@ class FileTagSelect(ui.Select):
             options=options,
             min_values=1,
             max_values=1,
-            row=0,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction):
         selected = self.values[0]
         tag_value = None if selected == "__none__" else selected
-        await self.owner_view.apply_tag(interaction, self.file_index, tag_value)
+        await self.owner_view.apply_tag(
+            interaction, self.owner_view.selected_file_index, tag_value
+        )
 
 
 class BaseFileTagView(ui.View):
     def __init__(self, page_index=0, timeout=120):
         super().__init__(timeout=timeout)
         self.page_index = page_index
+        self.selected_file_index = 0
 
     def get_entries(self):
         raise NotImplementedError
@@ -566,8 +599,10 @@ class BaseFileTagView(ui.View):
         self.clear_items()
         self._update_button_state()
         start, end, _ = chunk_file_entries(self.get_entries(), self.page_index)
-        for file_index in range(start, end):
-            self.add_item(FileTagSelect(self, file_index))
+        if self.selected_file_index < start or self.selected_file_index >= end:
+            self.selected_file_index = start
+        self.add_item(FileTargetSelect(self))
+        self.add_item(FileTagSelect(self))
         self.add_item(self.btn_prev)
         self.add_item(self.btn_next)
 
@@ -577,9 +612,10 @@ class BaseFileTagView(ui.View):
 
     def build_preview(self):
         start, end, entries = chunk_file_entries(self.get_entries(), self.page_index)
-        lines = ["请选择每个文件的标签：", ""]
+        lines = ["请选择文件后再设置标签：", ""]
         for idx, entry in enumerate(entries, start=start + 1):
-            lines.append(build_file_line(entry, idx))
+            prefix = "👉 " if idx - 1 == self.selected_file_index else "   "
+            lines.append(f"{prefix}{build_file_line(entry, idx)}")
         return start, end, "\n".join(lines)[:1900]
 
     @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
