@@ -4,6 +4,7 @@ import aiosqlite
 
 DB_NAME = "chimidan.db"
 
+
 async def init_db():
     """
     【统一入口】检查并初始化所有数据表。
@@ -34,7 +35,13 @@ async def init_db():
         except:
             pass
         try:
-            await db.execute("ALTER TABLE protected_items ADD COLUMN mention_users INTEGER DEFAULT 0")
+            await db.execute(
+                "ALTER TABLE protected_items ADD COLUMN mention_users INTEGER DEFAULT 0"
+            )
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE protected_items ADD COLUMN file_meta TEXT")
         except:
             pass
 
@@ -80,7 +87,9 @@ async def init_db():
                 created_at TEXT
             )
         """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_file_traces_user ON file_traces (user_id)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_traces_user ON file_traces (user_id)"
+        )
         # 6. 自动置底任务配置表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bump_config (
@@ -104,7 +113,9 @@ async def init_db():
             )
         """)
         # 为 panel_type 创建索引可以加快查询速度
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_panel_type ON panel_records (panel_type)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_panel_type ON panel_records (panel_type)"
+        )
 
         await db.commit()
     print("✅ 数据库初始化完成，所有表结构已就绪。")
@@ -114,32 +125,40 @@ def get_db():
     """获取数据库连接对象"""
     return aiosqlite.connect(DB_NAME)
 
+
 # === 面板记录辅助函数 ===
 
-async def get_panel_message_id(channel_id: int, panel_type: str = 'daily_report') -> int | None:
+
+async def get_panel_message_id(
+    channel_id: int, panel_type: str = "daily_report"
+) -> int | None:
     """根据频道ID和面板类型获取消息ID"""
     async with get_db() as db:
         cursor = await db.execute(
             "SELECT message_id FROM panel_records WHERE channel_id = ? AND panel_type = ?",
-            (channel_id, panel_type)
+            (channel_id, panel_type),
         )
         row = await cursor.fetchone()
         return row[0] if row else None
 
-async def set_panel_message_id(channel_id: int, message_id: int, panel_type: str = 'daily_report'):
+
+async def set_panel_message_id(
+    channel_id: int, message_id: int, panel_type: str = "daily_report"
+):
     """设置或更新面板的消息ID"""
     async with get_db() as db:
         await db.execute(
             "INSERT OR REPLACE INTO panel_records (channel_id, message_id, panel_type) VALUES (?, ?, ?)",
-            (channel_id, message_id, panel_type)
+            (channel_id, message_id, panel_type),
         )
         await db.commit()
 
-async def remove_panel_record(channel_id: int, panel_type: str = 'daily_report'):
+
+async def remove_panel_record(channel_id: int, panel_type: str = "daily_report"):
     """移除面板记录"""
     async with get_db() as db:
         await db.execute(
             "DELETE FROM panel_records WHERE channel_id = ? AND panel_type = ?",
-            (channel_id, panel_type)
+            (channel_id, panel_type),
         )
         await db.commit()

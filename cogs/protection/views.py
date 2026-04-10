@@ -10,7 +10,7 @@ import aiosqlite
 
 from datetime import datetime
 from ..core.db import get_db
-from .import db as protection_db
+from . import db as protection_db
 from .db import log_file_trace
 from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
 from .utils import (
@@ -18,10 +18,56 @@ from .utils import (
     make_discord_files_common,
     check_requirements_common,
     record_download_common,
-    inject_smart_trace, 
-    generate_trace_id 
+    inject_smart_trace,
+    generate_trace_id,
 )
-from .modals import DraftTitleModal, DraftNoteModal, DraftPasswordModal, RenameFileModal, PasswordUnlockModal, DraftUpdateLogModal
+from .modals import (
+    DraftTitleModal,
+    DraftNoteModal,
+    DraftPasswordModal,
+    RenameFileModal,
+    PasswordUnlockModal,
+    DraftUpdateLogModal,
+    normalize_file_tag,
+)
+
+
+FILE_EDIT_PAGE_SIZE = 15
+
+
+def get_attachment_original_name(attachment):
+    candidate = getattr(attachment, "title", None) or getattr(
+        attachment, "filename", None
+    )
+    return candidate or "unknown"
+
+
+def ensure_file_entry_defaults(entry):
+    entry.setdefault("original_filename", entry.get("filename", "unknown"))
+    entry.setdefault("filename", entry.get("original_filename", "unknown"))
+    entry["tag"] = normalize_file_tag(entry.get("tag"))
+    return entry
+
+
+def format_tag_text(entry):
+    tag = entry.get("tag")
+    return f" [{tag}]" if tag else ""
+
+
+def build_file_line(entry, index=None):
+    prefix = f"{index}. " if index is not None else ""
+    original_text = ""
+    original_name = entry.get("original_filename")
+    if original_name and entry["filename"] != original_name:
+        original_text = f" (原始: {original_name})"
+    return f"{prefix}{entry['filename']}{format_tag_text(entry)}{original_text}"
+
+
+def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
+    start = page_index * page_size
+    end = start + page_size
+    return start, end, file_entries[start:end]
+
 
 # --- 延迟下载视图 (核心修改区域) ---
 class AuthorNoteView(ui.View):
@@ -31,10 +77,13 @@ class AuthorNoteView(ui.View):
         self.row = row
         self.downloaded = False
 
-    @ui.button(label="⏳ 请阅读说明 (5s)", style=discord.ButtonStyle.secondary, disabled=True)
+    @ui.button(
+        label="⏳ 请阅读说明 (5s)", style=discord.ButtonStyle.secondary, disabled=True
+    )
     async def btn_confirm(self, interaction: discord.Interaction, button: ui.Button):
 
-        if self.downloaded: return
+        if self.downloaded:
+            return
         self.downloaded = True
 
         # 禁用按钮防止重复点击，并更新提示
@@ -45,7 +94,10 @@ class AuthorNoteView(ui.View):
         # 下载逻辑
         try:
             # 1. 获取原始文件数据 (这里面存着我们改好的正确文件名！)
-            file_data = json.loads(self.row['storage_urls'])
+            file_data = [
+                ensure_file_entry_defaults(f)
+                for f in json.loads(self.row["storage_urls"])
+            ]
 
             # 2. 下载文件内容 (这里返回的文件名往往是被Discord处理过的乱码或下划线)
             raw_results = await fetch_files_common(self.bot, file_data)
@@ -64,7 +116,7 @@ class AuthorNoteView(ui.View):
                 # 这样我们就能通过 file_data[i]['filename'] 拿到正确的中文名
                 for i, res in enumerate(raw_results):
                     # 尝试获取正确的显示文件名，如果拿不到就只好用原始的
-                    correct_filename = file_data[i].get('filename', res['filename'])
+                    correct_filename = file_data[i].get("filename", res["filename"])
 
                     # A. 生成唯一追踪码
                     trace_id = generate_trace_id()
@@ -72,9 +124,7 @@ class AuthorNoteView(ui.View):
                     # B. 注入指纹
                     # 注意：这里我们依然传 correct_filename 进去，以便注入工具能正确识别文件类型
                     new_bytes = inject_smart_trace(
-                        res['bytes'],
-                        correct_filename,
-                        trace_id
+                        res["bytes"], correct_filename, trace_id
                     )
 
                     # C. 记录到溯源数据库
@@ -83,9 +133,9 @@ class AuthorNoteView(ui.View):
                         user_id=interaction.user.id,
                         guild_id=guild_id,
                         channel_id=channel_id,
-                        message_id=self.row['message_id'],
-                        filename=correct_filename, # 记录里也存正确名字
-                        timestamp=timestamp
+                        message_id=self.row["message_id"],
+                        filename=correct_filename,  # 记录里也存正确名字
+                        timestamp=timestamp,
                     )
 
                     # D. 构建发送用的文件对象
@@ -96,20 +146,35 @@ class AuthorNoteView(ui.View):
                 # -----------------------
 
                 # 计算剩余额度 (这一块保持不变)
-                today_start_iso = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                today_start_iso = (
+                    datetime.now(TZ_SHANGHAI)
+                    .replace(hour=0, minute=0, second=0, microsecond=0)
+                    .isoformat()
+                )
                 async with get_db() as db:
-                    cursor = await db.execute("SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?", (interaction.user.id, today_start_iso))
+                    cursor = await db.execute(
+                        "SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?",
+                        (interaction.user.id, today_start_iso),
+                    )
                     cnt = (await cursor.fetchone())[0]
 
                 await interaction.followup.send(
-                    content=f"✅ **获取成功！**\n🛡️ 本文件包含溯源指纹，请勿私自转传。\n今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}\n请查收下方附件：",
+                    content=(
+                        f"✅ **获取成功！**\n"
+                        f"🛡️ 本文件包含溯源指纹，请勿私自转传。\n"
+                        f"今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}\n"
+                        f"请查收下方附件："
+                    ),
                     files=final_files_to_send,
-                    ephemeral=True
+                    ephemeral=True,
                 )
             else:
-                await interaction.followup.send("❌ 文件数据读取失败，请联系管理员。", ephemeral=True)
+                await interaction.followup.send(
+                    "❌ 文件数据读取失败，请联系管理员。", ephemeral=True
+                )
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             await interaction.followup.send(f"❌ 发生未知错误: {e}", ephemeral=True)
 
@@ -121,9 +186,9 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
     2. 等待 5 秒
     3. 启用按钮供用户点击下载
     """
-    author_note = row['log'] if row['log'] else "（作者未留下额外说明）"
+    author_note = row["log"] if row["log"] else "（作者未留下额外说明）"
 
-    embed = discord.Embed(title="📝 作者提示", description=author_note, color=0xffd700)
+    embed = discord.Embed(title="📝 作者提示", description=author_note, color=0xFFD700)
     embed.set_footer(text="请仔细阅读以上内容，5秒后可点击下方按钮获取文件。")
 
     view = AuthorNoteView(bot, row)
@@ -145,7 +210,8 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
     try:
         await msg.edit(view=view)
     except:
-        pass # 用户可能已经关闭了弹窗
+        pass  # 用户可能已经关闭了弹窗
+
 
 # --- 自定义文件名选择视图 ---
 class FileSelectView(ui.View):
@@ -153,17 +219,285 @@ class FileSelectView(ui.View):
         super().__init__(timeout=60)
         self.protection_view = protection_view
         options = []
-        for i, att in enumerate(protection_view.attachments):
-            current_name = protection_view.custom_names.get(i, att.filename)
+        for i, entry in enumerate(protection_view.file_entries):
+            current_name = entry["filename"]
             label = current_name[:95]
-            options.append(discord.SelectOption(label=f"{i+1}. {label}", value=str(i), description=f"原始: {att.filename[:50]}"))
-        self.select_menu = ui.Select(placeholder="选择要改名的文件...", options=options, min_values=1, max_values=1)
+            description = (
+                f"原始: {entry['original_filename'][:40]}{format_tag_text(entry)[:20]}"
+            )
+            options.append(
+                discord.SelectOption(
+                    label=f"{i + 1}. {label}",
+                    value=str(i),
+                    description=description[:100],
+                )
+            )
+        self.select_menu = ui.Select(
+            placeholder="选择要改名的文件...",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
         self.select_menu.callback = self.select_callback
         self.add_item(self.select_menu)
+
     async def select_callback(self, interaction: discord.Interaction):
         idx = int(self.select_menu.values[0])
-        current_name = self.protection_view.custom_names.get(idx, self.protection_view.attachments[idx].filename)
-        await interaction.response.send_modal(RenameFileModal(self.protection_view, idx, current_name))
+        current_name = self.protection_view.file_entries[idx]["filename"]
+        await interaction.response.send_modal(
+            RenameFileModal(self.protection_view, idx, current_name)
+        )
+
+
+class DraftBatchFileView(ui.View):
+    def __init__(self, protection_view, page_index=0):
+        super().__init__(timeout=120)
+        self.protection_view = protection_view
+        self.page_index = page_index
+        self.total_pages = max(
+            1,
+            (len(self.protection_view.file_entries) + FILE_EDIT_PAGE_SIZE - 1)
+            // FILE_EDIT_PAGE_SIZE,
+        )
+        self._update_button_state()
+
+    def _update_button_state(self):
+        self.btn_prev.disabled = self.page_index <= 0
+        self.btn_next.disabled = self.page_index >= self.total_pages - 1
+        self.btn_open.label = f"批量编辑 第{self.page_index + 1}/{self.total_pages}页"
+
+    def build_preview(self):
+        start, end, entries = chunk_file_entries(
+            self.protection_view.file_entries, self.page_index
+        )
+        lines = ["每行格式: 序号. 文件名 | 标签", "标签不填可留空。", ""]
+        for idx, entry in enumerate(entries, start=start + 1):
+            tag = entry.get("tag") or "无标签"
+            lines.append(f"{idx}. {entry['filename']} | {tag}")
+        preview = "\n".join(lines)
+        return start, end, preview[:1900]
+
+    @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
+    async def btn_prev(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index -= 1
+        self._update_button_state()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+    @ui.button(label="批量编辑", style=discord.ButtonStyle.primary)
+    async def btn_open(self, interaction: discord.Interaction, button: ui.Button):
+        start, end, _ = self.build_preview()
+        modal = DraftBulkFilePageModal(self.protection_view, start, end)
+        await interaction.response.send_modal(modal)
+
+    @ui.button(label="下一页", style=discord.ButtonStyle.secondary)
+    async def btn_next(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index += 1
+        self._update_button_state()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+
+class DraftBulkFilePageModal(ui.Modal, title="批量编辑文件页"):
+    entries_input = ui.TextInput(
+        label="每行: 序号. 文件名 | 标签",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
+
+    def __init__(self, protection_view, start, end):
+        super().__init__()
+        self.protection_view = protection_view
+        self.start = start
+        self.end = end
+        default_lines = []
+        for idx, entry in enumerate(
+            self.protection_view.file_entries[start:end], start=start + 1
+        ):
+            tag = entry.get("tag") or ""
+            default_lines.append(f"{idx}. {entry['filename']} | {tag}")
+        self.entries_input.default = "\n".join(default_lines)[:4000]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.entries_input.value
+
+        import re
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return await interaction.response.send_message(
+                "❌ 请至少保留一行文件配置。", ephemeral=True
+            )
+
+        pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
+        updated = 0
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                return await interaction.response.send_message(
+                    f"❌ 无法解析这一行：{line}", ephemeral=True
+                )
+            absolute_index = int(match.group(1)) - 1
+            if not self.start <= absolute_index < self.end:
+                return await interaction.response.send_message(
+                    "❌ 当前弹窗只能编辑当前页的文件。", ephemeral=True
+                )
+            content = match.group(2).strip()
+            if "|" in content:
+                name_text, tag_text = content.split("|", 1)
+            else:
+                name_text, tag_text = content, None
+            entry = self.protection_view.file_entries[absolute_index]
+            new_name = name_text.strip()
+            if not new_name:
+                return await interaction.response.send_message(
+                    "❌ 文件名不能为空。", ephemeral=True
+                )
+            ext = os.path.splitext(entry["original_filename"])[1]
+            if ext and not os.path.splitext(new_name)[1]:
+                new_name = f"{new_name}{ext}"
+            try:
+                entry["tag"] = normalize_file_tag(tag_text)
+            except ValueError as exc:
+                return await interaction.response.send_message(
+                    f"❌ {exc}", ephemeral=True
+                )
+            entry["filename"] = new_name
+            updated += 1
+
+        self.protection_view.sync_custom_names_from_entries()
+        await interaction.response.defer(ephemeral=True)
+        await self.protection_view.update_dashboard(interaction)
+        await interaction.followup.send(
+            f"✅ 已更新当前页 {updated} 个文件。", ephemeral=True
+        )
+
+
+class PublishedBatchFileView(ui.View):
+    def __init__(self, message_id, file_data, page_index=0):
+        super().__init__(timeout=120)
+        self.message_id = message_id
+        self.file_data = file_data
+        self.page_index = page_index
+        self.total_pages = max(
+            1, (len(self.file_data) + FILE_EDIT_PAGE_SIZE - 1) // FILE_EDIT_PAGE_SIZE
+        )
+        self._update_button_state()
+
+    def _update_button_state(self):
+        self.btn_prev.disabled = self.page_index <= 0
+        self.btn_next.disabled = self.page_index >= self.total_pages - 1
+        self.btn_open.label = f"批量编辑 第{self.page_index + 1}/{self.total_pages}页"
+
+    def build_preview(self):
+        start, end, entries = chunk_file_entries(self.file_data, self.page_index)
+        lines = ["每行格式: 序号. 文件名 | 标签", "标签不填可留空。", ""]
+        for idx, entry in enumerate(entries, start=start + 1):
+            lines.append(f"{idx}. {entry['filename']} | {entry.get('tag') or '无标签'}")
+        return start, end, "\n".join(lines)[:1900]
+
+    @ui.button(label="上一页", style=discord.ButtonStyle.secondary)
+    async def btn_prev(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index -= 1
+        self._update_button_state()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+    @ui.button(label="批量编辑", style=discord.ButtonStyle.primary)
+    async def btn_open(self, interaction: discord.Interaction, button: ui.Button):
+        start, end, _ = self.build_preview()
+        await interaction.response.send_modal(
+            PublishedBulkFilePageModal(self.message_id, self.file_data, start, end)
+        )
+
+    @ui.button(label="下一页", style=discord.ButtonStyle.secondary)
+    async def btn_next(self, interaction: discord.Interaction, button: ui.Button):
+        self.page_index += 1
+        self._update_button_state()
+        _, _, preview = self.build_preview()
+        await interaction.response.edit_message(content=preview, view=self)
+
+
+class PublishedBulkFilePageModal(ui.Modal, title="批量编辑已发布文件页"):
+    entries_input = ui.TextInput(
+        label="每行: 序号. 文件名 | 标签",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
+
+    def __init__(self, message_id, file_data, start, end):
+        super().__init__()
+        self.message_id = message_id
+        self.file_data = file_data
+        self.start = start
+        self.end = end
+        default_lines = []
+        for idx, entry in enumerate(self.file_data[start:end], start=start + 1):
+            default_lines.append(
+                f"{idx}. {entry['filename']} | {entry.get('tag') or ''}"
+            )
+        self.entries_input.default = "\n".join(default_lines)[:4000]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        import re
+
+        lines = [
+            line.strip()
+            for line in self.entries_input.value.splitlines()
+            if line.strip()
+        ]
+        if not lines:
+            return await interaction.response.send_message(
+                "❌ 请至少保留一行文件配置。", ephemeral=True
+            )
+
+        pattern = re.compile(r"^(\d+)\s*[\.、\-)]?\s*(.*)$")
+        updated = 0
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                return await interaction.response.send_message(
+                    f"❌ 无法解析这一行：{line}", ephemeral=True
+                )
+            absolute_index = int(match.group(1)) - 1
+            if not self.start <= absolute_index < self.end:
+                return await interaction.response.send_message(
+                    "❌ 当前弹窗只能编辑当前页的文件。", ephemeral=True
+                )
+            content = match.group(2).strip()
+            if "|" in content:
+                name_text, tag_text = content.split("|", 1)
+            else:
+                name_text, tag_text = content, None
+            entry = self.file_data[absolute_index]
+            new_name = name_text.strip()
+            if not new_name:
+                return await interaction.response.send_message(
+                    "❌ 文件名不能为空。", ephemeral=True
+                )
+            ext = os.path.splitext(entry["original_filename"])[1]
+            if ext and not os.path.splitext(new_name)[1]:
+                new_name = f"{new_name}{ext}"
+            try:
+                entry["tag"] = normalize_file_tag(tag_text)
+            except ValueError as exc:
+                return await interaction.response.send_message(
+                    f"❌ {exc}", ephemeral=True
+                )
+            entry["filename"] = new_name
+            updated += 1
+
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                (json.dumps(self.file_data), self.message_id),
+            )
+            await db.commit()
+
+        await interaction.response.send_message(
+            f"✅ 已更新当前页 {updated} 个已发布文件。", ephemeral=True
+        )
+
 
 # --- 草稿/发布视图 ---
 class ProtectionDraftView(ui.View):
@@ -179,15 +513,51 @@ class ProtectionDraftView(ui.View):
         self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
-        self.custom_names = {}
+        self.file_entries = [
+            ensure_file_entry_defaults(
+                {
+                    "filename": get_attachment_original_name(att),
+                    "original_filename": get_attachment_original_name(att),
+                    "tag": None,
+                }
+            )
+            for att in attachments
+        ]
+        self.custom_names = {
+            idx: entry["filename"]
+            for idx, entry in enumerate(self.file_entries)
+            if entry["filename"] != entry["original_filename"]
+        }
+
+    def sync_custom_names_from_entries(self):
+        self.custom_names = {
+            idx: entry["filename"]
+            for idx, entry in enumerate(self.file_entries)
+            if entry["filename"] != entry["original_filename"]
+        }
+
+    def count_tagged_files(self):
+        return sum(1 for entry in self.file_entries if entry.get("tag"))
 
     async def update_dashboard(self, interaction: discord.Interaction):
-        log_preview = self.draft_log[:50] + "..." if self.draft_log and len(self.draft_log) > 50 else self.draft_log
+        log_preview = (
+            self.draft_log[:50] + "..."
+            if self.draft_log and len(self.draft_log) > 50
+            else self.draft_log
+        )
         renamed_count = len(self.custom_names)
         file_status = f"{len(self.attachments)} 个"
-        if renamed_count > 0: file_status += f" (已改名 {renamed_count} 个)"
+        if renamed_count > 0:
+            file_status += f" (已改名 {renamed_count} 个)"
+        tagged_count = self.count_tagged_files()
+        if tagged_count > 0:
+            file_status += f" / 已标记 {tagged_count} 个"
 
-        update_log_preview = self.draft_update_log[:50] + "..." if self.draft_update_log and len(self.draft_update_log) > 50 else self.draft_update_log
+        update_log_preview = (
+            self.draft_update_log[:50] + "..."
+            if self.draft_update_log and len(self.draft_update_log) > 50
+            else self.draft_update_log
+        )
         status_desc = (
             f"📦 **已传文件**: {file_status}\n"
             f"🏷️ **当前标题**: {self.draft_title}\n"
@@ -195,116 +565,223 @@ class ProtectionDraftView(ui.View):
             f"🗒️ **更新日志**: {'✅ ' + update_log_preview if self.draft_update_log else '⚪ 未设置'}\n"
             f"📣 **艾特贴内用户**: {'✅ 开启' if self.mention_users else '⚪ 关闭'}\n"
         )
-        mode_map = {"like": "👍 点赞解锁", "like_comment": "💬 点赞+评论", "like_password": f"🔐 点赞+口令 (口令: ||{self.draft_password}||)", "like_comment_password": f"🔐💬 点赞+评论+口令 (口令: ||{self.draft_password}||)"}
+        mode_map = {
+            "like": "👍 点赞解锁",
+            "like_comment": "💬 点赞+评论",
+            "like_password": f"🔐 点赞+口令 (口令: ||{self.draft_password}||)",
+            "like_comment_password": f"🔐💬 点赞+评论+口令 (口令: ||{self.draft_password}||)",
+        }
         status_desc += f"⚙️ **获取方式**: {mode_map.get(self.draft_mode)}"
-        guide_desc = ("1️⃣ 点击 **第一排** 修改标题、说明、**更新日志** 或 **修改文件名**。\n2️⃣ 点击 **第二排** 选择解锁条件或配置 **艾特贴内用户**。\n3️⃣ 确认无误后，点击底部的 **🚀 确认发布**。")
-        embed = discord.Embed(title="🛠️ 附件保护控制台", color=0x87ceeb); embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False); embed.add_field(name="📖 操作指引", value=guide_desc, inline=False); embed.set_footer(text="此面板仅你自己可见")
+        guide_desc = "1️⃣ 点击 **第一排** 修改标题、说明、更新日志，或进入单文件/批量文件编辑。\n2️⃣ 批量编辑支持分批处理文件名与标签。\n3️⃣ 点击 **第二排** 选择解锁条件或配置 **艾特贴内用户**。\n4️⃣ 确认无误后点击 **🚀 确认发布**。"
+        embed = discord.Embed(title="🛠️ 附件保护控制台", color=0x87CEEB)
+        embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False)
+        embed.add_field(name="📖 操作指引", value=guide_desc, inline=False)
+        embed.set_footer(text="此面板仅你自己可见")
 
         if interaction.response.is_done():
-            try: await interaction.edit_original_response(content=None, embed=embed, view=self)
-            except: pass
-        else: await interaction.response.edit_message(content=None, embed=embed, view=self)
+            try:
+                await interaction.edit_original_response(
+                    content=None, embed=embed, view=self
+                )
+            except:
+                pass
+        else:
+            await interaction.response.edit_message(
+                content=None, embed=embed, view=self
+            )
 
     @ui.button(label="修改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
-    async def btn_set_title(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftTitleModal(self))
+    async def btn_set_title(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(DraftTitleModal(self))
+
     @ui.button(label="作者提示", style=discord.ButtonStyle.secondary, row=0, emoji="📝")
-    async def btn_set_note(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftNoteModal(self))
+    async def btn_set_note(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(DraftNoteModal(self))
+
     @ui.button(label="更新日志", style=discord.ButtonStyle.secondary, row=0, emoji="🗒️")
-    async def btn_set_update_log(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftUpdateLogModal(self))
-    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
-    async def btn_rename_files(self, i: discord.Interaction, b: ui.Button): await i.response.send_message("请选择要重命名的文件：", view=FileSelectView(self), ephemeral=True)
-    @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
+    async def btn_set_update_log(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(DraftUpdateLogModal(self))
+
+    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
+    async def btn_rename_files(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_message(
+            "请选择要重命名的文件：", view=FileSelectView(self), ephemeral=True
+        )
+
+    @ui.button(
+        label="批量编辑文件", style=discord.ButtonStyle.secondary, row=1, emoji="🧩"
+    )
+    async def btn_batch_edit_files(self, i: discord.Interaction, b: ui.Button):
+        view = DraftBatchFileView(self)
+        _, _, preview = view.build_preview()
+        await i.response.send_message(preview, view=view, ephemeral=True)
+
+    @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=1, emoji="📦")
     async def btn_view_files(self, i: discord.Interaction, b: ui.Button):
         names = []
-        for idx, att in enumerate(self.attachments):
-            final_name = self.custom_names.get(idx, att.filename)
-            names.append(f"{idx+1}. {final_name}")
-        await i.response.send_message(f"**当前文件列表：**\n" + "\n".join(names)[:1900], ephemeral=True)
+        for idx, entry in enumerate(self.file_entries):
+            names.append(build_file_line(entry, idx + 1))
+        await i.response.send_message(
+            f"**当前文件列表：**\n" + "\n".join(names)[:1900], ephemeral=True
+        )
 
-    @ui.button(label="点赞", style=discord.ButtonStyle.primary, row=1)
-    async def mode_like(self, i: discord.Interaction, b: ui.Button): self.draft_mode = "like"; await self.update_dashboard(i)
-    @ui.button(label="点赞+评论", style=discord.ButtonStyle.primary, row=1)
-    async def mode_like_comment(self, i: discord.Interaction, b: ui.Button): self.draft_mode = "like_comment"; await self.update_dashboard(i)
-    @ui.button(label="点赞+口令", style=discord.ButtonStyle.success, row=1, emoji="🔐")
-    async def mode_like_pass(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftPasswordModal(self, "like_password"))
-    @ui.button(label="点赞+评论+口令", style=discord.ButtonStyle.success, row=1, emoji="🔐")
-    async def mode_like_comm_pass(self, i: discord.Interaction, b: ui.Button): await i.response.send_modal(DraftPasswordModal(self, "like_comment_password"))
-    @ui.button(label="艾特贴内用户", style=discord.ButtonStyle.secondary, row=1, emoji="📣")
+    @ui.button(label="点赞", style=discord.ButtonStyle.primary, row=2)
+    async def mode_like(self, i: discord.Interaction, b: ui.Button):
+        self.draft_mode = "like"
+        await self.update_dashboard(i)
+
+    @ui.button(label="点赞+评论", style=discord.ButtonStyle.primary, row=2)
+    async def mode_like_comment(self, i: discord.Interaction, b: ui.Button):
+        self.draft_mode = "like_comment"
+        await self.update_dashboard(i)
+
+    @ui.button(label="点赞+口令", style=discord.ButtonStyle.success, row=2, emoji="🔐")
+    async def mode_like_pass(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(DraftPasswordModal(self, "like_password"))
+
+    @ui.button(
+        label="点赞+评论+口令", style=discord.ButtonStyle.success, row=2, emoji="🔐"
+    )
+    async def mode_like_comm_pass(self, i: discord.Interaction, b: ui.Button):
+        await i.response.send_modal(DraftPasswordModal(self, "like_comment_password"))
+
+    @ui.button(
+        label="艾特贴内用户", style=discord.ButtonStyle.secondary, row=2, emoji="📣"
+    )
     async def toggle_mention_users(self, i: discord.Interaction, b: ui.Button):
         self.mention_users = not self.mention_users
         await self.update_dashboard(i)
 
-    @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=2, emoji="🚀")
+    @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=3, emoji="🚀")
     async def btn_confirm(self, i: discord.Interaction, b: ui.Button):
-        await i.response.edit_message(content="⏳ 正在加密上传...", embed=None, view=None)
+        await i.response.edit_message(
+            content="⏳ 正在加密上传...", embed=None, view=None
+        )
         await self.publish(i)
 
-    @ui.button(label="取消", style=discord.ButtonStyle.gray, row=2, emoji="✖️")
+    @ui.button(label="取消", style=discord.ButtonStyle.gray, row=3, emoji="✖️")
     async def btn_cancel(self, i: discord.Interaction, b: ui.Button):
-        await i.response.edit_message(content="操作已取消。", embed=None, view=None); self.stop()
+        await i.response.edit_message(content="操作已取消。", embed=None, view=None)
+        self.stop()
 
     async def publish(self, interaction: discord.Interaction):
         prepared_files = []
         try:
             for idx, att in enumerate(self.attachments):
                 file_bytes = await att.read()
-                final_filename = self.custom_names.get(idx, att.filename)
-                prepared_files.append((file_bytes, final_filename))
-        except Exception as e: return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
+                entry = self.file_entries[idx]
+                final_filename = entry["filename"]
+                prepared_files.append((file_bytes, final_filename, dict(entry)))
+        except Exception as e:
+            return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
 
         stored_data = []
         try:
             # 优先私信，失败转存备份频道
             try:
                 dm = await self.user.create_dm()
-                dm_files = [discord.File(io.BytesIO(file_bytes), filename=final_filename) for file_bytes, final_filename in prepared_files]
+                dm_files = [
+                    discord.File(io.BytesIO(file_bytes), filename=final_filename)
+                    for file_bytes, final_filename, entry in prepared_files
+                ]
                 backup_msg = await dm.send(
                     content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)",
-                    files=dm_files
+                    files=dm_files,
                 )
             except Exception as e:
                 print(f"DM backup failed: {e}")
                 # Fallback
                 fallback_channel = self.bot.get_channel(BACKUP_CHANNEL_ID)
-                if not fallback_channel: fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
-                fallback_files = [discord.File(io.BytesIO(file_bytes), filename=final_filename) for file_bytes, final_filename in prepared_files]
+                if not fallback_channel:
+                    fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
+                fallback_files = [
+                    discord.File(io.BytesIO(file_bytes), filename=final_filename)
+                    for file_bytes, final_filename, entry in prepared_files
+                ]
                 backup_msg = await fallback_channel.send(
                     content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}",
-                    files=fallback_files
+                    files=fallback_files,
                 )
 
             for i, att in enumerate(backup_msg.attachments):
-                real_display_name = self.custom_names.get(i, self.attachments[i].filename)
-                stored_data.append({
-                    "strategy": "msg_ref", "channel_id": backup_msg.channel.id, "message_id": backup_msg.id,
-                    "attachment_index": i, "filename": real_display_name, "url": att.url
-                })
-        except Exception as e: return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
+                entry = dict(self.file_entries[i])
+                stored_data.append(
+                    {
+                        "strategy": "msg_ref",
+                        "channel_id": backup_msg.channel.id,
+                        "message_id": backup_msg.id,
+                        "attachment_index": i,
+                        "filename": entry["filename"],
+                        "original_filename": entry["original_filename"],
+                        "tag": entry.get("tag"),
+                        "url": att.url,
+                    }
+                )
+        except Exception as e:
+            return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
 
         if self.target_message:
-            try: await self.target_message.delete()
-            except: pass
+            try:
+                await self.target_message.delete()
+            except:
+                pass
 
         final_desc = "📋 **本附件受保护，请按照下方指示获取。**"
-        embed = discord.Embed(title=f"✨ {self.draft_title}", description=final_desc, color=discord.Color.from_rgb(255, 183, 197))
-        embed.set_author(name=f"由 {self.user.display_name} 发布", icon_url=self.user.display_avatar.url)
-        mode_map = {"like": "👍 **点赞首楼**", "like_comment": "👍💬 **点赞首楼 + 回复本贴**", "like_password": "👍🔐 **点赞首楼 + 口令**", "like_comment_password": "👍💬🔐 **点赞首楼 + 回复本贴 + 口令**"}
-        embed.add_field(name="🔑 获取条件", value=mode_map.get(self.draft_mode, "未知"), inline=True)
-        embed.add_field(name="📦 文件数量", value=f"**{len(stored_data)}** 个", inline=True)
+        embed = discord.Embed(
+            title=f"✨ {self.draft_title}",
+            description=final_desc,
+            color=discord.Color.from_rgb(255, 183, 197),
+        )
+        embed.set_author(
+            name=f"由 {self.user.display_name} 发布",
+            icon_url=self.user.display_avatar.url,
+        )
+        mode_map = {
+            "like": "👍 **点赞首楼**",
+            "like_comment": "👍💬 **点赞首楼 + 回复本贴**",
+            "like_password": "👍🔐 **点赞首楼 + 口令**",
+            "like_comment_password": "👍💬🔐 **点赞首楼 + 回复本贴 + 口令**",
+        }
+        embed.add_field(
+            name="🔑 获取条件", value=mode_map.get(self.draft_mode, "未知"), inline=True
+        )
+        embed.add_field(
+            name="📦 文件数量", value=f"**{len(stored_data)}** 个", inline=True
+        )
         now_ts = discord.utils.format_dt(datetime.now(TZ_SHANGHAI))
         embed.add_field(name="⏰ 发布时间", value=now_ts, inline=True)
 
-        embed.add_field(name="📥 如何下载？", value="请使用命令：\n**`/保护附件 获取附件`**\n来验证条件并下载文件。", inline=False)
-        embed.set_footer(text="由 创作保护助手 强力驱动", icon_url=self.bot.user.display_avatar.url)
+        embed.add_field(
+            name="📥 如何下载？",
+            value="请使用命令：\n**`/保护附件 获取附件`**\n来验证条件并下载文件。",
+            inline=False,
+        )
+        embed.set_footer(
+            text="由 创作保护助手 强力驱动", icon_url=self.bot.user.display_avatar.url
+        )
 
         final_msg = await interaction.channel.send(embed=embed)
-        try: await final_msg.pin(reason="附件保护自动标注")
-        except: await interaction.followup.send("提示：我没有置顶权限！", ephemeral=True)
+        try:
+            await final_msg.pin(reason="附件保护自动标注")
+        except:
+            await interaction.followup.send("提示：我没有置顶权限！", ephemeral=True)
 
         async with get_db() as db:
             await db.execute(
                 """INSERT INTO protected_items (message_id, channel_id, owner_id, unlock_type, storage_urls, title, log, update_log, mention_users, password, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (final_msg.id, final_msg.channel.id, self.user.id, self.draft_mode, json.dumps(stored_data), self.draft_title, self.draft_log, self.draft_update_log, int(self.mention_users), self.draft_password, datetime.now(TZ_SHANGHAI).isoformat())
+                (
+                    final_msg.id,
+                    final_msg.channel.id,
+                    self.user.id,
+                    self.draft_mode,
+                    json.dumps(stored_data),
+                    self.draft_title,
+                    self.draft_log,
+                    self.draft_update_log,
+                    int(self.mention_users),
+                    self.draft_password,
+                    datetime.now(TZ_SHANGHAI).isoformat(),
+                ),
             )
             await db.commit()
 
@@ -312,10 +789,14 @@ class ProtectionDraftView(ui.View):
         try:
             channel_id = interaction.channel.id
             if channel_id not in self.bot.get_cog("ProtectionCog").bump_tasks:
-                task = self.bot.loop.create_task(self.bot.get_cog("ProtectionCog")._bump_loop(interaction.channel))
+                task = self.bot.loop.create_task(
+                    self.bot.get_cog("ProtectionCog")._bump_loop(interaction.channel)
+                )
                 self.bot.get_cog("ProtectionCog").bump_tasks[channel_id] = task
             await protection_db.add_bump_config(channel_id)
-            await self.bot.get_cog("ProtectionCog")._execute_bump_once(interaction.channel)
+            await self.bot.get_cog("ProtectionCog")._execute_bump_once(
+                interaction.channel
+            )
         except Exception:
             pass
 
@@ -328,44 +809,65 @@ class ProtectionDraftView(ui.View):
 
             if self.draft_update_log:
                 update_header = f"🗒️ **{self.draft_title} 更新日志**"
-                update_msg = await interaction.channel.send(f"{update_header}\n{self.draft_update_log}")
+                update_msg = await interaction.channel.send(
+                    f"{update_header}\n{self.draft_update_log}"
+                )
                 try:
                     await update_msg.pin(reason="附件更新日志标注")
                 except:
-                    await interaction.followup.send("提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True)
+                    await interaction.followup.send(
+                        "提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True
+                    )
 
-        await interaction.followup.send("✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True)
+        await interaction.followup.send(
+            "✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True
+        )
+
 
 # --- 帖子列表视图 ---
 class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
-    name_input = ui.TextInput(label="新文件名 (无需输入后缀)", placeholder="请输入新名字", max_length=100)
+    name_input = ui.TextInput(
+        label="新文件名 (无需输入后缀)", placeholder="请输入新名字", max_length=100
+    )
 
     def __init__(self, message_id, file_index, file_data):
         super().__init__()
         self.message_id = message_id
         self.file_index = file_index
         self.file_data = file_data
-        current_name = file_data[file_index].get('filename', 'unknown.ext')
+        ensure_file_entry_defaults(self.file_data[file_index])
+        current_name = file_data[file_index].get("filename", "unknown.ext")
         self.name_stem, self.ext = os.path.splitext(current_name)
         self.name_input.default = self.name_stem
 
     async def on_submit(self, interaction: discord.Interaction):
         new_stem = self.name_input.value.strip()
-        if not new_stem: return await interaction.response.send_message("文件名不能为空！", ephemeral=True)
+        if not new_stem:
+            return await interaction.response.send_message(
+                "文件名不能为空！", ephemeral=True
+            )
         new_full_name = f"{new_stem}{self.ext}"
 
         # 更新内存数据
-        self.file_data[self.file_index]['filename'] = new_full_name
+        self.file_data[self.file_index]["filename"] = new_full_name
 
         # 更新数据库
         async with get_db() as db:
-            await db.execute("UPDATE protected_items SET storage_urls = ? WHERE message_id = ?", (json.dumps(self.file_data), self.message_id))
+            await db.execute(
+                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                (json.dumps(self.file_data), self.message_id),
+            )
             await db.commit()
 
-        await interaction.response.send_message(f"✅ 修改成功！文件已更名为 `{new_full_name}`", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ 修改成功！文件已更名为 `{new_full_name}`", ephemeral=True
+        )
+
 
 class EditProtectionTitleModal(ui.Modal, title="修改附件标题"):
-    title_input = ui.TextInput(label="新标题", placeholder="请输入新的显示标题", max_length=100)
+    title_input = ui.TextInput(
+        label="新标题", placeholder="请输入新的显示标题", max_length=100
+    )
 
     def __init__(self, message_id, current_title):
         super().__init__()
@@ -374,16 +876,29 @@ class EditProtectionTitleModal(ui.Modal, title="修改附件标题"):
 
     async def on_submit(self, interaction: discord.Interaction):
         new_title = self.title_input.value.strip()
-        if not new_title: return
+        if not new_title:
+            return
 
         async with get_db() as db:
-            await db.execute("UPDATE protected_items SET title = ? WHERE message_id = ?", (new_title, self.message_id))
+            await db.execute(
+                "UPDATE protected_items SET title = ? WHERE message_id = ?",
+                (new_title, self.message_id),
+            )
             await db.commit()
 
-        await interaction.response.send_message(f"✅ 标题已更新为：**{new_title}**", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ 标题已更新为：**{new_title}**", ephemeral=True
+        )
+
 
 class EditProtectionNoteModal(ui.Modal, title="修改作者提示"):
-    note_input = ui.TextInput(label="新的作者提示", style=discord.TextStyle.paragraph, placeholder="请输入给下载者的说明...", max_length=1000, required=False)
+    note_input = ui.TextInput(
+        label="新的作者提示",
+        style=discord.TextStyle.paragraph,
+        placeholder="请输入给下载者的说明...",
+        max_length=1000,
+        required=False,
+    )
 
     def __init__(self, message_id, current_note):
         super().__init__()
@@ -394,13 +909,23 @@ class EditProtectionNoteModal(ui.Modal, title="修改作者提示"):
         new_note = self.note_input.value.strip()
 
         async with get_db() as db:
-            await db.execute("UPDATE protected_items SET log = ? WHERE message_id = ?", (new_note, self.message_id))
+            await db.execute(
+                "UPDATE protected_items SET log = ? WHERE message_id = ?",
+                (new_note, self.message_id),
+            )
             await db.commit()
 
         await interaction.response.send_message("✅ 作者提示已更新！", ephemeral=True)
 
+
 class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
-    pw_input = ui.TextInput(label="设置新口令", placeholder="留空则保持原密码不变（如果是从无密码模式切换来，则必须输入）", min_length=2, max_length=20, required=False)
+    pw_input = ui.TextInput(
+        label="设置新口令",
+        placeholder="留空则保持原密码不变（如果是从无密码模式切换来，则必须输入）",
+        min_length=2,
+        max_length=20,
+        required=False,
+    )
 
     def __init__(self, message_id, new_mode):
         super().__init__()
@@ -413,15 +938,23 @@ class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
         async with get_db() as db:
             if new_pw:
                 # 更新模式和密码
-                await db.execute("UPDATE protected_items SET unlock_type = ?, password = ? WHERE message_id = ?", (self.new_mode, new_pw, self.message_id))
-            elif self.new_mode: # 如果是单纯切换模式但不想改密码（前提是原先有密码，这里简单处理，如果没输密码就只更新模式，假设用户知道自己在做什么）
-                 await db.execute("UPDATE protected_items SET unlock_type = ? WHERE message_id = ?", (self.new_mode, self.message_id))
+                await db.execute(
+                    "UPDATE protected_items SET unlock_type = ?, password = ? WHERE message_id = ?",
+                    (self.new_mode, new_pw, self.message_id),
+                )
+            elif self.new_mode:  # 如果是单纯切换模式但不想改密码（前提是原先有密码，这里简单处理，如果没输密码就只更新模式，假设用户知道自己在做什么）
+                await db.execute(
+                    "UPDATE protected_items SET unlock_type = ? WHERE message_id = ?",
+                    (self.new_mode, self.message_id),
+                )
             await db.commit()
 
         mode_text = "点赞+口令" if self.new_mode == "like_password" else "全套验证"
         msg = f"✅ 验证模式已切换为 **{mode_text}**"
-        if new_pw: msg += f"\n新口令: ||{new_pw}||"
+        if new_pw:
+            msg += f"\n新口令: ||{new_pw}||"
         await interaction.response.send_message(msg, ephemeral=True)
+
 
 # --- 管理视图组件 ---
 class ManageFilesSelectView(ui.View):
@@ -431,14 +964,25 @@ class ManageFilesSelectView(ui.View):
         self.file_data = file_data
         options = []
         for i, f in enumerate(file_data):
-            fname = f.get('filename', 'unknown')
-            options.append(discord.SelectOption(label=f"{i+1}. {fname[:90]}", value=str(i)))
+            ensure_file_entry_defaults(f)
+            fname = f.get("filename", "unknown")
+            options.append(
+                discord.SelectOption(
+                    label=f"{i + 1}. {fname[:90]}",
+                    value=str(i),
+                    description=(f.get("original_filename") or fname)[:100],
+                )
+            )
         self.select = ui.Select(placeholder="选择要重命名的文件...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
+
     async def on_select(self, interaction: discord.Interaction):
         idx = int(self.select.values[0])
-        await interaction.response.send_modal(EditPublishedFileModal(self.message_id, idx, self.file_data))
+        await interaction.response.send_modal(
+            EditPublishedFileModal(self.message_id, idx, self.file_data)
+        )
+
 
 class EditUnlockModeView(ui.View):
     def __init__(self, message_id):
@@ -447,60 +991,95 @@ class EditUnlockModeView(ui.View):
 
     async def update_mode(self, interaction, mode, needs_password=False):
         if needs_password:
-            await interaction.response.send_modal(EditProtectionPasswordModal(self.message_id, mode))
+            await interaction.response.send_modal(
+                EditProtectionPasswordModal(self.message_id, mode)
+            )
         else:
             async with get_db() as db:
                 # 切换回不需要密码的模式时，建议清空密码字段或保留备用，这里仅更新 unlock_type
-                await db.execute("UPDATE protected_items SET unlock_type = ? WHERE message_id = ?", (mode, self.message_id))
+                await db.execute(
+                    "UPDATE protected_items SET unlock_type = ? WHERE message_id = ?",
+                    (mode, self.message_id),
+                )
                 await db.commit()
 
             mode_text = "点赞解锁" if mode == "like" else "点赞+评论"
-            await interaction.response.send_message(f"✅ 验证模式已切换为 **{mode_text}**", ephemeral=True)
+            await interaction.response.send_message(
+                f"✅ 验证模式已切换为 **{mode_text}**", ephemeral=True
+            )
 
     @ui.button(label="👍 点赞解锁", style=discord.ButtonStyle.primary)
-    async def mode_like(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like")
+    async def mode_like(self, i: discord.Interaction, b: ui.Button):
+        await self.update_mode(i, "like")
 
     @ui.button(label="💬 点赞+评论", style=discord.ButtonStyle.primary)
-    async def mode_like_comm(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_comment")
+    async def mode_like_comm(self, i: discord.Interaction, b: ui.Button):
+        await self.update_mode(i, "like_comment")
 
     @ui.button(label="🔐 点赞+口令", style=discord.ButtonStyle.success)
-    async def mode_like_pass(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_password", True)
+    async def mode_like_pass(self, i: discord.Interaction, b: ui.Button):
+        await self.update_mode(i, "like_password", True)
 
     @ui.button(label="🔐💬 全套验证", style=discord.ButtonStyle.success)
-    async def mode_all(self, i: discord.Interaction, b: ui.Button): await self.update_mode(i, "like_comment_password", True)
+    async def mode_all(self, i: discord.Interaction, b: ui.Button):
+        await self.update_mode(i, "like_comment_password", True)
 
 
 class PostManagementView(ui.View):
     def __init__(self, message_id, file_data, current_title, current_note):
         super().__init__(timeout=60)
         self.message_id = message_id
-        self.file_data = file_data
+        self.file_data = [ensure_file_entry_defaults(f) for f in file_data]
         self.current_title = current_title
         self.current_note = current_note
 
     # 第一排：内容修改
     @ui.button(label="改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
     async def edit_title(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(EditProtectionTitleModal(self.message_id, self.current_title))
+        await interaction.response.send_modal(
+            EditProtectionTitleModal(self.message_id, self.current_title)
+        )
 
     @ui.button(label="改提示", style=discord.ButtonStyle.secondary, row=0, emoji="📝")
     async def edit_note(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(EditProtectionNoteModal(self.message_id, self.current_note))
+        await interaction.response.send_modal(
+            EditProtectionNoteModal(self.message_id, self.current_note)
+        )
 
     @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
     async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_message("请选择要修改的文件：", view=ManageFilesSelectView(self.message_id, self.file_data), ephemeral=True)
+        await interaction.response.send_message(
+            "请选择要修改的文件：",
+            view=ManageFilesSelectView(self.message_id, self.file_data),
+            ephemeral=True,
+        )
+
+    @ui.button(
+        label="批量编辑文件", style=discord.ButtonStyle.secondary, row=0, emoji="🧩"
+    )
+    async def batch_edit_files(
+        self, interaction: discord.Interaction, button: ui.Button
+    ):
+        view = PublishedBatchFileView(self.message_id, self.file_data)
+        _, _, preview = view.build_preview()
+        await interaction.response.send_message(preview, view=view, ephemeral=True)
 
     # 第二排：逻辑修改与删除
     @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=1)
     async def change_mode(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_message("请选择新的验证模式：", view=EditUnlockModeView(self.message_id), ephemeral=True)
+        await interaction.response.send_message(
+            "请选择新的验证模式：",
+            view=EditUnlockModeView(self.message_id),
+            ephemeral=True,
+        )
 
     @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger, row=1)
     async def delete_post(self, interaction: discord.Interaction, button: ui.Button):
         # 双重确认可以防止误删，但作为管理工具直接执行也行，这里直接执行
         async with get_db() as db:
-            await db.execute("DELETE FROM protected_items WHERE message_id = ?", (self.message_id,))
+            await db.execute(
+                "DELETE FROM protected_items WHERE message_id = ?", (self.message_id,)
+            )
             await db.commit()
 
         # 尝试删除 Discord 实际消息
@@ -510,38 +1089,57 @@ class PostManagementView(ui.View):
         except:
             pass
 
-        await interaction.response.edit_message(content="✅ 帖子已删除！相关记录已清理。", embed=None, view=None)
+        await interaction.response.edit_message(
+            content="✅ 帖子已删除！相关记录已清理。", embed=None, view=None
+        )
+
 
 class PostSelectionView(ui.View):
     def __init__(self, posts_rows):
         super().__init__(timeout=60)
         options = []
         for p in posts_rows:
-            title = p['title'][:80]
-            dl_count = p['download_count']
-            options.append(discord.SelectOption(label=title, value=str(p['message_id']), description=f"下载: {dl_count}次 | ID: {p['message_id']}"))
+            title = p["title"][:80]
+            dl_count = p["download_count"]
+            options.append(
+                discord.SelectOption(
+                    label=title,
+                    value=str(p["message_id"]),
+                    description=f"下载: {dl_count}次 | ID: {p['message_id']}",
+                )
+            )
         self.select = ui.Select(placeholder="选择要管理的帖子...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
-        self.posts_map = {str(p['message_id']): p for p in posts_rows}
+        self.posts_map = {str(p["message_id"]): p for p in posts_rows}
 
     async def on_select(self, interaction: discord.Interaction):
         mid_str = self.select.values[0]
         row = self.posts_map[mid_str]
 
-        try: file_data = json.loads(row['storage_urls'])
-        except: file_data = []
+        try:
+            file_data = json.loads(row["storage_urls"])
+        except:
+            file_data = []
+        file_data = [ensure_file_entry_defaults(f) for f in file_data]
 
         # 将当前标题和提示传进去，方便回显
-        current_title = row['title']
-        current_note = row['log']
+        current_title = row["title"]
+        current_note = row["log"]
 
-        embed = discord.Embed(title=f"🔧 管理: {current_title}", description="请选择操作：", color=0xffd700)
+        embed = discord.Embed(
+            title=f"🔧 管理: {current_title}",
+            description="请选择操作：",
+            color=0xFFD700,
+        )
 
         # 实例化更新后的视图
-        view = PostManagementView(row['message_id'], file_data, current_title, current_note)
+        view = PostManagementView(
+            row["message_id"], file_data, current_title, current_note
+        )
 
         await interaction.response.edit_message(embed=embed, view=view)
+
 
 class PostListView(ui.View):
     def __init__(self, bot, posts_rows):
@@ -551,58 +1149,108 @@ class PostListView(ui.View):
         self.selected_row = None
         options = []
         for p in self.posts:
-            title = p['title'][:90]
-            ts_str = datetime.fromisoformat(p['created_at']).strftime('%m-%d %H:%M')
-            options.append(discord.SelectOption(label=title, description=f"发布于: {ts_str}", value=str(p['message_id']), emoji="📄"))
-        self.select_menu = ui.Select(placeholder="🔍 请选择要获取的附件...", options=options, row=0)
+            title = p["title"][:90]
+            ts_str = datetime.fromisoformat(p["created_at"]).strftime("%m-%d %H:%M")
+            options.append(
+                discord.SelectOption(
+                    label=title,
+                    description=f"发布于: {ts_str}",
+                    value=str(p["message_id"]),
+                    emoji="📄",
+                )
+            )
+        self.select_menu = ui.Select(
+            placeholder="🔍 请选择要获取的附件...", options=options, row=0
+        )
         self.select_menu.callback = self.on_select
         self.add_item(self.select_menu)
 
     async def on_select(self, interaction: discord.Interaction):
         selected_id = int(self.select_menu.values[0])
-        self.selected_row = next((p for p in self.posts if p['message_id'] == selected_id), None)
-        if not self.selected_row: return await interaction.response.send_message("选择出错，请重试。", ephemeral=True)
+        self.selected_row = next(
+            (p for p in self.posts if p["message_id"] == selected_id), None
+        )
+        if not self.selected_row:
+            return await interaction.response.send_message(
+                "选择出错，请重试。", ephemeral=True
+            )
         self.btn_download.disabled = False
         try:
-            file_data = json.loads(self.selected_row['storage_urls'])
-            file_list = "\n".join([f"📄 {f.get('filename','???')}" for f in file_data])
-        except: file_list = "解析错误"
-        mode_map = {"like": "👍 点赞", "like_comment": "👍💬 点赞+评论", "like_password": "👍🔐 点赞+口令", "like_comment_password": "👍💬🔐 全套验证"}
-        embed = discord.Embed(title=f"📂 {self.selected_row['title']}", color=discord.Color.green())
+            file_data = json.loads(self.selected_row["storage_urls"])
+            file_data = [ensure_file_entry_defaults(f) for f in file_data]
+            file_list = "\n".join([f"📄 {build_file_line(f)}" for f in file_data])
+        except:
+            file_list = "解析错误"
+        mode_map = {
+            "like": "👍 点赞",
+            "like_comment": "👍💬 点赞+评论",
+            "like_password": "👍🔐 点赞+口令",
+            "like_comment_password": "👍💬🔐 全套验证",
+        }
+        embed = discord.Embed(
+            title=f"📂 {self.selected_row['title']}", color=discord.Color.green()
+        )
         embed.add_field(name="📋 包含文件", value=file_list[:1000], inline=False)
-        embed.add_field(name="🔑 获取条件", value=mode_map.get(self.selected_row['unlock_type'], "未知"), inline=False)
+        embed.add_field(
+            name="🔑 获取条件",
+            value=mode_map.get(self.selected_row["unlock_type"], "未知"),
+            inline=False,
+        )
         embed.set_footer(text="请点击下方按钮验证条件并下载")
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @ui.button(label="验证并获取", style=discord.ButtonStyle.success, emoji="🎁", disabled=True, row=1)
+    @ui.button(
+        label="验证并获取",
+        style=discord.ButtonStyle.success,
+        emoji="🎁",
+        disabled=True,
+        row=1,
+    )
     async def btn_download(self, interaction: discord.Interaction, button: ui.Button):
-        if not self.selected_row: return
+        if not self.selected_row:
+            return
         row = self.selected_row
-        unlock_type = row['unlock_type']
+        unlock_type = row["unlock_type"]
 
         # 1. 检查密码模式
         if "password" in unlock_type:
-            has_test_role = isinstance(interaction.user, discord.Member) and interaction.user.get_role(TEST_ROLE_ID)
+            has_test_role = isinstance(
+                interaction.user, discord.Member
+            ) and interaction.user.get_role(TEST_ROLE_ID)
             # 如果是主人且没测试身份，直接给文件（跳过Delay，但建议还是打上水印以防万一）
             # 不过为了方便自己测试，保持原样逻辑给无水印版也行，这里我为了你的测试体验，保持了主人直通，但如果你希望测试水印功能，建议用小号下载
-            if interaction.user.id == row['owner_id'] and not has_test_role:
-                 await interaction.response.defer(ephemeral=True, thinking=True)
-                 file_data = json.loads(row['storage_urls'])
-                 # 依然是原始文件
-                 file_results = await fetch_files_common(self.bot, file_data)
-                 if file_results: await interaction.followup.send(content="👑 主人请拿好（无水印原版）：", files=make_discord_files_common(file_results), ephemeral=True)
-                 return
+            if interaction.user.id == row["owner_id"] and not has_test_role:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                file_data = [
+                    ensure_file_entry_defaults(f)
+                    for f in json.loads(row["storage_urls"])
+                ]
+                # 依然是原始文件
+                file_results = await fetch_files_common(self.bot, file_data)
+                if file_results:
+                    await interaction.followup.send(
+                        content="👑 主人请拿好（无水印原版）：",
+                        files=make_discord_files_common(file_results),
+                        ephemeral=True,
+                    )
+                return
             # 否则弹出密码框
-            await interaction.response.send_modal(PasswordUnlockModal(row['password'], row, self.bot, unlock_type))
+            await interaction.response.send_modal(
+                PasswordUnlockModal(row["password"], row, self.bot, unlock_type)
+            )
 
         # 2. 普通模式 (验证点赞评论)
         else:
             await interaction.response.defer(ephemeral=True, thinking=True)
-            success, msg = await check_requirements_common(interaction, unlock_type, row['owner_id'], row['message_id'])
-            if not success: return await interaction.followup.send(msg, ephemeral=True)
+            success, msg = await check_requirements_common(
+                interaction, unlock_type, row["owner_id"], row["message_id"]
+            )
+            if not success:
+                return await interaction.followup.send(msg, ephemeral=True)
 
             # 验证通过后，进入注入流程
             await start_download_flow(interaction, self.bot, row)
+
 
 class BumpButtonView(discord.ui.View):
     def __init__(self, bot):
@@ -622,27 +1270,30 @@ class BumpButtonView(discord.ui.View):
         return {
             "content": message_content,
             "embed": None,
-            "view": self # 直接返回当前实例
+            "view": self,  # 直接返回当前实例
         }
 
     @discord.ui.button(
         label="获取本帖附件",
         style=discord.ButtonStyle.blurple,
         custom_id="bump_get_attachments",
-        emoji="📥"
+        emoji="📥",
     )
-    async def get_attachments_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def get_attachments_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         """
         按钮点击后的回调：查找附件并显示下拉菜单。
         """
 
         bot = interaction.client
-        rows = await protection_db.get_items_in_channel(interaction.channel_id, limit=25)
+        rows = await protection_db.get_items_in_channel(
+            interaction.channel_id, limit=25
+        )
 
         if not rows:
             return await interaction.response.send_message(
-                "❌ 本频道当前没有任何受保护的附件记录。",
-                ephemeral=True
+                "❌ 本频道当前没有任何受保护的附件记录。", ephemeral=True
             )
 
         view = PostListView(bot, rows)
@@ -650,7 +1301,9 @@ class BumpButtonView(discord.ui.View):
         result_embed = discord.Embed(
             title="📂 附件获取列表",
             description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个进行查看和下载。",
-            color=0x87ceeb
+            color=0x87CEEB,
         )
 
-        await interaction.response.send_message(embed=result_embed, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            embed=result_embed, view=view, ephemeral=True
+        )
