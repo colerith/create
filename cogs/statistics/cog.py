@@ -11,8 +11,21 @@ from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS
 
 
 TEST_MILESTONE_CHANNEL_ID = 1426616953975607476
-LIKE_MILESTONE_1K = 1000
-LIKE_MILESTONE_1K_KEY = "likes_1000"
+LIKE_MILESTONE_STEP = 1000
+MILESTONE_CONTENT_LINES = [
+    "奇米蛋闻到香香高热帖的味道啦，这颗作品蛋已经啵的一下冲破 **{milestone}** 赞！",
+    "叮咚——检测到超级闪亮的内容蛋，这篇帖子已经被大家亲亲到 **{milestone}** 赞啦！",
+    "奇米蛋滚过来报喜，这篇宝藏产出已经孵成金灿灿的 **{milestone}** 赞大蛋啦！",
+    "呀呼，这篇帖子被喜欢到冒小星星，已经顺利蹦到 **{milestone}** 赞咯！",
+    "报告报告，论坛里有一颗超人气奇米蛋作品，刚刚甜甜地突破 **{milestone}** 赞！",
+]
+MILESTONE_EMBED_DESCRIPTIONS = [
+    "这是一篇被大家狠狠干饭式点赞的作品，奇米蛋已经抱着小喇叭来庆祝啦。",
+    "喜欢值已经满到溢出来啦，快点进帖子围观这颗闪闪发光的内容蛋。",
+    "能量检测结果：超高热度、超多喜欢、超值得跳进去看看。",
+    "这篇帖子已经成功进化成 {milestone} 赞甜心明星帖，路过的都可以去蹭蹭好运。",
+    "一颗作品蛋被大家宠到发光，现在正处于“怎么这么香呀”状态。",
+]
 
 
 class StatisticsCog(commands.Cog):
@@ -46,54 +59,75 @@ class StatisticsCog(commands.Cog):
         except ValueError:
             return None
 
-    def _build_milestone_embed(
-        self, thread: discord.Thread, snapshot: dict
-    ) -> discord.Embed:
+    async def _get_thread_starter(
+        self, thread: discord.Thread
+    ) -> discord.Message | None:
+        starter = thread.starter_message
+        if starter:
+            return starter
+
+        try:
+            history = [msg async for msg in thread.history(limit=1, oldest_first=True)]
+            return history[0] if history else None
+        except (discord.errors.Forbidden, IndexError):
+            return None
+
+    def _get_message_image_url(self, message: discord.Message | None) -> str | None:
+        if not message:
+            return None
+
+        for attachment in message.attachments:
+            content_type = attachment.content_type or ""
+            if content_type.startswith("image/"):
+                return attachment.url
+
+        for embed in message.embeds:
+            if embed.image and embed.image.url:
+                return embed.image.url
+            if embed.thumbnail and embed.thumbnail.url:
+                return embed.thumbnail.url
+
+        return None
+
+    def _build_milestone_embed(self, snapshot: dict, milestone: int) -> discord.Embed:
         color = discord.Color.random()
         author_name = snapshot.get("author_name") or "未知作者"
         tags = snapshot.get("tags", [])
         tags_text = " / ".join(tags[:5]) if tags else "无标签"
         likes = snapshot.get("likes", 0)
         comments = snapshot.get("comments", 0)
+        description = random.choice(MILESTONE_EMBED_DESCRIPTIONS).format(
+            milestone=f"{milestone:,}"
+        )
+        forum_channel = self.bot.get_channel(snapshot["forum_channel_id"])
+        forum_text = (
+            forum_channel.mention
+            if forum_channel
+            else f"`{snapshot['forum_channel_id']}`"
+        )
+        thread_url = snapshot.get("thread_url") or "https://discord.com/channels/@me"
+        thread_name = snapshot.get("thread_name") or "未知帖子"
+        starter_image_url = snapshot.get("starter_image_url")
 
         embed = discord.Embed(
-            title="🎉 热门帖子突破 1K 赞",
-            description=(
-                f"**[{thread.name}]({thread.jump_url})** 获得了超过 **{LIKE_MILESTONE_1K}** 个赞，"
-                f"快来品鉴美味产出吧！！😋"
-            ),
+            title=f"🎉 热门帖子突破 {milestone:,} 赞",
+            description=f"**[{thread_name}]({thread_url})** 获得了超过 **{milestone:,}** 个赞。\n{description}",
             color=color,
             timestamp=datetime.now(TZ_SHANGHAI),
         )
         embed.add_field(name="作者", value=author_name, inline=True)
         embed.add_field(name="点赞 / 评论", value=f"{likes} / {comments}", inline=True)
-        embed.add_field(
-            name="所在论坛",
-            value=thread.parent.mention if thread.parent else "未知论坛",
-            inline=False,
-        )
+        embed.add_field(name="所在论坛", value=forum_text, inline=False)
         embed.add_field(name="标签", value=tags_text, inline=False)
         embed.add_field(
-            name="直达链接", value=f"[点击跳转到帖子]({thread.jump_url})", inline=False
+            name="直达链接", value=f"[点击跳转到帖子]({thread_url})", inline=False
         )
+        if starter_image_url:
+            embed.set_thumbnail(url=starter_image_url)
         embed.set_footer(text="统计系统自动播报")
         return embed
 
-    async def maybe_send_like_milestone_notification(
-        self, thread: discord.Thread, previous_likes: int | None, snapshot: dict
-    ):
-        current_likes = snapshot.get("likes", 0)
-        crossed_threshold = current_likes >= LIKE_MILESTONE_1K and (
-            previous_likes is None or previous_likes < LIKE_MILESTONE_1K
-        )
-        if not crossed_threshold:
-            return
-
-        if await statistics_db.has_thread_milestone_notification(
-            thread.id, LIKE_MILESTONE_1K_KEY
-        ):
-            return
-
+    async def send_like_milestone_notification(self, snapshot: dict, milestone: int):
         target_channel = self.bot.get_channel(TEST_MILESTONE_CHANNEL_ID)
         if target_channel is None:
             try:
@@ -106,26 +140,20 @@ class StatisticsCog(commands.Cog):
             print(f"里程碑测试频道不可发送消息: {TEST_MILESTONE_CHANNEL_ID}")
             return
 
-        embed = self._build_milestone_embed(thread, snapshot)
-        content = f"🥳 发现一篇帖子刚刚突破 **{LIKE_MILESTONE_1K}** 赞！"
+        embed = self._build_milestone_embed(snapshot, milestone)
+        content = "🥳 " + random.choice(MILESTONE_CONTENT_LINES).format(
+            milestone=f"{milestone:,}"
+        )
         try:
             await target_channel.send(content=content, embed=embed)
-            await statistics_db.record_thread_milestone_notification(
-                thread.id, LIKE_MILESTONE_1K_KEY
+            await statistics_db.set_thread_like_milestone(
+                snapshot["thread_id"], milestone
             )
         except (discord.Forbidden, discord.HTTPException) as e:
-            print(f"发送帖子里程碑通知失败 {thread.id}: {e}")
+            print(f"发送帖子里程碑通知失败 {snapshot['thread_id']}: {e}")
 
     async def _build_thread_snapshot(self, thread: discord.Thread) -> dict:
-        starter = thread.starter_message
-        if not starter:
-            try:
-                history = [
-                    msg async for msg in thread.history(limit=1, oldest_first=True)
-                ]
-                starter = history[0] if history else None
-            except (discord.errors.Forbidden, IndexError):
-                starter = None
+        starter = await self._get_thread_starter(thread)
 
         last_message_at = None
         try:
@@ -153,6 +181,7 @@ class StatisticsCog(commands.Cog):
             "comments": comments,
             "score": likes * 1.5 + comments,
             "tags": [tag.name for tag in thread.applied_tags],
+            "starter_image_url": self._get_message_image_url(starter),
             "is_archived": thread.archived,
             "last_synced_at": datetime.now(TZ_SHANGHAI).isoformat(),
         }
@@ -161,28 +190,13 @@ class StatisticsCog(commands.Cog):
         if not forum:
             return
 
-        existing_threads = {
-            item["thread_id"]: item
-            for item in await statistics_db.get_cached_forum_threads(
-                forum.id, include_archived=True
-            )
-        }
         active_thread_ids = []
         synced_at = datetime.now(TZ_SHANGHAI).isoformat()
         for thread in forum.threads:
             try:
-                previous_snapshot = existing_threads.get(thread.id)
-                previous_likes = (
-                    previous_snapshot.get("likes")
-                    if previous_snapshot is not None
-                    else None
-                )
                 snapshot = await self._build_thread_snapshot(thread)
                 snapshot["last_synced_at"] = synced_at
                 await statistics_db.upsert_forum_thread_snapshot(snapshot)
-                await self.maybe_send_like_milestone_notification(
-                    thread, previous_likes, snapshot
-                )
                 active_thread_ids.append(thread.id)
                 await asyncio.sleep(0.2)
             except discord.Forbidden:
@@ -278,6 +292,25 @@ class StatisticsCog(commands.Cog):
             return None
         await self.ensure_forum_thread_cache(forum)
         return await self.build_statistics_from_cache(forum)
+
+    async def process_like_milestones(self):
+        milestone_candidates = (
+            await statistics_db.get_threads_ready_for_like_milestones(
+                LIKE_MILESTONE_STEP
+            )
+        )
+        for snapshot in milestone_candidates:
+            likes = snapshot.get("likes", 0)
+            target_milestone = (likes // LIKE_MILESTONE_STEP) * LIKE_MILESTONE_STEP
+            last_milestone = snapshot.get("last_like_milestone", 0)
+            if (
+                target_milestone < LIKE_MILESTONE_STEP
+                or target_milestone <= last_milestone
+            ):
+                continue
+
+            await self.send_like_milestone_notification(snapshot, target_milestone)
+            await asyncio.sleep(0.5)
 
     # ==========================================
     # Part 1. 斜杠命令
@@ -452,25 +485,17 @@ class StatisticsCog(commands.Cog):
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动论坛帖子缓存同步任务...")
 
         forums_to_sync = {}
-        panels = await statistics_db.get_all_statistics_panels()
-        for panel_info in panels:
-            guild = self.bot.get_guild(panel_info["guild_id"])
-            if not guild:
-                continue
-            forum = guild.get_channel(panel_info["forum_channel_id"])
-            if isinstance(forum, discord.ForumChannel):
-                forums_to_sync[forum.id] = forum
-
         for guild in self.bot.guilds:
             for forum in guild.forums:
-                if any(keyword in forum.name for keyword in RECOMMEND_TARGET_KEYWORDS):
-                    forums_to_sync[forum.id] = forum
+                forums_to_sync[forum.id] = forum
 
         for forum in forums_to_sync.values():
             try:
                 await self.sync_forum_thread_cache(forum)
             except Exception as e:
                 print(f"同步论坛缓存失败 {forum.id}: {e}")
+
+        await self.process_like_milestones()
 
     @thread_cache_sync_task.before_loop
     async def before_thread_cache_sync_task(self):

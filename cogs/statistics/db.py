@@ -48,23 +48,29 @@ async def init_statistics_db():
                 comments INTEGER NOT NULL DEFAULT 0,
                 score REAL NOT NULL DEFAULT 0,
                 tags_json TEXT NOT NULL DEFAULT '[]',
+                starter_image_url TEXT,
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 last_synced_at TEXT NOT NULL
             )
         """)
+        try:
+            await db.execute(
+                "ALTER TABLE forum_thread_cache ADD COLUMN starter_image_url TEXT"
+            )
+        except Exception:
+            pass
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_forum ON forum_thread_cache (forum_channel_id, is_archived)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_synced ON forum_thread_cache (last_synced_at)"
         )
-        # 4. 帖子里程碑通知记录表
+        # 4. 帖子里程碑状态表
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS thread_milestone_notifications (
-                thread_id INTEGER NOT NULL,
-                milestone_type TEXT NOT NULL,
-                notified_at TEXT NOT NULL,
-                PRIMARY KEY (thread_id, milestone_type)
+            CREATE TABLE IF NOT EXISTS thread_milestone_state (
+                thread_id INTEGER PRIMARY KEY,
+                last_like_milestone INTEGER NOT NULL DEFAULT 0,
+                last_notified_at TEXT NOT NULL
             )
         """)
         await db.commit()
@@ -121,8 +127,8 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
             INSERT INTO forum_thread_cache (
                 thread_id, guild_id, forum_channel_id, thread_name, thread_url,
                 author_id, author_name, created_at, last_message_at, likes,
-                comments, score, tags_json, is_archived, last_synced_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                comments, score, tags_json, starter_image_url, is_archived, last_synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET
                 guild_id = excluded.guild_id,
                 forum_channel_id = excluded.forum_channel_id,
@@ -136,6 +142,7 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
                 comments = excluded.comments,
                 score = excluded.score,
                 tags_json = excluded.tags_json,
+                starter_image_url = excluded.starter_image_url,
                 is_archived = excluded.is_archived,
                 last_synced_at = excluded.last_synced_at
             """,
@@ -153,6 +160,7 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
                 snapshot.get("comments", 0),
                 snapshot.get("score", 0),
                 json.dumps(snapshot.get("tags", []), ensure_ascii=False),
+                snapshot.get("starter_image_url"),
                 1 if snapshot.get("is_archived") else 0,
                 snapshot["last_synced_at"],
             ),
@@ -183,12 +191,18 @@ async def mark_missing_forum_threads_archived(
         await db.commit()
 
 
-async def record_thread_milestone_notification(thread_id: int, milestone_type: str):
-    """记录帖子里程碑已通知。"""
+async def set_thread_like_milestone(thread_id: int, milestone: int):
+    """记录帖子已播报的最高点赞里程碑。"""
     async with get_db() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO thread_milestone_notifications (thread_id, milestone_type, notified_at) VALUES (?, ?, ?)",
-            (thread_id, milestone_type, datetime.now(TZ_SHANGHAI).isoformat()),
+            """
+            INSERT INTO thread_milestone_state (thread_id, last_like_milestone, last_notified_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                last_like_milestone = excluded.last_like_milestone,
+                last_notified_at = excluded.last_notified_at
+            """,
+            (thread_id, milestone, datetime.now(TZ_SHANGHAI).isoformat()),
         )
         await db.commit()
 
@@ -254,17 +268,38 @@ async def get_cache_sync_summary(forum_channel_id: int):
         return await cursor.fetchone()
 
 
-async def has_thread_milestone_notification(
-    thread_id: int, milestone_type: str
-) -> bool:
-    """检查帖子里程碑是否已通知。"""
+async def get_thread_like_milestone(thread_id: int) -> int:
+    """获取帖子已播报的最高点赞里程碑。"""
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT 1 FROM thread_milestone_notifications WHERE thread_id = ? AND milestone_type = ?",
-            (thread_id, milestone_type),
+            "SELECT last_like_milestone FROM thread_milestone_state WHERE thread_id = ?",
+            (thread_id,),
         )
         row = await cursor.fetchone()
-        return row is not None
+        return row[0] if row else 0
+
+
+async def get_threads_ready_for_like_milestones(min_likes: int = 1000) -> list:
+    """获取所有达到点赞里程碑且可播报的缓存帖子。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT c.*, COALESCE(s.last_like_milestone, 0) AS last_like_milestone
+            FROM forum_thread_cache c
+            LEFT JOIN thread_milestone_state s ON s.thread_id = c.thread_id
+            WHERE c.likes >= ?
+            ORDER BY c.likes DESC, c.last_synced_at DESC
+            """,
+            (min_likes,),
+        )
+        rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.get("tags_json") or "[]")
+            result.append(item)
+        return result
 
 
 async def get_recently_bumped_threads(days: int = 7) -> set:
