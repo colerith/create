@@ -46,6 +46,18 @@ FILE_TAG_OPTIONS = [
 ]
 
 
+class CachedAttachment:
+    def __init__(self, filename, title, data, content_type=None, size=None):
+        self.filename = filename
+        self.title = title
+        self._data = data
+        self.content_type = content_type
+        self.size = size if size is not None else len(data)
+
+    async def read(self):
+        return self._data
+
+
 def log_attachment_debug(stage, attachment):
     attr_names = [
         "id",

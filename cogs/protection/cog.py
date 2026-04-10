@@ -19,6 +19,7 @@ from .views import (
     BumpButtonView,
     UploadSessionControlView,
     UPLOAD_SESSION_TIMEOUT_SECONDS,
+    CachedAttachment,
 )
 
 
@@ -253,7 +254,28 @@ class ProtectionCog(commands.Cog):
         default_log_parts = []
         source_messages = session["messages"]
         for msg in source_messages:
-            attachments.extend(msg.attachments)
+            for att in msg.attachments:
+                try:
+                    file_bytes = await att.read()
+                except Exception as exc:
+                    print(
+                        f"[ProtectionDebug] upload-session-read-source-failed: message={msg.id} attachment={getattr(att, 'id', None)} error={exc}"
+                    )
+                    return await interaction.response.edit_message(
+                        content=f"❌ 收纳附件失败：{exc}",
+                        embed=None,
+                        view=None,
+                    )
+
+                attachments.append(
+                    CachedAttachment(
+                        filename=att.filename,
+                        title=getattr(att, "title", None),
+                        data=file_bytes,
+                        content_type=getattr(att, "content_type", None),
+                        size=getattr(att, "size", None),
+                    )
+                )
             if msg.content:
                 default_log_parts.append(msg.content)
 
