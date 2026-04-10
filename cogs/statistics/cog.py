@@ -60,7 +60,7 @@ class StatisticsCog(commands.Cog):
             title="🎉 热门帖子突破 1K 赞",
             description=(
                 f"**[{thread.name}]({thread.jump_url})** 获得了超过 **{LIKE_MILESTONE_1K}** 个赞，"
-                f"快去围观这篇高热作品。"
+                f"快来品鉴美味产出吧！！😋"
             ),
             color=color,
             timestamp=datetime.now(TZ_SHANGHAI),
