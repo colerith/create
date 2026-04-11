@@ -108,9 +108,8 @@ def get_attachment_original_name(attachment):
     candidate = title or filename
 
     if candidate and filename:
-        candidate_ext = os.path.splitext(candidate)[1]
         filename_ext = os.path.splitext(filename)[1]
-        if filename_ext and not candidate_ext:
+        if filename_ext and not candidate.lower().endswith(filename_ext.lower()):
             candidate = f"{candidate}{filename_ext}"
 
     print(
