@@ -103,12 +103,23 @@ def log_attachment_debug(stage, attachment):
 
 def get_attachment_original_name(attachment):
     log_attachment_debug("attachment-name-detect", attachment)
-    candidate = getattr(attachment, "title", None) or getattr(
-        attachment, "filename", None
-    )
+    title = getattr(attachment, "title", None)
+    filename = getattr(attachment, "filename", None)
+    candidate = title or filename
+
+    if candidate and filename:
+        candidate_ext = os.path.splitext(candidate)[1]
+        filename_ext = os.path.splitext(filename)[1]
+        if filename_ext and not candidate_ext:
+            candidate = f"{candidate}{filename_ext}"
+
     print(
         "[ProtectionDebug] attachment-name-result:",
-        {"chosen_name": candidate or "unknown"},
+        {
+            "chosen_name": candidate or "unknown",
+            "title": title,
+            "filename": filename,
+        },
     )
     return candidate or "unknown"
 
