@@ -7,11 +7,15 @@ import random
 
 from . import db as statistics_db
 from .views import ForumSelectView, StatisticsContainerView
-from config import TZ_SHANGHAI, RECOMMEND_TARGET_KEYWORDS
+from config import (
+    TZ_SHANGHAI,
+    RECOMMEND_TARGET_KEYWORDS,
+    MILESTONE_FIRST_BREAK_CHANNEL_ID,
+)
 
 
-TEST_MILESTONE_CHANNEL_ID = 1426616953975607476
 LIKE_MILESTONE_STEP = 1000
+FIRST_BREAK_MILESTONES = (1000, 10000)
 MILESTONE_CONTENT_LINES = [
     "奇米蛋闻到香香高热帖的味道啦，这颗作品蛋已经啵的一下冲破 **{milestone}** 赞！",
     "叮咚——检测到超级闪亮的内容蛋，这篇帖子已经被大家亲亲到 **{milestone}** 赞啦！",
@@ -127,30 +131,82 @@ class StatisticsCog(commands.Cog):
         embed.set_footer(text="统计系统自动播报")
         return embed
 
-    async def send_like_milestone_notification(self, snapshot: dict, milestone: int):
-        target_channel = self.bot.get_channel(TEST_MILESTONE_CHANNEL_ID)
+    async def _fetch_messageable_channel(self, channel_id: int):
+        target_channel = self.bot.get_channel(channel_id)
         if target_channel is None:
             try:
-                target_channel = await self.bot.fetch_channel(TEST_MILESTONE_CHANNEL_ID)
+                target_channel = await self.bot.fetch_channel(channel_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                print(f"获取里程碑测试频道失败: {e}")
-                return
+                print(f"获取频道失败 {channel_id}: {e}")
+                return None
 
         if not isinstance(target_channel, discord.abc.Messageable):
-            print(f"里程碑测试频道不可发送消息: {TEST_MILESTONE_CHANNEL_ID}")
-            return
+            print(f"频道不可发送消息: {channel_id}")
+            return None
+
+        return target_channel
+
+    async def _fetch_thread_channel(self, thread_id: int):
+        thread = self.bot.get_channel(thread_id)
+        if thread is None:
+            try:
+                thread = await self.bot.fetch_channel(thread_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                print(f"获取原帖频道失败 {thread_id}: {e}")
+                return None
+
+        if not isinstance(thread, discord.Thread):
+            return None
+        if thread.archived:
+            return None
+        return thread
+
+    async def send_like_milestone_notification(self, snapshot: dict, milestone: int):
+        thread_channel = await self._fetch_thread_channel(snapshot["thread_id"])
+        if not thread_channel:
+            return False
 
         embed = self._build_milestone_embed(snapshot, milestone)
         content = "🥳 " + random.choice(MILESTONE_CONTENT_LINES).format(
             milestone=f"{milestone:,}"
         )
         try:
-            await target_channel.send(content=content, embed=embed)
-            await statistics_db.set_thread_like_milestone(
-                snapshot["thread_id"], milestone
-            )
+            await thread_channel.send(content=content, embed=embed)
+            await statistics_db.set_thread_like_milestone(snapshot["thread_id"], milestone)
+            return True
         except (discord.Forbidden, discord.HTTPException) as e:
             print(f"发送帖子里程碑通知失败 {snapshot['thread_id']}: {e}")
+            return False
+
+    async def send_first_break_notification(self, snapshot: dict, milestone: int):
+        if milestone not in FIRST_BREAK_MILESTONES:
+            return False
+
+        target_channel = await self._fetch_messageable_channel(
+            MILESTONE_FIRST_BREAK_CHANNEL_ID
+        )
+        if target_channel is None:
+            return False
+
+        thread_name = snapshot.get("thread_name") or "未知帖子"
+        thread_url = snapshot.get("thread_url") or "https://discord.com/channels/@me"
+        likes = snapshot.get("likes", 0)
+        content = (
+            f"📈 帖子 **{thread_name}** 首次突破 **{milestone:,}** 赞！\n"
+            f"当前点赞：**{likes:,}**\n"
+            f"原帖直达：{thread_url}"
+        )
+        embed = self._build_milestone_embed(snapshot, milestone)
+
+        try:
+            await target_channel.send(content=content, embed=embed)
+            await statistics_db.mark_first_break_milestone_notified(
+                snapshot["thread_id"], milestone
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"发送首破里程碑通知失败 {snapshot['thread_id']} ({milestone}): {e}")
+            return False
 
     async def _build_thread_snapshot(self, thread: discord.Thread) -> dict:
         starter = await self._get_thread_starter(thread)
@@ -301,7 +357,13 @@ class StatisticsCog(commands.Cog):
                 LIKE_MILESTONE_STEP
             )
         )
+
+        processed_count = 0
+        regular_sent_count = 0
+        first_break_sent_count = 0
+
         for snapshot in milestone_candidates:
+            processed_count += 1
             likes = snapshot.get("likes", 0)
             target_milestone = (likes // LIKE_MILESTONE_STEP) * LIKE_MILESTONE_STEP
             last_milestone = snapshot.get("last_like_milestone", 0)
@@ -309,10 +371,33 @@ class StatisticsCog(commands.Cog):
                 target_milestone < LIKE_MILESTONE_STEP
                 or target_milestone <= last_milestone
             ):
-                continue
+                target_milestone = None
 
-            await self.send_like_milestone_notification(snapshot, target_milestone)
+            if target_milestone is not None:
+                sent_regular = await self.send_like_milestone_notification(
+                    snapshot, target_milestone
+                )
+                if sent_regular:
+                    regular_sent_count += 1
+
+            notified_first_1000 = snapshot.get("notified_first_1000", 0)
+            notified_first_10000 = snapshot.get("notified_first_10000", 0)
+            if likes >= 1000 and not notified_first_1000:
+                sent = await self.send_first_break_notification(snapshot, 1000)
+                if sent:
+                    first_break_sent_count += 1
+            if likes >= 10000 and not notified_first_10000:
+                sent = await self.send_first_break_notification(snapshot, 10000)
+                if sent:
+                    first_break_sent_count += 1
+
             await asyncio.sleep(0.5)
+
+        return {
+            "processed_count": processed_count,
+            "regular_sent_count": regular_sent_count,
+            "first_break_sent_count": first_break_sent_count,
+        }
 
     # ==========================================
     # Part 1. 斜杠命令
@@ -357,6 +442,29 @@ class StatisticsCog(commands.Cog):
 
         await interaction.followup.send(
             f"✅ 清理完成！共移除了 **{cleaned_count}** 条无效的面板记录。",
+            ephemeral=True,
+        )
+
+    @statistics_group.command(
+        name="初始化里程碑通知",
+        description="[管理] 重置并重发当前所有里程碑通知（按当前最高里程碑）",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def reinitialize_milestone_notifications(
+        self, interaction: discord.Interaction
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        await statistics_db.reset_all_thread_milestone_state()
+        result = await self.process_like_milestones()
+
+        await interaction.followup.send(
+            (
+                "✅ 里程碑通知初始化完成。\n"
+                f"扫描帖子：**{result['processed_count']}**\n"
+                f"原帖里程碑通知：**{result['regular_sent_count']}**\n"
+                f"首破 1000/10000 专用通知：**{result['first_break_sent_count']}**"
+            ),
             ephemeral=True,
         )
 
@@ -498,7 +606,13 @@ class StatisticsCog(commands.Cog):
             except Exception as e:
                 print(f"同步论坛缓存失败 {forum.id}: {e}")
 
-        await self.process_like_milestones()
+        result = await self.process_like_milestones()
+        print(
+            "里程碑通知任务完成: "
+            f"扫描 {result['processed_count']}，"
+            f"原帖通知 {result['regular_sent_count']}，"
+            f"首破通知 {result['first_break_sent_count']}"
+        )
 
     @thread_cache_sync_task.before_loop
     async def before_thread_cache_sync_task(self):

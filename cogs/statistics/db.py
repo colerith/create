@@ -70,9 +70,23 @@ async def init_statistics_db():
             CREATE TABLE IF NOT EXISTS thread_milestone_state (
                 thread_id INTEGER PRIMARY KEY,
                 last_like_milestone INTEGER NOT NULL DEFAULT 0,
+                notified_first_1000 INTEGER NOT NULL DEFAULT 0,
+                notified_first_10000 INTEGER NOT NULL DEFAULT 0,
                 last_notified_at TEXT NOT NULL
             )
         """)
+        try:
+            await db.execute(
+                "ALTER TABLE thread_milestone_state ADD COLUMN notified_first_1000 INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE thread_milestone_state ADD COLUMN notified_first_10000 INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
         await db.commit()
     print("✅ [StatisticsCog] 数据库表结构检查完毕。")
 
@@ -207,6 +221,36 @@ async def set_thread_like_milestone(thread_id: int, milestone: int):
         await db.commit()
 
 
+async def mark_first_break_milestone_notified(thread_id: int, milestone: int):
+    """记录帖子已播报首次突破 1000 / 10000 赞。"""
+    if milestone not in (1000, 10000):
+        return
+
+    field_name = (
+        "notified_first_1000" if milestone == 1000 else "notified_first_10000"
+    )
+    async with get_db() as db:
+        now_iso = datetime.now(TZ_SHANGHAI).isoformat()
+        await db.execute(
+            f"""
+            INSERT INTO thread_milestone_state (thread_id, {field_name}, last_notified_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                {field_name} = 1,
+                last_notified_at = excluded.last_notified_at
+            """,
+            (thread_id, now_iso),
+        )
+        await db.commit()
+
+
+async def reset_all_thread_milestone_state():
+    """清空所有帖子里程碑状态，用于里程碑系统初始化重发。"""
+    async with get_db() as db:
+        await db.execute("DELETE FROM thread_milestone_state")
+        await db.commit()
+
+
 # --- 读操作 (Read) ---
 
 
@@ -285,10 +329,14 @@ async def get_threads_ready_for_like_milestones(min_likes: int = 1000) -> list:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT c.*, COALESCE(s.last_like_milestone, 0) AS last_like_milestone
+            SELECT
+                c.*,
+                COALESCE(s.last_like_milestone, 0) AS last_like_milestone,
+                COALESCE(s.notified_first_1000, 0) AS notified_first_1000,
+                COALESCE(s.notified_first_10000, 0) AS notified_first_10000
             FROM forum_thread_cache c
             LEFT JOIN thread_milestone_state s ON s.thread_id = c.thread_id
-            WHERE c.likes >= ?
+            WHERE c.likes >= ? AND c.is_archived = 0
             ORDER BY c.likes DESC, c.last_synced_at DESC
             """,
             (min_likes,),
