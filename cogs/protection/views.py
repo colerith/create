@@ -8,11 +8,19 @@ import asyncio
 import os
 import aiosqlite
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from ..core.db import get_db
 from . import db as protection_db
 from .db import log_file_trace
-from config import TZ_SHANGHAI, BACKUP_CHANNEL_ID, DAILY_DOWNLOAD_LIMIT, TEST_ROLE_ID
+from config import (
+    TZ_SHANGHAI,
+    BACKUP_CHANNEL_ID,
+    DAILY_DOWNLOAD_LIMIT,
+    TEST_ROLE_ID,
+    DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES,
+    DOWNLOAD_RATE_LIMIT_MAX_TIMES,
+    ABNORMAL_REPORT_CHANNEL_ID,
+)
 from .utils import (
     fetch_files_common,
     make_discord_files_common,
@@ -226,6 +234,73 @@ async def upload_files_for_storage(bot, user, title, prepared_files):
             }
         )
     return stored_data
+
+
+async def check_rate_limit_and_report(
+    interaction: discord.Interaction, bot, row
+) -> tuple[bool, str]:
+    """检查下载速率并在触发异常时上报。"""
+    since_dt = datetime.now(TZ_SHANGHAI) - timedelta(
+        minutes=DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES
+    )
+    since_iso = since_dt.isoformat()
+    logs = await protection_db.get_user_downloads_since(interaction.user.id, since_iso)
+
+    if len(logs) < DOWNLOAD_RATE_LIMIT_MAX_TIMES:
+        return True, ""
+
+    report_channel = bot.get_channel(ABNORMAL_REPORT_CHANNEL_ID)
+    if not report_channel:
+        try:
+            report_channel = await bot.fetch_channel(ABNORMAL_REPORT_CHANNEL_ID)
+        except Exception:
+            report_channel = None
+
+    if report_channel:
+        recent_history = await protection_db.get_recent_download_history(
+            interaction.user.id, limit=10
+        )
+        history_lines = []
+        for item in recent_history[:8]:
+            try:
+                ts = discord.utils.format_dt(datetime.fromisoformat(item["timestamp"]), "T")
+            except Exception:
+                ts = item["timestamp"]
+            channel_text = f"<#{item['channel_id']}>" if item["channel_id"] else "未知频道"
+            history_lines.append(
+                f"- {ts} | {channel_text} | {item['title'] or '无标题'}"
+            )
+
+        embed = discord.Embed(
+            title="🚨 异常下载速率告警",
+            color=discord.Color.red(),
+            description=(
+                f"用户: <@{interaction.user.id}> (`{interaction.user.id}`)\n"
+                f"触发阈值: {DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次\n"
+                f"当前窗口命中: {len(logs)} 次\n"
+                f"尝试下载: {row.get('title', '未知标题')}"
+            ),
+            timestamp=datetime.now(TZ_SHANGHAI),
+        )
+        if history_lines:
+            embed.add_field(
+                name="最近操作历史",
+                value="\n".join(history_lines)[:1024],
+                inline=False,
+            )
+
+        try:
+            await report_channel.send(embed=embed)
+        except Exception:
+            pass
+
+    return (
+        False,
+        (
+            f"⏱️ 下载过于频繁，请稍后再试。\n"
+            f"限制规则：{DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次。"
+        ),
+    )
 
 
 # --- 延迟下载视图 (核心修改区域) ---
@@ -1709,6 +1784,12 @@ class PostListView(ui.View):
             return
         row = self.selected_row
         unlock_type = row["unlock_type"]
+
+        allowed, reject_msg = await check_rate_limit_and_report(
+            interaction, self.bot, row
+        )
+        if not allowed:
+            return await interaction.response.send_message(reject_msg, ephemeral=True)
 
         # 1. 检查密码模式
         if "password" in unlock_type:

@@ -9,7 +9,13 @@ import asyncio
 import random
 
 # --- 从新的地方导入 ---
-from config import TZ_SHANGHAI, DAILY_DOWNLOAD_LIMIT
+from config import (
+    TZ_SHANGHAI,
+    DAILY_DOWNLOAD_LIMIT,
+    SUSPICIOUS_WINDOW_MINUTES,
+    SUSPICIOUS_MIN_DOWNLOADS,
+    SUSPICIOUS_LIST_PAGE_SIZE,
+)
 from . import db as protection_db
 from .utils import is_valid_comment, extract_trace_from_bytes
 from .views import (
@@ -332,6 +338,71 @@ class ProtectionCog(commands.Cog):
             f"✅ 修复完成！\n已移除按钮的消息: {success_count} 个\n失败/已删除: {fail_count} 个",
             ephemeral=True,
         )
+
+    @admin_group.command(name="可疑下载名单", description="查询短时间高频下载的可疑用户名单")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(page="页码，从 1 开始")
+    async def suspicious_download_list(
+        self, interaction: discord.Interaction, page: app_commands.Range[int, 1, 999] = 1
+    ):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "❌ 仅管理员可使用此命令。", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        since_dt = datetime.now(TZ_SHANGHAI) - timedelta(minutes=SUSPICIOUS_WINDOW_MINUTES)
+        since_iso = since_dt.isoformat()
+
+        total_users = await protection_db.count_suspicious_users_in_window(
+            since_iso, SUSPICIOUS_MIN_DOWNLOADS
+        )
+        if total_users == 0:
+            return await interaction.followup.send(
+                f"✅ 最近 {SUSPICIOUS_WINDOW_MINUTES} 分钟内暂无达到阈值（{SUSPICIOUS_MIN_DOWNLOADS} 次）的用户。",
+                ephemeral=True,
+            )
+
+        page_size = SUSPICIOUS_LIST_PAGE_SIZE
+        total_pages = max(1, (total_users + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+
+        offset = (page - 1) * page_size
+        rows = await protection_db.get_suspicious_users_in_window(
+            since_iso,
+            SUSPICIOUS_MIN_DOWNLOADS,
+            limit=page_size,
+            offset=offset,
+        )
+
+        embed = discord.Embed(
+            title="🚨 短时高频下载可疑名单",
+            color=discord.Color.orange(),
+            description=(
+                f"统计窗口: 最近 {SUSPICIOUS_WINDOW_MINUTES} 分钟\n"
+                f"触发阈值: ≥ {SUSPICIOUS_MIN_DOWNLOADS} 次下载"
+            ),
+        )
+        lines = []
+        for idx, row in enumerate(rows, start=offset + 1):
+            user_id = row["user_id"]
+            download_count = row["download_count"]
+            unique_posts = row["unique_posts"]
+            latest_ts = row["latest_timestamp"]
+            try:
+                latest_fmt = discord.utils.format_dt(
+                    datetime.fromisoformat(latest_ts), "T"
+                )
+            except Exception:
+                latest_fmt = latest_ts
+            lines.append(
+                f"{idx}. <@{user_id}> (`{user_id}`) | 次数: **{download_count}** | 帖子: **{unique_posts}** | 最近: {latest_fmt}"
+            )
+
+        embed.add_field(name="名单", value="\n".join(lines)[:1024], inline=False)
+        embed.set_footer(text=f"第 {page}/{total_pages} 页 | 总人数 {total_users}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @admin_group.command(name="溯源", description="检查文件水印并查询下载记录")
     @app_commands.describe(file="请上传需要检查的文件")

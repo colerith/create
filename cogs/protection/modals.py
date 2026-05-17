@@ -176,6 +176,10 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
             return await i.followup.send(msg, ephemeral=True)
 
         # 【关键修复】在此处延迟导入，解决循环依赖
-        from .views import start_download_flow
+        from .views import start_download_flow, check_rate_limit_and_report
+
+        allowed, reject_msg = await check_rate_limit_and_report(i, self.bot, self.row)
+        if not allowed:
+            return await i.followup.send(reject_msg, ephemeral=True)
 
         await start_download_flow(i, self.bot, self.row)

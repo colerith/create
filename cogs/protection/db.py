@@ -180,3 +180,73 @@ async def get_user_download_logs_page(user_id: int, limit: int = 10, offset: int
             (user_id, limit, offset),
         )
         return await cursor.fetchall()
+
+
+async def count_suspicious_users_in_window(since_ts: str, min_downloads: int) -> int:
+    """统计时间窗口内达到阈值下载次数的用户数。"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT user_id
+                FROM download_log
+                WHERE timestamp >= ?
+                GROUP BY user_id
+                HAVING COUNT(*) >= ?
+            ) t
+            """,
+            (since_ts, min_downloads),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_suspicious_users_in_window(
+    since_ts: str, min_downloads: int, limit: int = 10, offset: int = 0
+):
+    """分页获取时间窗口内短时高频下载用户。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                dl.user_id,
+                COUNT(*) AS download_count,
+                COUNT(DISTINCT dl.message_id) AS unique_posts,
+                MAX(dl.timestamp) AS latest_timestamp
+            FROM download_log dl
+            WHERE dl.timestamp >= ?
+            GROUP BY dl.user_id
+            HAVING COUNT(*) >= ?
+            ORDER BY download_count DESC, latest_timestamp DESC
+            LIMIT ? OFFSET ?
+            """,
+            (since_ts, min_downloads, limit, offset),
+        )
+        return await cursor.fetchall()
+
+
+async def get_recent_download_history(user_id: int, limit: int = 10):
+    """获取用户最近下载历史，包含来源频道。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                dl.log_id,
+                dl.user_id,
+                dl.message_id,
+                dl.title,
+                dl.filenames,
+                dl.timestamp,
+                pi.channel_id
+            FROM download_log dl
+            LEFT JOIN protected_items pi ON dl.message_id = pi.message_id
+            WHERE dl.user_id = ?
+            ORDER BY dl.timestamp DESC, dl.log_id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cursor.fetchall()
