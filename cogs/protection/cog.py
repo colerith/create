@@ -439,7 +439,7 @@ class ProtectionCog(commands.Cog):
             )
 
         posts = [dict(row) for row in rows]
-        view = PostSelectionView(posts)
+        view = PostSelectionView(self.bot, posts)
         await interaction.response.send_message(
             f"你在此频道中发布了 {len(posts)} 个受保护的附件，请选择进行管理：",
             view=view,

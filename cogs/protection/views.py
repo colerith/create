@@ -181,6 +181,53 @@ def apply_rename_lines_to_entries(entries, raw_text, start=None, end=None):
     return updated
 
 
+async def upload_files_for_storage(bot, user, title, prepared_files):
+    """
+    与发布流程一致的存储上传逻辑：优先私信备份，失败则转发到备份频道。
+    prepared_files: [(file_bytes, final_filename, entry_dict), ...]
+    """
+    try:
+        dm = await user.create_dm()
+        dm_files = [
+            discord.File(io.BytesIO(file_bytes), filename=final_filename)
+            for file_bytes, final_filename, _entry in prepared_files
+        ]
+        backup_msg = await dm.send(
+            content=f"【{title}】的私信备份！\n(此消息仅作为文件源，请勿删除)",
+            files=dm_files,
+        )
+    except Exception as e:
+        print(f"DM backup failed: {e}")
+        fallback_channel = bot.get_channel(BACKUP_CHANNEL_ID)
+        if not fallback_channel:
+            fallback_channel = await bot.fetch_channel(BACKUP_CHANNEL_ID)
+        fallback_files = [
+            discord.File(io.BytesIO(file_bytes), filename=final_filename)
+            for file_bytes, final_filename, _entry in prepared_files
+        ]
+        backup_msg = await fallback_channel.send(
+            content=f"📦 **备用存储** (DM Failed)\nUser: {user} ({user.id})\nTitle: {title}",
+            files=fallback_files,
+        )
+
+    stored_data = []
+    for i, att in enumerate(backup_msg.attachments):
+        entry = dict(prepared_files[i][2])
+        stored_data.append(
+            {
+                "strategy": "msg_ref",
+                "channel_id": backup_msg.channel.id,
+                "message_id": backup_msg.id,
+                "attachment_index": i,
+                "filename": entry["filename"],
+                "original_filename": entry["original_filename"],
+                "tag": entry.get("tag"),
+                "url": att.url,
+            }
+        )
+    return stored_data
+
+
 # --- 延迟下载视图 (核心修改区域) ---
 class AuthorNoteView(ui.View):
     def __init__(self, bot, row):
@@ -938,48 +985,13 @@ class ProtectionDraftView(ui.View):
         except Exception as e:
             return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
 
-        stored_data = []
         try:
-            # 优先私信，失败转存备份频道
-            try:
-                dm = await self.user.create_dm()
-                dm_files = [
-                    discord.File(io.BytesIO(file_bytes), filename=final_filename)
-                    for file_bytes, final_filename, entry in prepared_files
-                ]
-                backup_msg = await dm.send(
-                    content=f"【{self.draft_title}】的私信备份！\nID: {interaction.id}\n(此消息仅作为文件源，请勿删除)",
-                    files=dm_files,
-                )
-            except Exception as e:
-                print(f"DM backup failed: {e}")
-                # Fallback
-                fallback_channel = self.bot.get_channel(BACKUP_CHANNEL_ID)
-                if not fallback_channel:
-                    fallback_channel = await self.bot.fetch_channel(BACKUP_CHANNEL_ID)
-                fallback_files = [
-                    discord.File(io.BytesIO(file_bytes), filename=final_filename)
-                    for file_bytes, final_filename, entry in prepared_files
-                ]
-                backup_msg = await fallback_channel.send(
-                    content=f"📦 **备用存储** (DM Failed)\nUser: {self.user} ({self.user.id})\nTitle: {self.draft_title}",
-                    files=fallback_files,
-                )
-
-            for i, att in enumerate(backup_msg.attachments):
-                entry = dict(self.file_entries[i])
-                stored_data.append(
-                    {
-                        "strategy": "msg_ref",
-                        "channel_id": backup_msg.channel.id,
-                        "message_id": backup_msg.id,
-                        "attachment_index": i,
-                        "filename": entry["filename"],
-                        "original_filename": entry["original_filename"],
-                        "tag": entry.get("tag"),
-                        "url": att.url,
-                    }
-                )
+            stored_data = await upload_files_for_storage(
+                self.bot,
+                self.user,
+                self.draft_title,
+                prepared_files,
+            )
         except Exception as e:
             return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
 
@@ -1221,10 +1233,14 @@ class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
 
 # --- 管理视图组件 ---
 class ManageFilesSelectView(ui.View):
-    def __init__(self, message_id, file_data):
-        super().__init__(timeout=60)
+    def __init__(self, bot, owner_id, message_id, file_data, post_title):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.owner_id = owner_id
         self.message_id = message_id
         self.file_data = file_data
+        self.post_title = post_title
+        self.selected_index = 0
         options = []
         for i, f in enumerate(file_data):
             ensure_file_entry_defaults(f)
@@ -1234,16 +1250,152 @@ class ManageFilesSelectView(ui.View):
                     label=f"{i + 1}. {fname[:90]}",
                     value=str(i),
                     description=(f.get("original_filename") or fname)[:100],
+                    default=(i == 0),
                 )
             )
-        self.select = ui.Select(placeholder="选择要重命名的文件...", options=options)
+        self.select = ui.Select(placeholder="选择要操作的文件...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
 
     async def on_select(self, interaction: discord.Interaction):
-        idx = int(self.select.values[0])
+        self.selected_index = int(self.select.values[0])
+        for idx, option in enumerate(self.select.options):
+            option.default = idx == self.selected_index
+        entry = self.file_data[self.selected_index]
+        await interaction.response.edit_message(
+            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}",
+            view=self,
+        )
+
+    @ui.button(label="改名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
+    async def rename_file(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(
-            EditPublishedFileModal(self.message_id, idx, self.file_data)
+            EditPublishedFileModal(self.message_id, self.selected_index, self.file_data)
+        )
+
+    @ui.button(label="替换文件", style=discord.ButtonStyle.primary, row=1, emoji="♻️")
+    async def replace_file(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(
+            "请在当前频道 5 分钟内发送 1 条带附件的消息（将使用第一个附件进行替换）。",
+            ephemeral=True,
+        )
+
+        def check(msg: discord.Message):
+            return (
+                msg.author.id == self.owner_id
+                and msg.channel.id == interaction.channel.id
+                and len(msg.attachments) > 0
+            )
+
+        try:
+            msg = await self.bot.wait_for("message", timeout=300, check=check)
+        except asyncio.TimeoutError:
+            return await interaction.followup.send("⏰ 超时未收到附件，已取消替换。", ephemeral=True)
+
+        attachment = msg.attachments[0]
+        try:
+            file_bytes = await attachment.read()
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"❌ 读取附件失败：{exc}", ephemeral=True
+            )
+
+        old_entry = ensure_file_entry_defaults(self.file_data[self.selected_index])
+        new_original_name = get_attachment_original_name(attachment)
+        new_entry = ensure_file_entry_defaults(
+            {
+                "filename": new_original_name,
+                "original_filename": new_original_name,
+                "tag": old_entry.get("tag"),
+            }
+        )
+
+        try:
+            stored_data = await upload_files_for_storage(
+                self.bot,
+                interaction.user,
+                f"管理替换: {self.post_title}",
+                [(file_bytes, new_entry["filename"], new_entry)],
+            )
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"❌ 替换文件备份失败：{exc}", ephemeral=True
+            )
+
+        self.file_data[self.selected_index] = stored_data[0]
+        ensure_file_entry_defaults(self.file_data[self.selected_index])
+
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                (json.dumps(self.file_data), self.message_id),
+            )
+            await db.commit()
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        for idx, option in enumerate(self.select.options):
+            name = self.file_data[idx].get("filename", "unknown")
+            option.label = f"{idx + 1}. {name[:90]}"
+            option.description = (
+                self.file_data[idx].get("original_filename") or name
+            )[:100]
+            option.default = idx == self.selected_index
+
+        try:
+            await interaction.message.edit(
+                content=f"当前选中：{build_file_line(self.file_data[self.selected_index], self.selected_index + 1)}",
+                view=self,
+            )
+        except Exception:
+            pass
+
+        await interaction.followup.send(
+            f"✅ 已替换为：{self.file_data[self.selected_index]['filename']}",
+            ephemeral=True,
+        )
+
+    @ui.button(label="删除文件", style=discord.ButtonStyle.danger, row=1, emoji="🗑️")
+    async def delete_file(self, interaction: discord.Interaction, button: ui.Button):
+        if len(self.file_data) <= 1:
+            return await interaction.response.send_message(
+                "❌ 当前仅剩 1 个文件，无法单独删除。请使用“删除帖子”。",
+                ephemeral=True,
+            )
+
+        removed = self.file_data.pop(self.selected_index)
+        if self.selected_index >= len(self.file_data):
+            self.selected_index = len(self.file_data) - 1
+
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                (json.dumps(self.file_data), self.message_id),
+            )
+            await db.commit()
+
+        self.select.options = []
+        for i, f in enumerate(self.file_data):
+            ensure_file_entry_defaults(f)
+            fname = f.get("filename", "unknown")
+            self.select.options.append(
+                discord.SelectOption(
+                    label=f"{i + 1}. {fname[:90]}",
+                    value=str(i),
+                    description=(f.get("original_filename") or fname)[:100],
+                    default=(i == self.selected_index),
+                )
+            )
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ 已删除：{removed.get('filename', 'unknown')}\n"
+                f"当前选中：{build_file_line(self.file_data[self.selected_index], self.selected_index + 1)}"
+            ),
+            view=self,
         )
 
 
@@ -1289,12 +1441,76 @@ class EditUnlockModeView(ui.View):
 
 
 class PostManagementView(ui.View):
-    def __init__(self, message_id, file_data, current_title, current_note):
-        super().__init__(timeout=60)
+    def __init__(
+        self,
+        bot,
+        message_id,
+        file_data,
+        current_title,
+        current_note,
+        posts_rows=None,
+    ):
+        super().__init__(timeout=600)
         self.message_id = message_id
+        self.bot = bot
         self.file_data = [ensure_file_entry_defaults(f) for f in file_data]
         self.current_title = current_title
         self.current_note = current_note
+        self.posts_rows = posts_rows or []
+        self.posts_map = {str(p["message_id"]): p for p in self.posts_rows}
+
+        if len(self.posts_rows) >= 2:
+            options = []
+            for p in self.posts_rows[:25]:
+                title = (p.get("title") or "无标题")[:90]
+                dl_count = p.get("download_count", 0)
+                message_id = p.get("message_id")
+                options.append(
+                    discord.SelectOption(
+                        label=title,
+                        value=str(message_id),
+                        description=f"下载: {dl_count}次 | ID: {message_id}",
+                        default=(message_id == self.message_id),
+                    )
+                )
+            self.switch_post_select = ui.Select(
+                placeholder="快捷切换到其他批次...",
+                options=options,
+                row=3,
+            )
+            self.switch_post_select.callback = self.on_switch_post
+            self.add_item(self.switch_post_select)
+
+    async def on_switch_post(self, interaction: discord.Interaction):
+        mid_str = self.switch_post_select.values[0]
+        row = self.posts_map.get(mid_str)
+        if not row:
+            return await interaction.response.send_message(
+                "❌ 切换失败，请重试。", ephemeral=True
+            )
+
+        try:
+            file_data = json.loads(row["storage_urls"])
+        except Exception:
+            file_data = []
+        file_data = [ensure_file_entry_defaults(f) for f in file_data]
+
+        current_title = row["title"]
+        current_note = row["log"]
+        embed = discord.Embed(
+            title=f"🔧 管理: {current_title}",
+            description="请选择操作：",
+            color=0xFFD700,
+        )
+        view = PostManagementView(
+            self.bot,
+            row["message_id"],
+            file_data,
+            current_title,
+            current_note,
+            posts_rows=self.posts_rows,
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
 
     # 第一排：内容修改
     @ui.button(label="改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
@@ -1309,11 +1525,17 @@ class PostManagementView(ui.View):
             EditProtectionNoteModal(self.message_id, self.current_note)
         )
 
-    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
+    @ui.button(label="单文件操作", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
     async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message(
-            "请选择要修改的文件：",
-            view=ManageFilesSelectView(self.message_id, self.file_data),
+            "请选择文件并执行操作（改名/替换/删除）：",
+            view=ManageFilesSelectView(
+                self.bot,
+                interaction.user.id,
+                self.message_id,
+                self.file_data,
+                self.current_title,
+            ),
             ephemeral=True,
         )
 
@@ -1364,8 +1586,10 @@ class PostManagementView(ui.View):
 
 
 class PostSelectionView(ui.View):
-    def __init__(self, posts_rows):
+    def __init__(self, bot, posts_rows):
         super().__init__(timeout=60)
+        self.bot = bot
+        self.posts_rows = posts_rows
         options = []
         for p in posts_rows:
             title = p["title"][:80]
@@ -1404,7 +1628,12 @@ class PostSelectionView(ui.View):
 
         # 实例化更新后的视图
         view = PostManagementView(
-            row["message_id"], file_data, current_title, current_note
+            self.bot,
+            row["message_id"],
+            file_data,
+            current_title,
+            current_note,
+            posts_rows=self.posts_rows,
         )
 
         await interaction.response.edit_message(embed=embed, view=view)
