@@ -35,7 +35,19 @@ class ProtectionCog(commands.Cog):
         self.ctx_menu = app_commands.ContextMenu(
             name="转为保护附件", callback=self.convert_to_protected
         )
+        self.bump_enable_ctx_menu = app_commands.ContextMenu(
+            name="激活置底消息", callback=self.ctx_enable_bump
+        )
+        self.bump_disable_ctx_menu = app_commands.ContextMenu(
+            name="关闭置底消息", callback=self.ctx_disable_bump
+        )
+        self.bump_refresh_ctx_menu = app_commands.ContextMenu(
+            name="刷新置底消息", callback=self.ctx_refresh_bump
+        )
         self.bot.tree.add_command(self.ctx_menu)
+        self.bot.tree.add_command(self.bump_enable_ctx_menu)
+        self.bot.tree.add_command(self.bump_disable_ctx_menu)
+        self.bot.tree.add_command(self.bump_refresh_ctx_menu)
         self.bump_tasks = {}
         self.upload_sessions = {}
 
@@ -91,6 +103,15 @@ class ProtectionCog(commands.Cog):
 
     async def cog_unload(self):
         self.bot.tree.remove_command(self.ctx_menu.name, type=self.ctx_menu.type)
+        self.bot.tree.remove_command(
+            self.bump_enable_ctx_menu.name, type=self.bump_enable_ctx_menu.type
+        )
+        self.bot.tree.remove_command(
+            self.bump_disable_ctx_menu.name, type=self.bump_disable_ctx_menu.type
+        )
+        self.bot.tree.remove_command(
+            self.bump_refresh_ctx_menu.name, type=self.bump_refresh_ctx_menu.type
+        )
         for task in self.bump_tasks.values():
             task.cancel()
 
@@ -111,6 +132,24 @@ class ProtectionCog(commands.Cog):
             return False
 
         return getattr(first_child, "custom_id", None) == "bump_get_attachments"
+
+    def _get_keepalive_interval(self, channel: discord.TextChannel | discord.Thread) -> timedelta:
+        """根据帖子自动归档时长计算保活重发间隔。"""
+        auto_archive_minutes = getattr(channel, "auto_archive_duration", 60) or 60
+        # 控制在 10 分钟~12 小时，默认按归档时长的 80% 重发一次
+        interval_minutes = max(10, min(int(auto_archive_minutes * 0.8), 12 * 60))
+        return timedelta(minutes=interval_minutes)
+
+    def _need_keepalive_repost(
+        self, channel: discord.TextChannel | discord.Thread, bump_message: discord.Message | None
+    ) -> bool:
+        if not bump_message:
+            return False
+        created_at = bump_message.created_at
+        if created_at is None:
+            return False
+        now_utc = datetime.now(created_at.tzinfo)
+        return (now_utc - created_at) >= self._get_keepalive_interval(channel)
 
     async def _scan_bump_messages(
         self, channel: discord.TextChannel | discord.Thread, limit: int = 10
@@ -581,70 +620,127 @@ class ProtectionCog(commands.Cog):
     )
     @app_commands.describe(开关="'on'开启, 'off'关闭")
     async def auto_bump(self, interaction: discord.Interaction, 开关: str):
-        is_admin = interaction.user.guild_permissions.administrator
-        # 修正：TextChannel 没有 owner_id，所以要判断类型
-        is_owner = (
-            isinstance(interaction.channel, discord.Thread)
-            and interaction.channel.owner_id == interaction.user.id
-        )
-        if not (is_admin or is_owner):
+        if not self._can_manage_bump(interaction):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
 
         channel = interaction.channel
-        channel_id = channel.id
-
         if 开关.lower() == "off":
-            # 停止并移除任务
-            if channel_id in self.bump_tasks:
-                self.bump_tasks[channel_id].cancel()
-                del self.bump_tasks[channel_id]
-
-            # 从数据库移除配置
-            await protection_db.remove_bump_config(channel_id)
-
-            # 【新增】主动清理旧的置底面板
-            try:
-                async for msg in channel.history(limit=20):
-                    if self._is_bump_message(msg):
-                        await msg.delete()
-                        break  # 只删除一个就行
-            except Exception:
-                pass  # 忽略权限等错误
-
-            return await interaction.response.send_message(
-                "✅ 已**关闭**本频道的自动置底，并尝试清理了旧面板。", ephemeral=True
-            )
+            ok, msg = await self._disable_auto_bump(channel)
+            return await interaction.response.send_message(msg, ephemeral=True)
 
         if 开关.lower() == "on":
-            # 检查是否有附件，这一步是正确的
-            rows = await protection_db.get_items_in_channel(channel_id, limit=1)
-            if not rows:
-                return await interaction.response.send_message(
-                    "❌ 本频道没有任何受保护的附件记录，无法开启置底。", ephemeral=True
-                )
+            ok, msg = await self._enable_auto_bump(channel)
+            return await interaction.response.send_message(msg, ephemeral=True)
 
-            # 如果任务已在运行，先停止旧的
-            if channel_id in self.bump_tasks:
-                self.bump_tasks[channel_id].cancel()
+        await interaction.response.send_message("请明确指示 `on` 或 `off`。", ephemeral=True)
 
-            # 创建并记录新任务
-            task = self.bot.loop.create_task(self._bump_loop(channel))
-            self.bump_tasks[channel_id] = task
-            await protection_db.add_bump_config(channel_id)
+    def _can_manage_bump(self, interaction: discord.Interaction) -> bool:
+        is_admin = interaction.user.guild_permissions.administrator
+        is_owner = (
+            isinstance(interaction.channel, discord.Thread)
+            and interaction.channel.owner_id == interaction.user.id
+        )
+        return bool(is_admin or is_owner)
 
-            # 【优化】立即执行一次循环，立刻发送置底消息，提供即时反馈
-            await self._execute_bump_once(channel)
+    async def _disable_auto_bump(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> tuple[bool, str]:
+        channel_id = channel.id
+        if channel_id in self.bump_tasks:
+            self.bump_tasks[channel_id].cancel()
+            del self.bump_tasks[channel_id]
 
-            await interaction.response.send_message(
-                f"✅ **自动置底已开启**\nBot 将定时检查并维护置底面板，首次面板已发送。",
-                ephemeral=True,
+        await protection_db.remove_bump_config(channel_id)
+
+        try:
+            async for msg in channel.history(limit=20):
+                if self._is_bump_message(msg):
+                    await msg.delete()
+                    break
+        except Exception:
+            pass
+
+        return True, "✅ 已**关闭**本频道的自动置底，并尝试清理了旧面板。"
+
+    async def _enable_auto_bump(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> tuple[bool, str]:
+        channel_id = channel.id
+        rows = await protection_db.get_items_in_channel(channel_id, limit=1)
+        if not rows:
+            return False, "❌ 本频道没有任何受保护的附件记录，无法开启置底。"
+
+        if channel_id in self.bump_tasks:
+            self.bump_tasks[channel_id].cancel()
+
+        task = self.bot.loop.create_task(self._bump_loop(channel))
+        self.bump_tasks[channel_id] = task
+        await protection_db.add_bump_config(channel_id)
+        await self._execute_bump_once(channel)
+        return True, "✅ **自动置底已开启**\nBot 将定时检查并维护置底面板，首次面板已发送。"
+
+    async def _refresh_auto_bump(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> tuple[bool, str]:
+        rows = await protection_db.get_items_in_channel(channel.id, limit=1)
+        if not rows:
+            return False, "❌ 本频道没有任何受保护的附件记录，无法刷新置底。"
+        await self._execute_bump_once(channel)
+        return True, "🔄 已执行一次置底刷新。"
+
+    def _resolve_bump_target_channel(
+        self, message: discord.Message
+    ) -> discord.TextChannel | discord.Thread | None:
+        if isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+            return message.channel
+        return None
+
+    async def ctx_enable_bump(
+        self, interaction: discord.Interaction, message: discord.Message
+    ):
+        if not self._can_manage_bump(interaction):
+            return await interaction.response.send_message(
+                "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
-        else:
-            await interaction.response.send_message(
-                "请明确指示 `on` 或 `off`。", ephemeral=True
+        channel = self._resolve_bump_target_channel(message)
+        if not channel:
+            return await interaction.response.send_message(
+                "❌ 当前消息所在频道不支持置底功能。", ephemeral=True
             )
+        ok, text = await self._enable_auto_bump(channel)
+        await interaction.response.send_message(text, ephemeral=True)
+
+    async def ctx_disable_bump(
+        self, interaction: discord.Interaction, message: discord.Message
+    ):
+        if not self._can_manage_bump(interaction):
+            return await interaction.response.send_message(
+                "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
+            )
+        channel = self._resolve_bump_target_channel(message)
+        if not channel:
+            return await interaction.response.send_message(
+                "❌ 当前消息所在频道不支持置底功能。", ephemeral=True
+            )
+        ok, text = await self._disable_auto_bump(channel)
+        await interaction.response.send_message(text, ephemeral=True)
+
+    async def ctx_refresh_bump(
+        self, interaction: discord.Interaction, message: discord.Message
+    ):
+        if not self._can_manage_bump(interaction):
+            return await interaction.response.send_message(
+                "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
+            )
+        channel = self._resolve_bump_target_channel(message)
+        if not channel:
+            return await interaction.response.send_message(
+                "❌ 当前消息所在频道不支持置底功能。", ephemeral=True
+            )
+        ok, text = await self._refresh_auto_bump(channel)
+        await interaction.response.send_message(text, ephemeral=True)
 
     async def _execute_bump_once(self, channel: discord.TextChannel | discord.Thread):
         """单独执行一次置底循环的逻辑，用于提供即时反馈"""
@@ -665,9 +761,29 @@ class ProtectionCog(commands.Cog):
             elif should_have_bump and old_bump_message:
                 # 已经是最新消息，无需操作
                 if latest_message and latest_message.id == old_bump_message.id:
-                    pass
+                    if self._need_keepalive_repost(channel, old_bump_message):
+                        deleted = await self._safe_delete_message(old_bump_message)
+                        if not deleted:
+                            await protection_db.remove_bump_config(channel.id)
+                            if channel.id in self.bump_tasks:
+                                self.bump_tasks.pop(channel.id, None)
+                            return
+                        await asyncio.sleep(1)
+                        view = BumpButtonView(self.bot)
+                        await channel.send(**view.create_layout())
                 elif latest_message and latest_message.author.bot:
-                    await self._refresh_bump_message(old_bump_message)
+                    if self._need_keepalive_repost(channel, old_bump_message):
+                        deleted = await self._safe_delete_message(old_bump_message)
+                        if not deleted:
+                            await protection_db.remove_bump_config(channel.id)
+                            if channel.id in self.bump_tasks:
+                                self.bump_tasks.pop(channel.id, None)
+                            return
+                        await asyncio.sleep(1)
+                        view = BumpButtonView(self.bot)
+                        await channel.send(**view.create_layout())
+                    else:
+                        await self._refresh_bump_message(old_bump_message)
                 else:  # 不在底部，重发
                     deleted = await self._safe_delete_message(old_bump_message)
                     if not deleted:
@@ -733,7 +849,17 @@ class ProtectionCog(commands.Cog):
 
                         # **情况B：应该有，也有了，但最新消息是机器人 -> 只刷新原按钮，避免机器人互顶**
                         elif latest_is_bot_message:
-                            await self._refresh_bump_message(old_bump_message)
+                            if self._need_keepalive_repost(channel, old_bump_message):
+                                deleted = await self._safe_delete_message(old_bump_message)
+                                if not deleted:
+                                    await protection_db.remove_bump_config(channel.id)
+                                    if channel.id in self.bump_tasks:
+                                        del self.bump_tasks[channel.id]
+                                    break
+                                await asyncio.sleep(1)
+                                await channel.send(**view.create_layout())
+                            else:
+                                await self._refresh_bump_message(old_bump_message)
 
                         # **情况C：应该有，也有了，但不在底部 -> 删掉旧的，发送新的**
                         elif not is_at_bottom:
@@ -746,7 +872,16 @@ class ProtectionCog(commands.Cog):
                             await asyncio.sleep(1)  # 等待一下，防止竞态
                             await channel.send(**view.create_layout())
 
-                        # 情况D：应该有，也有了，且在底部 -> 无需操作
+                        # 情况D：应该有，也有了，且在底部 -> 到保活周期时重发
+                        elif self._need_keepalive_repost(channel, old_bump_message):
+                            deleted = await self._safe_delete_message(old_bump_message)
+                            if not deleted:
+                                await protection_db.remove_bump_config(channel.id)
+                                if channel.id in self.bump_tasks:
+                                    del self.bump_tasks[channel.id]
+                                break
+                            await asyncio.sleep(1)
+                            await channel.send(**view.create_layout())
 
                     else:  # not should_have_bump
                         # **情况E：不该有，但有了 -> 删除它，并自动停止任务**
