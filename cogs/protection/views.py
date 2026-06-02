@@ -1832,9 +1832,19 @@ class PostListView(ui.View):
 
 
 class BumpButtonView(discord.ui.View):
-    def __init__(self, bot):
+    def __init__(self, bot, top_url: str | None = None):
         super().__init__(timeout=None)
         self.bot = bot
+        self.top_url = top_url
+        if self.top_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="回到顶部",
+                    style=discord.ButtonStyle.link,
+                    url=self.top_url,
+                    row=0,
+                )
+            )
 
     def create_layout(self):
         """

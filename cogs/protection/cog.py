@@ -191,15 +191,48 @@ class ProtectionCog(commands.Cog):
             return None
         return message
 
+    async def _get_channel_top_message_url(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> str | None:
+        if isinstance(channel, discord.Thread):
+            starter_message = channel.starter_message
+            if not starter_message:
+                try:
+                    history = [msg async for msg in channel.history(limit=1, oldest_first=True)]
+                    starter_message = history[0] if history else None
+                except (discord.Forbidden, discord.HTTPException):
+                    starter_message = None
+
+            if starter_message:
+                return starter_message.jump_url
+
+            if channel.guild:
+                return f"https://discord.com/channels/{channel.guild.id}/{channel.id}"
+            return None
+
+        try:
+            history = [msg async for msg in channel.history(limit=1, oldest_first=True)]
+            first_message = history[0] if history else None
+        except (discord.Forbidden, discord.HTTPException):
+            first_message = None
+
+        if first_message:
+            return first_message.jump_url
+        if channel.guild:
+            return f"https://discord.com/channels/{channel.guild.id}/{channel.id}"
+        return None
+
     async def _send_bump_message(self, channel: discord.TextChannel | discord.Thread):
-        view = BumpButtonView(self.bot)
+        top_url = await self._get_channel_top_message_url(channel)
+        view = BumpButtonView(self.bot, top_url=top_url)
         message = await channel.send(**view.create_layout())
         await protection_db.set_sticky_message(channel.id, message.id)
         return message
 
     async def _refresh_bump_message(self, message: discord.Message) -> bool:
         try:
-            view = BumpButtonView(self.bot)
+            top_url = await self._get_channel_top_message_url(message.channel)
+            view = BumpButtonView(self.bot, top_url=top_url)
             await message.edit(**view.create_layout())
             return True
         except discord.NotFound:
@@ -908,7 +941,7 @@ class ProtectionCog(commands.Cog):
                         break
                     import traceback
 
-                    print(f"- [缃簳浠诲姟] {channel.name} HTTPException: {e}")
+                    print(f"- [置底任务] {channel.name} HTTPException: {e}")
                     traceback.print_exc()
                 except Exception as e:
                     import traceback
