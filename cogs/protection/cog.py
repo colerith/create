@@ -133,23 +133,21 @@ class ProtectionCog(commands.Cog):
 
         return getattr(first_child, "custom_id", None) == "bump_get_attachments"
 
-    def _get_keepalive_interval(self, channel: discord.TextChannel | discord.Thread) -> timedelta:
-        """根据帖子自动归档时长计算保活重发间隔。"""
-        auto_archive_minutes = getattr(channel, "auto_archive_duration", 60) or 60
-        # 控制在 10 分钟~12 小时，默认按归档时长的 80% 重发一次
-        interval_minutes = max(10, min(int(auto_archive_minutes * 0.8), 12 * 60))
-        return timedelta(minutes=interval_minutes)
-
-    def _need_keepalive_repost(
-        self, channel: discord.TextChannel | discord.Thread, bump_message: discord.Message | None
+    def _should_repost_stale_bump(
+        self, bump_message: discord.Message | None
     ) -> bool:
+        """置底按钮超过 2 小时且已离开最近 10 条时，才允许重发。"""
         if not bump_message:
             return False
         created_at = bump_message.created_at
         if created_at is None:
             return False
         now_utc = datetime.now(created_at.tzinfo)
-        return (now_utc - created_at) >= self._get_keepalive_interval(channel)
+        return (now_utc - created_at) >= timedelta(hours=2)
+
+    def _should_refresh_in_place(self, bump_message: discord.Message | None) -> bool:
+        """只要旧按钮还在最近 10 条内，就只编辑原消息。"""
+        return bool(bump_message)
 
     async def _scan_bump_messages(
         self, channel: discord.TextChannel | discord.Thread, limit: int = 10
@@ -167,6 +165,37 @@ class ProtectionCog(commands.Cog):
                     continue
 
         return latest_message, old_bump_message
+
+    async def _get_tracked_bump_message(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        scanned_bump_message: discord.Message | None = None,
+    ) -> discord.Message | None:
+        if scanned_bump_message:
+            return scanned_bump_message
+
+        message_id = await protection_db.get_sticky_message_id(channel.id)
+        if not message_id:
+            return None
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            await protection_db.remove_sticky_message(channel.id)
+            return None
+        except discord.HTTPException:
+            return None
+
+        if not self._is_bump_message(message):
+            await protection_db.remove_sticky_message(channel.id)
+            return None
+        return message
+
+    async def _send_bump_message(self, channel: discord.TextChannel | discord.Thread):
+        view = BumpButtonView(self.bot)
+        message = await channel.send(**view.create_layout())
+        await protection_db.set_sticky_message(channel.id, message.id)
+        return message
 
     async def _refresh_bump_message(self, message: discord.Message) -> bool:
         try:
@@ -653,6 +682,7 @@ class ProtectionCog(commands.Cog):
             del self.bump_tasks[channel_id]
 
         await protection_db.remove_bump_config(channel_id)
+        await protection_db.remove_sticky_message(channel_id)
 
         try:
             async for msg in channel.history(limit=20):
@@ -753,53 +783,34 @@ class ProtectionCog(commands.Cog):
             should_have_bump = bool(
                 await protection_db.get_items_in_channel(channel.id, limit=1)
             )
-            latest_message, old_bump_message = await self._scan_bump_messages(channel)
+            _, nearby_bump_message = await self._scan_bump_messages(channel)
+            tracked_bump_message = await self._get_tracked_bump_message(
+                channel, nearby_bump_message
+            )
 
-            if should_have_bump and not old_bump_message:
-                view = BumpButtonView(self.bot)
-                await channel.send(**view.create_layout())
-            elif should_have_bump and old_bump_message:
-                # 已经是最新消息，无需操作
-                if latest_message and latest_message.id == old_bump_message.id:
-                    if self._need_keepalive_repost(channel, old_bump_message):
-                        deleted = await self._safe_delete_message(old_bump_message)
-                        if not deleted:
-                            await protection_db.remove_bump_config(channel.id)
-                            if channel.id in self.bump_tasks:
-                                self.bump_tasks.pop(channel.id, None)
-                            return
-                        await asyncio.sleep(1)
-                        view = BumpButtonView(self.bot)
-                        await channel.send(**view.create_layout())
-                elif latest_message and latest_message.author.bot:
-                    if self._need_keepalive_repost(channel, old_bump_message):
-                        deleted = await self._safe_delete_message(old_bump_message)
-                        if not deleted:
-                            await protection_db.remove_bump_config(channel.id)
-                            if channel.id in self.bump_tasks:
-                                self.bump_tasks.pop(channel.id, None)
-                            return
-                        await asyncio.sleep(1)
-                        view = BumpButtonView(self.bot)
-                        await channel.send(**view.create_layout())
-                    else:
-                        await self._refresh_bump_message(old_bump_message)
-                else:  # 不在底部，重发
-                    deleted = await self._safe_delete_message(old_bump_message)
+            if should_have_bump and not tracked_bump_message:
+                await self._send_bump_message(channel)
+            elif should_have_bump and tracked_bump_message:
+                if self._should_refresh_in_place(nearby_bump_message):
+                    await self._refresh_bump_message(tracked_bump_message)
+                elif self._should_repost_stale_bump(tracked_bump_message):
+                    deleted = await self._safe_delete_message(tracked_bump_message)
                     if not deleted:
                         await protection_db.remove_bump_config(channel.id)
+                        await protection_db.remove_sticky_message(channel.id)
                         if channel.id in self.bump_tasks:
                             self.bump_tasks.pop(channel.id, None)
                         return
+                    await protection_db.remove_sticky_message(channel.id)
                     await asyncio.sleep(1)
-                    view = BumpButtonView(self.bot)
-                    await channel.send(**view.create_layout())
+                    await self._send_bump_message(channel)
 
         except discord.NotFound:
             print(
                 f"❌ [置底任务] 频道不存在或无法访问，已自动关闭置底: {getattr(channel, 'id', None)}"
             )
             await protection_db.remove_bump_config(channel.id)
+            await protection_db.remove_sticky_message(channel.id)
             if channel.id in self.bump_tasks:
                 self.bump_tasks.pop(channel.id, None)
         except discord.Forbidden:
@@ -807,6 +818,7 @@ class ProtectionCog(commands.Cog):
                 f"❌ [置底任务] 没有权限访问频道，已自动关闭置底: {getattr(channel, 'id', None)}"
             )
             await protection_db.remove_bump_config(channel.id)
+            await protection_db.remove_sticky_message(channel.id)
             if channel.id in self.bump_tasks:
                 self.bump_tasks.pop(channel.id, None)
         except Exception as e:
@@ -828,65 +840,36 @@ class ProtectionCog(commands.Cog):
                     should_have_bump = bool(rows)
 
                     # 2. 查找旧的置底消息
-                    latest_message, old_bump_message = await self._scan_bump_messages(
+                    _, nearby_bump_message = await self._scan_bump_messages(
                         channel
                     )
-                    is_at_bottom = bool(
-                        latest_message
-                        and old_bump_message
-                        and latest_message.id == old_bump_message.id
-                    )
-                    latest_is_bot_message = bool(
-                        latest_message and latest_message.author.bot
+                    tracked_bump_message = await self._get_tracked_bump_message(
+                        channel, nearby_bump_message
                     )
 
                     # 3. 根据状态执行正确的操作 (状态机逻辑)
                     if should_have_bump:
-                        view = BumpButtonView(self.bot)  # 每次都用新的实例
-                        # **情况A：应该有，但没有 -> 发送一个新的**
-                        if not old_bump_message:
-                            await channel.send(**view.create_layout())
-
-                        # **情况B：应该有，也有了，但最新消息是机器人 -> 只刷新原按钮，避免机器人互顶**
-                        elif latest_is_bot_message:
-                            if self._need_keepalive_repost(channel, old_bump_message):
-                                deleted = await self._safe_delete_message(old_bump_message)
-                                if not deleted:
-                                    await protection_db.remove_bump_config(channel.id)
-                                    if channel.id in self.bump_tasks:
-                                        del self.bump_tasks[channel.id]
-                                    break
-                                await asyncio.sleep(1)
-                                await channel.send(**view.create_layout())
-                            else:
-                                await self._refresh_bump_message(old_bump_message)
-
-                        # **情况C：应该有，也有了，但不在底部 -> 删掉旧的，发送新的**
-                        elif not is_at_bottom:
-                            deleted = await self._safe_delete_message(old_bump_message)
+                        if not tracked_bump_message:
+                            await self._send_bump_message(channel)
+                        elif self._should_refresh_in_place(nearby_bump_message):
+                            await self._refresh_bump_message(tracked_bump_message)
+                        elif self._should_repost_stale_bump(tracked_bump_message):
+                            deleted = await self._safe_delete_message(tracked_bump_message)
                             if not deleted:
                                 await protection_db.remove_bump_config(channel.id)
-                                if channel.id in self.bump_tasks:
-                                    del self.bump_tasks[channel.id]
-                                break
-                            await asyncio.sleep(1)  # 等待一下，防止竞态
-                            await channel.send(**view.create_layout())
-
-                        # 情况D：应该有，也有了，且在底部 -> 到保活周期时重发
-                        elif self._need_keepalive_repost(channel, old_bump_message):
-                            deleted = await self._safe_delete_message(old_bump_message)
-                            if not deleted:
-                                await protection_db.remove_bump_config(channel.id)
+                                await protection_db.remove_sticky_message(channel.id)
                                 if channel.id in self.bump_tasks:
                                     del self.bump_tasks[channel.id]
                                 break
                             await asyncio.sleep(1)
-                            await channel.send(**view.create_layout())
+                            await protection_db.remove_sticky_message(channel.id)
+                            await self._send_bump_message(channel)
 
                     else:  # not should_have_bump
                         # **情况E：不该有，但有了 -> 删除它，并自动停止任务**
-                        if old_bump_message:
-                            await self._safe_delete_message(old_bump_message)
+                        if tracked_bump_message:
+                            await self._safe_delete_message(tracked_bump_message)
+                            await protection_db.remove_sticky_message(channel.id)
 
                         # 自动关闭
                         print(
@@ -895,6 +878,7 @@ class ProtectionCog(commands.Cog):
                         if channel.id in self.bump_tasks:
                             del self.bump_tasks[channel.id]
                         await protection_db.remove_bump_config(channel.id)
+                        await protection_db.remove_sticky_message(channel.id)
                         break  # 跳出 while True 循环，终止此任务
 
                 except discord.NotFound:
@@ -902,6 +886,7 @@ class ProtectionCog(commands.Cog):
                         f"❌ [置底任务] 频道不存在或无法访问，任务为频道 {getattr(channel, 'name', 'unknown')} 自动停止。"
                     )
                     await protection_db.remove_bump_config(channel.id)
+                    await protection_db.remove_sticky_message(channel.id)
                     if channel.id in self.bump_tasks:
                         del self.bump_tasks[channel.id]
                     break
@@ -910,12 +895,14 @@ class ProtectionCog(commands.Cog):
                         f"❌ [置底任务] 权限不足，任务为频道 {channel.name} 自动停止。"
                     )
                     await protection_db.remove_bump_config(channel.id)
+                    await protection_db.remove_sticky_message(channel.id)
                     if channel.id in self.bump_tasks:
                         del self.bump_tasks[channel.id]
                     break  # 没权限了直接退出循环
                 except discord.HTTPException as e:
                     if getattr(e, "code", None) == 50083:
                         await protection_db.remove_bump_config(channel.id)
+                        await protection_db.remove_sticky_message(channel.id)
                         if channel.id in self.bump_tasks:
                             del self.bump_tasks[channel.id]
                         break

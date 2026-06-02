@@ -39,6 +39,7 @@ class StatisticsCog(commands.Cog):
         # 启动新的任务
         self.daily_stats_refresh.start()
         self.bumping_task.start()
+        self.keepalive_pinned_threads_task.start()
         self.thread_cache_sync_task.start()
 
     async def cog_load(self):
@@ -50,6 +51,7 @@ class StatisticsCog(commands.Cog):
         # 停止新的任务
         self.daily_stats_refresh.cancel()
         self.bumping_task.cancel()
+        self.keepalive_pinned_threads_task.cancel()
         self.thread_cache_sync_task.cancel()
 
     def _serialize_dt(self, value: datetime | None) -> str | None:
@@ -146,7 +148,7 @@ class StatisticsCog(commands.Cog):
 
         return target_channel
 
-    async def _fetch_thread_channel(self, thread_id: int):
+    async def _fetch_thread_channel(self, thread_id: int, include_archived: bool = False):
         thread = self.bot.get_channel(thread_id)
         if thread is None:
             try:
@@ -157,9 +159,66 @@ class StatisticsCog(commands.Cog):
 
         if not isinstance(thread, discord.Thread):
             return None
-        if thread.archived:
+        if thread.archived and not include_archived:
             return None
         return thread
+
+    def _get_thread_keepalive_interval(
+        self, thread: discord.Thread
+    ) -> timedelta:
+        auto_archive_minutes = getattr(thread, "auto_archive_duration", 60) or 60
+        interval_minutes = max(10, min(int(auto_archive_minutes * 0.8), 12 * 60))
+        return timedelta(minutes=interval_minutes)
+
+    async def _get_thread_last_activity_at(
+        self, thread: discord.Thread
+    ) -> datetime | None:
+        try:
+            recent_messages = [msg async for msg in thread.history(limit=1)]
+            if recent_messages:
+                return recent_messages[0].created_at
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return thread.created_at
+
+    async def _keepalive_thread(self, thread: discord.Thread) -> bool:
+        try:
+            if thread.archived or getattr(thread, "locked", False):
+                await thread.edit(archived=False, locked=False)
+                await asyncio.sleep(1)
+
+            msg = await thread.send(
+                f"Keeping thread alive... ({random.randint(1000, 9999)})"
+            )
+            await msg.delete()
+            print(f"- [保活] 已刷新帖子活跃状态: {thread.name} ({thread.id})")
+            return True
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"- [保活] 帖子保活失败 {thread.name} ({thread.id}): {e}")
+            return False
+
+    async def _process_keepalive_thread(self, thread_id: int):
+        thread = await self._fetch_thread_channel(thread_id, include_archived=True)
+        if not thread:
+            print(f"- [保活] 找不到目标帖子 {thread_id}，已跳过。")
+            return
+
+        if not getattr(thread.flags, "pinned", False):
+            return
+
+        last_activity_at = await self._get_thread_last_activity_at(thread)
+        interval = self._get_thread_keepalive_interval(thread)
+        now_utc = datetime.now(timezone.utc)
+
+        if thread.archived:
+            await self._keepalive_thread(thread)
+            return
+
+        if not last_activity_at:
+            return
+
+        if (now_utc - last_activity_at) >= interval:
+            await self._keepalive_thread(thread)
 
     async def send_like_milestone_notification(self, snapshot: dict, milestone: int):
         thread_channel = await self._fetch_thread_channel(snapshot["thread_id"])
@@ -238,6 +297,7 @@ class StatisticsCog(commands.Cog):
             "score": likes * 1.5 + comments,
             "tags": [tag.name for tag in thread.applied_tags],
             "starter_image_url": self._get_message_image_url(starter),
+            "is_pinned": bool(getattr(thread.flags, "pinned", False)),
             "is_archived": thread.archived,
             "last_synced_at": datetime.now(TZ_SHANGHAI).isoformat(),
         }
@@ -589,6 +649,48 @@ class StatisticsCog(commands.Cog):
 
     @bumping_task.before_loop
     async def before_bumping_task(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=30)
+    async def keepalive_pinned_threads_task(self):
+        print(f"[{datetime.now(TZ_SHANGHAI)}] 启动置顶标注帖保活任务...")
+        forums_to_scan = {}
+        for guild in self.bot.guilds:
+            for forum in guild.forums:
+                forums_to_scan[forum.id] = forum
+
+        for forum in forums_to_scan.values():
+            try:
+                await self.ensure_forum_thread_cache(forum)
+
+                pinned_thread_ids = {
+                    thread.id
+                    for thread in forum.threads
+                    if getattr(thread.flags, "pinned", False)
+                }
+                cached_pinned_threads = await statistics_db.get_cached_pinned_forum_threads(
+                    forum.id, include_archived=True
+                )
+                pinned_thread_ids.update(
+                    row["thread_id"] for row in cached_pinned_threads if row.get("thread_id")
+                )
+
+                if not pinned_thread_ids:
+                    continue
+
+                print(
+                    f"- [保活] 论坛 '{forum.name}' 检测到 {len(pinned_thread_ids)} 个置顶帖子。"
+                )
+                for thread_id in pinned_thread_ids:
+                    await self._process_keepalive_thread(thread_id)
+                    await asyncio.sleep(2)
+            except discord.Forbidden:
+                continue
+            except Exception as e:
+                print(f"- [保活] 扫描论坛 {forum.id} 时发生错误: {e}")
+
+    @keepalive_pinned_threads_task.before_loop
+    async def before_keepalive_pinned_threads_task(self):
         await self.bot.wait_until_ready()
 
     @tasks.loop(minutes=30)

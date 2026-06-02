@@ -74,6 +74,13 @@ async def set_sticky_message(channel_id: int, message_id: int):
         await db.commit()
 
 
+async def remove_sticky_message(channel_id: int):
+    """移除置底消息ID记录。"""
+    async with get_db() as db:
+        await db.execute("DELETE FROM sticky_messages WHERE channel_id = ?", (channel_id,))
+        await db.commit()
+
+
 # --- 删操作 (Delete) ---
 
 async def remove_like(user_id: int, message_id: int):
