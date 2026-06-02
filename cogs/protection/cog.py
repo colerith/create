@@ -698,13 +698,22 @@ class ProtectionCog(commands.Cog):
 
         await interaction.response.send_message("请明确指示 `on` 或 `off`。", ephemeral=True)
 
-    def _can_manage_bump(self, interaction: discord.Interaction) -> bool:
+    def _can_manage_bump(
+        self,
+        interaction: discord.Interaction,
+        message: discord.Message | None = None,
+    ) -> bool:
         is_admin = interaction.user.guild_permissions.administrator
-        is_owner = (
+        is_thread_owner = (
             isinstance(interaction.channel, discord.Thread)
             and interaction.channel.owner_id == interaction.user.id
         )
-        return bool(is_admin or is_owner)
+        is_text_owner = bool(
+            message
+            and isinstance(message.channel, discord.TextChannel)
+            and message.author.id == interaction.user.id
+        )
+        return bool(is_admin or is_thread_owner or is_text_owner)
 
     async def _disable_auto_bump(
         self, channel: discord.TextChannel | discord.Thread
@@ -763,7 +772,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_enable_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction):
+        if not self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
@@ -778,7 +787,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_disable_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction):
+        if not self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
@@ -793,7 +802,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_refresh_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction):
+        if not self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
