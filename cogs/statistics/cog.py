@@ -183,8 +183,9 @@ class StatisticsCog(commands.Cog):
 
     async def _keepalive_thread(self, thread: discord.Thread) -> bool:
         try:
-            if thread.archived or getattr(thread, "locked", False):
-                await thread.edit(archived=False, locked=False)
+            if thread.archived:
+                # 这里只打开帖子，不改动锁定状态，避免放开发言权限。
+                await thread.edit(archived=False)
                 await asyncio.sleep(1)
 
             msg = await thread.send(
