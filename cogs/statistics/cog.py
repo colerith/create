@@ -203,34 +203,34 @@ class StatisticsCog(commands.Cog):
                 f"Keeping thread alive... ({random.randint(1000, 9999)})"
             )
             await msg.delete()
-            print(f"- [保活] 已刷新帖子活跃状态: {thread.name} ({thread.id})")
             return True
         except (discord.Forbidden, discord.HTTPException) as e:
             print(f"- [保活] 帖子保活失败 {thread.name} ({thread.id}): {e}")
             return False
 
-    async def _process_keepalive_thread(self, thread_id: int):
+    async def _process_keepalive_thread(self, thread_id: int) -> str:
         thread = await self._fetch_thread_channel(thread_id, include_archived=True)
         if not thread:
-            print(f"- [保活] 找不到目标帖子 {thread_id}，已跳过。")
-            return
+            return "missing"
 
         if not getattr(thread.flags, "pinned", False):
-            return
+            return "not_pinned"
 
         last_activity_at = await self._get_thread_last_activity_at(thread)
         interval = self._get_thread_keepalive_interval(thread)
         now_utc = datetime.now(timezone.utc)
 
         if thread.archived:
-            await self._keepalive_thread(thread)
-            return
+            refreshed = await self._keepalive_thread(thread)
+            return "refreshed" if refreshed else "failed"
 
         if not last_activity_at:
-            return
+            return "skipped"
 
         if (now_utc - last_activity_at) >= interval:
-            await self._keepalive_thread(thread)
+            refreshed = await self._keepalive_thread(thread)
+            return "refreshed" if refreshed else "failed"
+        return "skipped"
 
     async def send_like_milestone_notification(self, snapshot: dict, milestone: int):
         thread_channel = await self._fetch_thread_channel(snapshot["thread_id"])
@@ -734,8 +734,14 @@ class StatisticsCog(commands.Cog):
 
         recently_bumped_ids = await statistics_db.get_recently_bumped_threads(days=7)
         three_days_ago_utc = datetime.now(timezone.utc) - timedelta(days=3)
+        scanned_forums = 0
+        candidate_threads = 0
+        planned_threads = 0
+        bumped_threads = 0
+        failed_threads = 0
 
         for forum in forums_to_scan:
+            scanned_forums += 1
             eligible_threads = []
             try:
                 for thread in forum.threads:
@@ -750,26 +756,29 @@ class StatisticsCog(commands.Cog):
                             continue
                         last_message = last_messages[0]
                         last_msg_time = last_message.created_at
-                    except (IndexError, discord.Forbidden):
+                    except (
+                        IndexError,
+                        discord.Forbidden,
+                        discord.HTTPException,
+                        discord.DiscordServerError,
+                    ):
                         continue
 
                     if last_msg_time and last_msg_time < three_days_ago_utc:
                         eligible_threads.append(thread)
 
-            except discord.Forbidden:
+            except (discord.Forbidden, discord.HTTPException, discord.DiscordServerError):
                 continue
 
             if not eligible_threads:
                 continue
 
+            candidate_threads += len(eligible_threads)
             num_to_bump = random.randint(5, 10)
             threads_to_bump = random.sample(
                 eligible_threads, min(len(eligible_threads), num_to_bump)
             )
-
-            print(
-                f"- 在频道 '{forum.name}' 中找到 {len(threads_to_bump)} 个帖子准备顶帖。"
-            )
+            planned_threads += len(threads_to_bump)
             for thread in threads_to_bump:
                 try:
                     msg = await thread.send(
@@ -777,9 +786,20 @@ class StatisticsCog(commands.Cog):
                     )
                     await msg.delete()
                     await statistics_db.log_thread_bump(thread.id)
+                    bumped_threads += 1
                     await asyncio.sleep(3)
                 except Exception as e:
+                    failed_threads += 1
                     print(f"  - 顶帖失败: {thread.name} ({thread.id}) - {e}")
+
+        print(
+            "[顶帖] 本轮完成: "
+            f"扫描论坛 {scanned_forums}，"
+            f"候选帖子 {candidate_threads}，"
+            f"计划顶帖 {planned_threads}，"
+            f"成功 {bumped_threads}，"
+            f"失败 {failed_threads}"
+        )
 
     @bumping_task.before_loop
     async def before_bumping_task(self):
@@ -793,7 +813,15 @@ class StatisticsCog(commands.Cog):
             for forum in guild.forums:
                 forums_to_scan[forum.id] = forum
 
+        scanned_forums = 0
+        pinned_threads_total = 0
+        refreshed_threads = 0
+        skipped_threads = 0
+        missing_threads = 0
+        failed_threads = 0
+
         for forum in forums_to_scan.values():
+            scanned_forums += 1
             try:
                 await self.ensure_forum_thread_cache(forum)
 
@@ -812,16 +840,32 @@ class StatisticsCog(commands.Cog):
                 if not pinned_thread_ids:
                     continue
 
-                print(
-                    f"- [保活] 论坛 '{forum.name}' 检测到 {len(pinned_thread_ids)} 个置顶帖子。"
-                )
+                pinned_threads_total += len(pinned_thread_ids)
                 for thread_id in pinned_thread_ids:
-                    await self._process_keepalive_thread(thread_id)
+                    result = await self._process_keepalive_thread(thread_id)
+                    if result == "refreshed":
+                        refreshed_threads += 1
+                    elif result in {"skipped", "not_pinned"}:
+                        skipped_threads += 1
+                    elif result == "missing":
+                        missing_threads += 1
+                    elif result == "failed":
+                        failed_threads += 1
                     await asyncio.sleep(2)
             except discord.Forbidden:
                 continue
             except Exception as e:
                 print(f"- [保活] 扫描论坛 {forum.id} 时发生错误: {e}")
+
+        print(
+            "[保活] 本轮完成: "
+            f"扫描论坛 {scanned_forums}，"
+            f"检测置顶帖 {pinned_threads_total}，"
+            f"实际保活 {refreshed_threads}，"
+            f"跳过 {skipped_threads}，"
+            f"缺失 {missing_threads}，"
+            f"失败 {failed_threads}"
+        )
 
     @keepalive_pinned_threads_task.before_loop
     async def before_keepalive_pinned_threads_task(self):

@@ -5,7 +5,6 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import aiohttp
-import asyncio
 
 from cogs.core.db import init_db
 from cogs.protection.views import BumpButtonView
@@ -18,6 +17,12 @@ if not TOKEN:
     exit()
 
 TEST_GUILD_ID = [1397629012292931726, 1384945301780955246, 1413953986519760908]
+COG_EXTENSIONS = (
+    "cogs.protection",
+    "cogs.statistics",
+    "cogs.recommend",
+    "cogs.exploration",
+)
 
 
 class ChimidanBot(commands.Bot):
@@ -37,15 +42,13 @@ class ChimidanBot(commands.Bot):
         print("✅ 全局数据库检查完毕。")
 
         loaded_cogs = 0
-        for folder_name in os.listdir('./cogs'):
-            path = os.path.join('./cogs', folder_name)
-            if os.path.isdir(path) and not folder_name.startswith('__') and folder_name != 'core':
-                try:
-                    await self.load_extension(f'cogs.{folder_name}')
-                    print(f"📦 加载插件成功: cogs.{folder_name}")
-                    loaded_cogs += 1
-                except Exception as e:
-                    print(f"❌ 加载插件失败 cogs.{folder_name}: {e}")
+        for extension in COG_EXTENSIONS:
+            try:
+                await self.load_extension(extension)
+                print(f"📦 加载插件成功: {extension}")
+                loaded_cogs += 1
+            except Exception as e:
+                print(f"❌ 加载插件失败 {extension}: {e}")
 
         commands_list = self.tree.get_commands()
         print(f"📊 [诊断] 目前 Bot 内存中已加载 {len(commands_list)} 个斜杠命令: {[cmd.name for cmd in commands_list]}")
