@@ -7,7 +7,10 @@ import random
 
 from . import db as statistics_db
 from .like_role_reward import (
+    MAX_ROLE_GRANTS_PER_AUTO_RUN,
+    MAX_ROLE_GRANTS_PER_MANUAL_RUN,
     MIN_LIKES_FOR_ROLE,
+    ROLE_GRANT_DELAY_SECONDS,
     SCAN_INTERVAL_HOURS,
     TARGET_ROLE_ID,
     get_target_forums,
@@ -468,7 +471,7 @@ class StatisticsCog(commands.Cog):
             "first_break_sent_count": first_break_sent_count,
         }
 
-    async def process_like_role_rewards(self) -> dict:
+    async def process_like_role_rewards(self, max_role_grants: int | None = None) -> dict:
         summary = {
             "guilds_scanned": 0,
             "forums_scanned": 0,
@@ -479,6 +482,8 @@ class StatisticsCog(commands.Cog):
             "missing_members": 0,
             "missing_role": 0,
             "errors": 0,
+            "remaining_eligible": 0,
+            "grant_limit_hit": 0,
         }
 
         for guild in self.bot.guilds:
@@ -521,6 +526,14 @@ class StatisticsCog(commands.Cog):
                 continue
 
             for author_id in qualifying_authors:
+                if (
+                    max_role_grants is not None
+                    and summary["roles_granted"] >= max_role_grants
+                ):
+                    summary["remaining_eligible"] += 1
+                    summary["grant_limit_hit"] = 1
+                    continue
+
                 member = guild.get_member(author_id)
                 if member is None:
                     try:
@@ -542,7 +555,7 @@ class StatisticsCog(commands.Cog):
                         reason=f"帖子首楼点赞达到 {MIN_LIKES_FOR_ROLE}，自动发放身份组",
                     )
                     summary["roles_granted"] += 1
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(ROLE_GRANT_DELAY_SECONDS)
                 except (discord.Forbidden, discord.HTTPException) as e:
                     summary["errors"] += 1
                     print(f"[点赞身份组] 发放身份组失败 {guild.id}/{author_id}: {e}")
@@ -623,18 +636,25 @@ class StatisticsCog(commands.Cog):
         description="[管理] 扫描目标论坛里达到 20 赞的帖子，并为贴主补发身份组",
     )
     @app_commands.default_permissions(manage_guild=True)
-    async def scan_like_role_rewards(self, interaction: discord.Interaction):
+    async def scan_like_role_rewards(
+        self,
+        interaction: discord.Interaction,
+        本次最多发放: app_commands.Range[int, 1, 30] | None = None,
+    ):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await self.process_like_role_rewards()
+        max_role_grants = 本次最多发放 or MAX_ROLE_GRANTS_PER_MANUAL_RUN
+        result = await self.process_like_role_rewards(max_role_grants=max_role_grants)
         await interaction.followup.send(
             (
                 "✅ 点赞身份组扫描完成。\n"
+                f"本次发放上限：**{max_role_grants}**\n"
                 f"扫描服务器：**{result['guilds_scanned']}**\n"
                 f"扫描论坛：**{result['forums_scanned']}**\n"
                 f"达标帖子：**{result['qualified_threads']}**\n"
                 f"达标贴主：**{result['eligible_authors']}**\n"
                 f"新发身份组：**{result['roles_granted']}**\n"
                 f"已拥有身份组：**{result['already_had_role']}**\n"
+                f"剩余待发：**{result['remaining_eligible']}**\n"
                 f"找不到成员：**{result['missing_members']}**\n"
                 f"缺失身份组：**{result['missing_role']}**\n"
                 f"错误次数：**{result['errors']}**"
@@ -837,7 +857,9 @@ class StatisticsCog(commands.Cog):
     @tasks.loop(hours=SCAN_INTERVAL_HOURS)
     async def like_role_reward_task(self):
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动点赞身份组扫描任务...")
-        result = await self.process_like_role_rewards()
+        result = await self.process_like_role_rewards(
+            max_role_grants=MAX_ROLE_GRANTS_PER_AUTO_RUN
+        )
         print(
             "[点赞身份组] 扫描完成: "
             f"服务器 {result['guilds_scanned']}，"
@@ -845,6 +867,7 @@ class StatisticsCog(commands.Cog):
             f"达标帖子 {result['qualified_threads']}，"
             f"达标贴主 {result['eligible_authors']}，"
             f"新发身份组 {result['roles_granted']}，"
+            f"剩余待发 {result['remaining_eligible']}，"
             f"已拥有 {result['already_had_role']}，"
             f"缺失成员 {result['missing_members']}，"
             f"错误 {result['errors']}"
