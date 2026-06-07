@@ -6,6 +6,12 @@ import asyncio
 import random
 
 from . import db as statistics_db
+from .like_role_reward import (
+    MIN_LIKES_FOR_ROLE,
+    SCAN_INTERVAL_HOURS,
+    TARGET_ROLE_ID,
+    get_target_forums,
+)
 from .views import ForumSelectView, StatisticsContainerView
 from config import (
     TZ_SHANGHAI,
@@ -41,6 +47,7 @@ class StatisticsCog(commands.Cog):
         self.bumping_task.start()
         self.keepalive_pinned_threads_task.start()
         self.thread_cache_sync_task.start()
+        self.like_role_reward_task.start()
 
     async def cog_load(self):
         # 确保数据库表已创建
@@ -53,6 +60,7 @@ class StatisticsCog(commands.Cog):
         self.bumping_task.cancel()
         self.keepalive_pinned_threads_task.cancel()
         self.thread_cache_sync_task.cancel()
+        self.like_role_reward_task.cancel()
 
     def _serialize_dt(self, value: datetime | None) -> str | None:
         return value.isoformat() if value else None
@@ -460,6 +468,87 @@ class StatisticsCog(commands.Cog):
             "first_break_sent_count": first_break_sent_count,
         }
 
+    async def process_like_role_rewards(self) -> dict:
+        summary = {
+            "guilds_scanned": 0,
+            "forums_scanned": 0,
+            "qualified_threads": 0,
+            "eligible_authors": 0,
+            "roles_granted": 0,
+            "already_had_role": 0,
+            "missing_members": 0,
+            "missing_role": 0,
+            "errors": 0,
+        }
+
+        for guild in self.bot.guilds:
+            target_forums = get_target_forums(guild)
+            if not target_forums:
+                continue
+
+            summary["guilds_scanned"] += 1
+            summary["forums_scanned"] += len(target_forums)
+
+            # 优先复用统计缓存；仅在目标论坛完全没有缓存时才做一次兜底同步。
+            for forum in target_forums:
+                cache_summary = await statistics_db.get_cache_sync_summary(forum.id)
+                total_count = cache_summary["total_count"] if cache_summary else 0
+                if total_count == 0:
+                    try:
+                        await self.sync_forum_thread_cache(forum)
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        summary["errors"] += 1
+                        print(f"[点赞身份组] 初始化缓存失败 {forum.id}: {e}")
+
+            forum_ids = [forum.id for forum in target_forums]
+            qualifying_threads = await statistics_db.get_cached_threads_by_forums_and_likes(
+                forum_ids, MIN_LIKES_FOR_ROLE, include_archived=True
+            )
+            summary["qualified_threads"] += len(qualifying_threads)
+
+            qualifying_authors = {
+                row["author_id"]
+                for row in qualifying_threads
+                if row.get("author_id")
+            }
+            summary["eligible_authors"] += len(qualifying_authors)
+
+            role = guild.get_role(TARGET_ROLE_ID)
+            if role is None:
+                summary["missing_role"] += len(qualifying_authors)
+                print(f"[点赞身份组] 找不到身份组 {TARGET_ROLE_ID}，跳过 guild {guild.id}")
+                continue
+
+            for author_id in qualifying_authors:
+                member = guild.get_member(author_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(author_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        summary["missing_members"] += 1
+                        continue
+
+                if member.bot:
+                    continue
+
+                if member.get_role(TARGET_ROLE_ID):
+                    summary["already_had_role"] += 1
+                    continue
+
+                try:
+                    await member.add_roles(
+                        role,
+                        reason=f"帖子首楼点赞达到 {MIN_LIKES_FOR_ROLE}，自动发放身份组",
+                    )
+                    summary["roles_granted"] += 1
+                    await asyncio.sleep(1)
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    summary["errors"] += 1
+                    print(f"[点赞身份组] 发放身份组失败 {guild.id}/{author_id}: {e}")
+
+        return summary
+
     # ==========================================
     # Part 1. 斜杠命令
     # ==========================================
@@ -525,6 +614,30 @@ class StatisticsCog(commands.Cog):
                 f"扫描帖子：**{result['processed_count']}**\n"
                 f"原帖里程碑通知：**{result['regular_sent_count']}**\n"
                 f"首破 1000/10000 专用通知：**{result['first_break_sent_count']}**"
+            ),
+            ephemeral=True,
+        )
+
+    @statistics_group.command(
+        name="扫描点赞身份组",
+        description="[管理] 扫描目标论坛里达到 20 赞的帖子，并为贴主补发身份组",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def scan_like_role_rewards(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self.process_like_role_rewards()
+        await interaction.followup.send(
+            (
+                "✅ 点赞身份组扫描完成。\n"
+                f"扫描服务器：**{result['guilds_scanned']}**\n"
+                f"扫描论坛：**{result['forums_scanned']}**\n"
+                f"达标帖子：**{result['qualified_threads']}**\n"
+                f"达标贴主：**{result['eligible_authors']}**\n"
+                f"新发身份组：**{result['roles_granted']}**\n"
+                f"已拥有身份组：**{result['already_had_role']}**\n"
+                f"找不到成员：**{result['missing_members']}**\n"
+                f"缺失身份组：**{result['missing_role']}**\n"
+                f"错误次数：**{result['errors']}**"
             ),
             ephemeral=True,
         )
@@ -719,4 +832,24 @@ class StatisticsCog(commands.Cog):
 
     @thread_cache_sync_task.before_loop
     async def before_thread_cache_sync_task(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=SCAN_INTERVAL_HOURS)
+    async def like_role_reward_task(self):
+        print(f"[{datetime.now(TZ_SHANGHAI)}] 启动点赞身份组扫描任务...")
+        result = await self.process_like_role_rewards()
+        print(
+            "[点赞身份组] 扫描完成: "
+            f"服务器 {result['guilds_scanned']}，"
+            f"论坛 {result['forums_scanned']}，"
+            f"达标帖子 {result['qualified_threads']}，"
+            f"达标贴主 {result['eligible_authors']}，"
+            f"新发身份组 {result['roles_granted']}，"
+            f"已拥有 {result['already_had_role']}，"
+            f"缺失成员 {result['missing_members']}，"
+            f"错误 {result['errors']}"
+        )
+
+    @like_role_reward_task.before_loop
+    async def before_like_role_reward_task(self):
         await self.bot.wait_until_ready()

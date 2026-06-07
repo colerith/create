@@ -75,6 +75,9 @@ async def init_statistics_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_synced ON forum_thread_cache (last_synced_at)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_reward_scan ON forum_thread_cache (forum_channel_id, likes, is_archived)"
+        )
         # 4. 帖子里程碑状态表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS thread_milestone_state (
@@ -378,6 +381,38 @@ async def get_threads_ready_for_like_milestones(min_likes: int = 1000) -> list:
             """,
             (min_likes,),
         )
+        rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.get("tags_json") or "[]")
+            result.append(item)
+        return result
+
+
+async def get_cached_threads_by_forums_and_likes(
+    forum_channel_ids: list[int],
+    min_likes: int,
+    include_archived: bool = False,
+) -> list:
+    """获取指定论坛集合中达到指定点赞数的缓存帖子。"""
+    if not forum_channel_ids:
+        return []
+
+    placeholders = ", ".join("?" for _ in forum_channel_ids)
+    query = f"""
+        SELECT *
+        FROM forum_thread_cache
+        WHERE forum_channel_id IN ({placeholders}) AND likes >= ?
+    """
+    params: list[int] = [*forum_channel_ids, min_likes]
+    if not include_archived:
+        query += " AND is_archived = 0"
+    query += " ORDER BY likes DESC, last_synced_at DESC"
+
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(query, params)
         rows = await cursor.fetchall()
         result = []
         for row in rows:
