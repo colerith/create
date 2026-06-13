@@ -6,7 +6,9 @@ import json
 import io
 import asyncio
 import os
+import re
 import aiosqlite
+from urllib.parse import urlparse
 
 from datetime import datetime, timedelta
 from ..core.db import get_db
@@ -64,6 +66,82 @@ class CachedAttachment:
 
     async def read(self):
         return self._data
+
+
+def has_collectible_message_content(message: discord.Message) -> bool:
+    return bool((message.content or "").strip())
+
+
+def count_collectible_message_items(message: discord.Message) -> int:
+    text_count = 1 if has_collectible_message_content(message) and not message.attachments else 0
+    return len(message.attachments) + text_count
+
+
+def _sanitize_virtual_filename(name: str, fallback: str = "text_attachment") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\r\n\t]', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    return cleaned[:80] or fallback
+
+
+def build_text_attachment_name(text: str) -> str:
+    content = (text or "").strip()
+    if not content:
+        return "text_attachment.txt"
+
+    first_line = content.splitlines()[0].strip()
+    url_match = re.fullmatch(r"https?://\S+", first_line)
+    if url_match and content == first_line:
+        parsed = urlparse(first_line)
+        path_part = parsed.path.strip("/").replace("/", "_")
+        stem_parts = [parsed.netloc]
+        if path_part:
+            stem_parts.append(path_part)
+        stem = "_".join(part for part in stem_parts if part)
+        return f"{_sanitize_virtual_filename(stem, 'link')}.txt"
+
+    preview = first_line[:60]
+    return f"{_sanitize_virtual_filename(preview)}.txt"
+
+
+def build_text_cached_attachment(text: str, filename: str | None = None) -> CachedAttachment:
+    final_filename = filename or build_text_attachment_name(text)
+    text_bytes = text.encode("utf-8")
+    attachment = CachedAttachment(
+        filename=final_filename,
+        title=final_filename,
+        data=text_bytes,
+        content_type="text/plain; charset=utf-8",
+        size=len(text_bytes),
+    )
+    attachment.inline_text_content = text
+    attachment.inline_storage_strategy = "inline_text"
+    return attachment
+
+
+def split_storage_entries(storage_items):
+    file_items = []
+    text_items = []
+    if not isinstance(storage_items, list):
+        return file_items, text_items
+
+    for entry in storage_items:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("strategy") == "inline_text":
+            text_items.append(entry)
+        else:
+            file_items.append(entry)
+    return file_items, text_items
+
+
+def build_text_display_blocks(text_items, limit=8):
+    blocks = []
+    for idx, entry in enumerate(text_items[:limit], start=1):
+        name = entry.get("filename", f"文本 {idx}")
+        content = (entry.get("text_content") or "").strip() or "（空内容）"
+        preview = content if len(content) <= 900 else content[:900] + "..."
+        blocks.append((f"📝 {idx}. {name}", preview))
+    return blocks
 
 
 def log_attachment_debug(stage, attachment):
@@ -236,6 +314,87 @@ async def upload_files_for_storage(bot, user, title, prepared_files):
     return stored_data
 
 
+async def deliver_protected_content(
+    interaction: discord.Interaction,
+    bot,
+    row,
+    *,
+    owner_bypass: bool = False,
+):
+    raw_items = json.loads(row["storage_urls"])
+    storage_items = [ensure_file_entry_defaults(f) for f in raw_items if isinstance(f, dict)]
+    file_items, text_items = split_storage_entries(storage_items)
+
+    file_results = []
+    if file_items:
+        if owner_bypass:
+            file_results = await fetch_files_common(bot, file_items)
+        else:
+            raw_results = await fetch_files_common(bot, file_items)
+            guild_id = interaction.guild_id if interaction.guild else 0
+            channel_id = interaction.channel_id
+            timestamp = datetime.now(TZ_SHANGHAI).isoformat()
+
+            for i, res in enumerate(raw_results):
+                correct_filename = file_items[i].get("filename", res["filename"])
+                trace_id = generate_trace_id()
+                new_bytes = inject_smart_trace(res["bytes"], correct_filename, trace_id)
+                await log_file_trace(
+                    trace_id=trace_id,
+                    user_id=interaction.user.id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=row["message_id"],
+                    filename=correct_filename,
+                    timestamp=timestamp,
+                )
+                file_results.append(
+                    {"filename": correct_filename, "bytes": new_bytes}
+                )
+
+    embed = None
+    text_blocks = build_text_display_blocks(text_items)
+    if text_blocks:
+        embed = discord.Embed(
+            title="📝 文本内容",
+            color=discord.Color.teal(),
+        )
+        for title, preview in text_blocks:
+            embed.add_field(name=title[:256], value=preview[:1024], inline=False)
+        if len(text_items) > len(text_blocks):
+            embed.set_footer(text=f"仅展示前 {len(text_blocks)} 条文本内容")
+
+    if owner_bypass:
+        content = "👑 主人请拿好（原版内容）："
+    else:
+        content = (
+            "✅ **获取成功！**\n"
+            "🛡️ 文件附件仍包含溯源指纹，请勿私自转传。"
+        )
+        if text_items:
+            content += "\n📝 纯文本内容已直接在下方显示。"
+
+        today_start_iso = (
+            datetime.now(TZ_SHANGHAI)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .isoformat()
+        )
+        async with get_db() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?",
+                (interaction.user.id, today_start_iso),
+            )
+            cnt = (await cursor.fetchone())[0]
+        content += f"\n今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}"
+
+    await interaction.followup.send(
+        content=content,
+        embed=embed,
+        files=make_discord_files_common(file_results) if file_results else None,
+        ephemeral=True,
+    )
+
+
 async def check_rate_limit_and_report(
     interaction: discord.Interaction, bot, row
 ) -> tuple[bool, str]:
@@ -327,85 +486,9 @@ class AuthorNoteView(ui.View):
 
         # 下载逻辑
         try:
-            # 1. 获取原始文件数据 (这里面存着我们改好的正确文件名！)
-            file_data = [
-                ensure_file_entry_defaults(f)
-                for f in json.loads(self.row["storage_urls"])
-            ]
-
-            # 2. 下载文件内容 (这里返回的文件名往往是被Discord处理过的乱码或下划线)
-            raw_results = await fetch_files_common(self.bot, file_data)
-
-            # 3. 记录普通下载日志
+            # 记录普通下载日志
             await record_download_common(interaction.user, self.row)
-
-            if raw_results:
-                final_files_to_send = []
-                guild_id = interaction.guild_id if interaction.guild else 0
-                channel_id = interaction.channel_id
-                timestamp = datetime.now(TZ_SHANGHAI).isoformat()
-
-                # --- 核心溯源注入逻辑 ---
-                # 修改点：使用了 enumerate 来同时获取索引 i
-                # 这样我们就能通过 file_data[i]['filename'] 拿到正确的中文名
-                for i, res in enumerate(raw_results):
-                    # 尝试获取正确的显示文件名，如果拿不到就只好用原始的
-                    correct_filename = file_data[i].get("filename", res["filename"])
-
-                    # A. 生成唯一追踪码
-                    trace_id = generate_trace_id()
-
-                    # B. 注入指纹
-                    # 注意：这里我们依然传 correct_filename 进去，以便注入工具能正确识别文件类型
-                    new_bytes = inject_smart_trace(
-                        res["bytes"], correct_filename, trace_id
-                    )
-
-                    # C. 记录到溯源数据库
-                    await log_file_trace(
-                        trace_id=trace_id,
-                        user_id=interaction.user.id,
-                        guild_id=guild_id,
-                        channel_id=channel_id,
-                        message_id=self.row["message_id"],
-                        filename=correct_filename,  # 记录里也存正确名字
-                        timestamp=timestamp,
-                    )
-
-                    # D. 构建发送用的文件对象
-                    # 关键修改：这里强制使用 correct_filename 作为发送给用户的文件名！
-                    final_files_to_send.append(
-                        discord.File(io.BytesIO(new_bytes), filename=correct_filename)
-                    )
-                # -----------------------
-
-                # 计算剩余额度 (这一块保持不变)
-                today_start_iso = (
-                    datetime.now(TZ_SHANGHAI)
-                    .replace(hour=0, minute=0, second=0, microsecond=0)
-                    .isoformat()
-                )
-                async with get_db() as db:
-                    cursor = await db.execute(
-                        "SELECT COUNT(*) FROM download_log WHERE user_id = ? AND timestamp >= ?",
-                        (interaction.user.id, today_start_iso),
-                    )
-                    cnt = (await cursor.fetchone())[0]
-
-                await interaction.followup.send(
-                    content=(
-                        f"✅ **获取成功！**\n"
-                        f"🛡️ 本文件包含溯源指纹，请勿私自转传。\n"
-                        f"今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}\n"
-                        f"请查收下方附件："
-                    ),
-                    files=final_files_to_send,
-                    ephemeral=True,
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ 文件数据读取失败，请联系管理员。", ephemeral=True
-                )
+            await deliver_protected_content(interaction, self.bot, self.row)
         except Exception as e:
             import traceback
 
@@ -834,23 +917,25 @@ class UploadSessionControlView(ui.View):
                 color=discord.Color.red(),
             )
 
-        attachment_count = sum(len(msg.attachments) for msg in session["messages"])
+        attachment_count = sum(
+            count_collectible_message_items(msg) for msg in session["messages"]
+        )
         msg_count = len(session["messages"])
         expire_text = discord.utils.format_dt(session["expires_at"], "R")
         embed = discord.Embed(
             title="📥 保护附件收集中",
             color=0x87CEEB,
             description=(
-                "接下来 5 分钟内，你在当前频道发送的带附件消息都会加入本次保护附件草稿。\n"
-                "推荐做法：直接正常发送文件，全部发完后点下方 `上传完毕`。"
+                "接下来 5 分钟内，你在当前频道发送的带附件或纯文本消息都会加入本次保护附件草稿。\n"
+                "推荐做法：直接正常发送文件、链接或文本内容，全部发完后点下方 `上传完毕`。"
             ),
         )
         embed.add_field(name="已收集消息", value=str(msg_count), inline=True)
-        embed.add_field(name="已收集附件", value=str(attachment_count), inline=True)
+        embed.add_field(name="已收集项目", value=str(attachment_count), inline=True)
         embed.add_field(name="截止时间", value=expire_text, inline=True)
         embed.add_field(
             name="说明",
-            value="此流程绕开 slash 附件参数，优先保留普通消息附件原始文件名。",
+            value="此流程绕开 slash 附件参数，既支持保留原始文件名，也支持把纯文本内容转成可保护的文本附件。",
             inline=False,
         )
         return embed
@@ -1051,24 +1136,39 @@ class ProtectionDraftView(ui.View):
 
     async def publish(self, interaction: discord.Interaction):
         prepared_files = []
+        inline_text_entries = []
         try:
             for idx, att in enumerate(self.attachments):
                 file_bytes = await att.read()
                 entry = self.file_entries[idx]
                 final_filename = entry["filename"]
-                prepared_files.append((file_bytes, final_filename, dict(entry)))
+                if getattr(att, "inline_storage_strategy", None) == "inline_text":
+                    inline_text_entries.append(
+                        {
+                            "strategy": "inline_text",
+                            "filename": final_filename,
+                            "original_filename": entry["original_filename"],
+                            "tag": entry.get("tag"),
+                            "text_content": file_bytes.decode("utf-8", errors="replace"),
+                        }
+                    )
+                else:
+                    prepared_files.append((file_bytes, final_filename, dict(entry)))
         except Exception as e:
             return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
 
-        try:
-            stored_data = await upload_files_for_storage(
-                self.bot,
-                self.user,
-                self.draft_title,
-                prepared_files,
-            )
-        except Exception as e:
-            return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
+        stored_data = []
+        if prepared_files:
+            try:
+                stored_data = await upload_files_for_storage(
+                    self.bot,
+                    self.user,
+                    self.draft_title,
+                    prepared_files,
+                )
+            except Exception as e:
+                return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
+        stored_data.extend(inline_text_entries)
 
         if self.target_message:
             try:
@@ -1351,7 +1451,7 @@ class ManageFilesSelectView(ui.View):
     @ui.button(label="替换文件", style=discord.ButtonStyle.primary, row=1, emoji="♻️")
     async def replace_file(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message(
-            "请在当前频道 5 分钟内发送 1 条带附件的消息（将使用第一个附件进行替换）。",
+            "请在当前频道 5 分钟内发送 1 条带附件或纯文本的消息（附件会取第一个，纯文本会转成 .txt 进行替换）。",
             ephemeral=True,
         )
 
@@ -1359,45 +1459,57 @@ class ManageFilesSelectView(ui.View):
             return (
                 msg.author.id == self.owner_id
                 and msg.channel.id == interaction.channel.id
-                and len(msg.attachments) > 0
+                and (len(msg.attachments) > 0 or has_collectible_message_content(msg))
             )
 
         try:
             msg = await self.bot.wait_for("message", timeout=300, check=check)
         except asyncio.TimeoutError:
-            return await interaction.followup.send("⏰ 超时未收到附件，已取消替换。", ephemeral=True)
-
-        attachment = msg.attachments[0]
-        try:
-            file_bytes = await attachment.read()
-        except Exception as exc:
             return await interaction.followup.send(
-                f"❌ 读取附件失败：{exc}", ephemeral=True
+                "⏰ 超时未收到可替换内容，已取消替换。", ephemeral=True
             )
 
         old_entry = ensure_file_entry_defaults(self.file_data[self.selected_index])
-        new_original_name = get_attachment_original_name(attachment)
-        new_entry = ensure_file_entry_defaults(
-            {
-                "filename": new_original_name,
-                "original_filename": new_original_name,
-                "tag": old_entry.get("tag"),
-            }
-        )
-
-        try:
-            stored_data = await upload_files_for_storage(
-                self.bot,
-                interaction.user,
-                f"管理替换: {self.post_title}",
-                [(file_bytes, new_entry["filename"], new_entry)],
+        if msg.attachments:
+            attachment = msg.attachments[0]
+            try:
+                file_bytes = await attachment.read()
+            except Exception as exc:
+                return await interaction.followup.send(
+                    f"❌ 读取附件失败：{exc}", ephemeral=True
+                )
+            new_original_name = get_attachment_original_name(attachment)
+            try:
+                stored_data = await upload_files_for_storage(
+                    self.bot,
+                    interaction.user,
+                    f"管理替换: {self.post_title}",
+                    [(file_bytes, new_original_name, {
+                        "filename": new_original_name,
+                        "original_filename": new_original_name,
+                        "tag": old_entry.get("tag"),
+                    })],
+                )
+            except Exception as exc:
+                return await interaction.followup.send(
+                    f"❌ 替换文件备份失败：{exc}", ephemeral=True
+                )
+            updated_entry = stored_data[0]
+        else:
+            text_attachment = build_text_cached_attachment(msg.content.strip())
+            file_bytes = await text_attachment.read()
+            new_original_name = text_attachment.filename
+            updated_entry = ensure_file_entry_defaults(
+                {
+                    "strategy": "inline_text",
+                    "filename": new_original_name,
+                    "original_filename": new_original_name,
+                    "tag": old_entry.get("tag"),
+                    "text_content": file_bytes.decode("utf-8", errors="replace"),
+                }
             )
-        except Exception as exc:
-            return await interaction.followup.send(
-                f"❌ 替换文件备份失败：{exc}", ephemeral=True
-            )
 
-        self.file_data[self.selected_index] = stored_data[0]
+        self.file_data[self.selected_index] = updated_entry
         ensure_file_entry_defaults(self.file_data[self.selected_index])
 
         async with get_db() as db:
@@ -1800,18 +1912,12 @@ class PostListView(ui.View):
             # 不过为了方便自己测试，保持原样逻辑给无水印版也行，这里我为了你的测试体验，保持了主人直通，但如果你希望测试水印功能，建议用小号下载
             if interaction.user.id == row["owner_id"] and not has_test_role:
                 await interaction.response.defer(ephemeral=True, thinking=True)
-                file_data = [
-                    ensure_file_entry_defaults(f)
-                    for f in json.loads(row["storage_urls"])
-                ]
-                # 依然是原始文件
-                file_results = await fetch_files_common(self.bot, file_data)
-                if file_results:
-                    await interaction.followup.send(
-                        content="👑 主人请拿好（无水印原版）：",
-                        files=make_discord_files_common(file_results),
-                        ephemeral=True,
-                    )
+                await deliver_protected_content(
+                    interaction,
+                    self.bot,
+                    row,
+                    owner_bypass=True,
+                )
                 return
             # 否则弹出密码框
             await interaction.response.send_modal(

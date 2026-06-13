@@ -26,6 +26,9 @@ from .views import (
     UploadSessionControlView,
     UPLOAD_SESSION_TIMEOUT_SECONDS,
     CachedAttachment,
+    build_text_cached_attachment,
+    count_collectible_message_items,
+    has_collectible_message_content,
 )
 
 
@@ -282,7 +285,7 @@ class ProtectionCog(commands.Cog):
         return self.upload_sessions.get(self._session_key(user_id, channel_id))
 
     async def _collect_upload_session_message(self, message: discord.Message):
-        if not message.attachments:
+        if not message.attachments and not has_collectible_message_content(message):
             return
 
         key = self._session_key(message.author.id, message.channel.id)
@@ -300,7 +303,7 @@ class ProtectionCog(commands.Cog):
 
         session["messages"].append(message)
         print(
-            f"[ProtectionDebug] upload-session-collected: user={message.author.id} channel={message.channel.id} message={message.id} attachments={len(message.attachments)}"
+            f"[ProtectionDebug] upload-session-collected: user={message.author.id} channel={message.channel.id} message={message.id} items={count_collectible_message_items(message)} attachments={len(message.attachments)} text={bool((message.content or '').strip())}"
         )
 
         try:
@@ -361,6 +364,7 @@ class ProtectionCog(commands.Cog):
         default_log_parts = []
         source_messages = session["messages"]
         for msg in source_messages:
+            has_text_item = has_collectible_message_content(msg)
             for att in msg.attachments:
                 try:
                     file_bytes = await att.read()
@@ -383,12 +387,14 @@ class ProtectionCog(commands.Cog):
                         size=getattr(att, "size", None),
                     )
                 )
-            if msg.content:
+            if has_text_item and not msg.attachments:
+                attachments.append(build_text_cached_attachment(msg.content.strip()))
+            elif msg.content:
                 default_log_parts.append(msg.content)
 
         if not attachments:
             return await interaction.response.edit_message(
-                content="❌ 还没有收集到任何附件，请先发送带附件的消息。",
+                content="❌ 还没有收集到任何可保护内容，请先发送带附件或纯文本的消息。",
                 embed=None,
                 view=None,
             )
@@ -625,17 +631,23 @@ class ProtectionCog(commands.Cog):
             return await interaction.response.send_message(
                 "不可以动别人的东西！", ephemeral=True
             )
-        if not message.attachments:
+        if not message.attachments and not has_collectible_message_content(message):
             return await interaction.response.send_message(
-                "消息里没有附件？", ephemeral=True
+                "消息里没有可保护的附件或文本内容？", ephemeral=True
             )
+
+        attachments = list(message.attachments)
+        default_log = message.content or None
+        if not attachments and has_collectible_message_content(message):
+            attachments = [build_text_cached_attachment(message.content.strip())]
+            default_log = None
 
         view = ProtectionDraftView(
             self.bot,
             interaction.user,
-            message.attachments,
+            attachments,
             target_message=message,
-            default_log=message.content or None,
+            default_log=default_log,
         )
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
