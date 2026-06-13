@@ -387,12 +387,15 @@ async def deliver_protected_content(
             cnt = (await cursor.fetchone())[0]
         content += f"\n今日剩余额度: {DAILY_DOWNLOAD_LIMIT - cnt}/{DAILY_DOWNLOAD_LIMIT}"
 
-    await interaction.followup.send(
-        content=content,
-        embed=embed,
-        files=make_discord_files_common(file_results) if file_results else None,
-        ephemeral=True,
-    )
+    send_kwargs = {
+        "content": content,
+        "embed": embed,
+        "ephemeral": True,
+    }
+    if file_results:
+        send_kwargs["files"] = make_discord_files_common(file_results)
+
+    await interaction.followup.send(**send_kwargs)
 
 
 async def check_rate_limit_and_report(
