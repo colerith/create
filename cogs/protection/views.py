@@ -44,6 +44,20 @@ from .modals import (
 
 FILE_EDIT_PAGE_SIZE = 15
 UPLOAD_SESSION_TIMEOUT_SECONDS = 300
+IMAGE_FILE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".svg",
+    ".avif",
+    ".heic",
+    ".heif",
+}
 FILE_TAG_OPTIONS = [
     "角色卡",
     "正则",
@@ -142,6 +156,58 @@ def build_text_display_blocks(text_items, limit=8):
         preview = content if len(content) <= 900 else content[:900] + "..."
         blocks.append((f"📝 {idx}. {name}", preview))
     return blocks
+
+
+def is_image_filename(filename: str | None) -> bool:
+    if not filename:
+        return False
+    return os.path.splitext(filename)[1].lower() in IMAGE_FILE_EXTENSIONS
+
+
+def build_markdown_link_lines(attachments, limit=12):
+    lines = []
+    for attachment in attachments[:limit]:
+        filename = (getattr(attachment, "filename", None) or "image").replace("[", "(").replace("]", ")")
+        url = getattr(attachment, "url", None)
+        if not url:
+            continue
+        lines.append(f"[{filename}]({url})")
+    return lines
+
+
+def add_image_download_fields(embed: discord.Embed, image_attachments):
+    if not image_attachments:
+        return embed
+
+    link_lines = build_markdown_link_lines(image_attachments)
+    if not link_lines:
+        return embed
+
+    chunks = []
+    current_chunk = ""
+    for line in link_lines:
+        if len(current_chunk) + len(line) + 1 > 1024:
+            chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            current_chunk = f"{current_chunk}\n{line}".strip()
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for idx, chunk in enumerate(chunks[:4], start=1):
+        field_name = "🖼️ 图片原文件链接" if idx == 1 else f"🖼️ 图片原文件链接 {idx}"
+        embed.add_field(
+            name=field_name,
+            value=chunk,
+            inline=False,
+        )
+
+    footer_text = "点击图片文件名可在浏览器中打开并下载原图，避免客户端直接另存时转成 webp。"
+    if embed.footer and embed.footer.text:
+        embed.set_footer(text=f"{embed.footer.text} | {footer_text}"[:2048])
+    else:
+        embed.set_footer(text=footer_text)
+    return embed
 
 
 def log_attachment_debug(stage, attachment):
@@ -395,7 +461,26 @@ async def deliver_protected_content(
     if file_results:
         send_kwargs["files"] = make_discord_files_common(file_results)
 
-    await interaction.followup.send(**send_kwargs)
+    sent_message = await interaction.followup.send(**send_kwargs, wait=True)
+
+    image_attachments = [
+        attachment
+        for attachment in getattr(sent_message, "attachments", [])
+        if is_image_filename(getattr(attachment, "filename", None))
+    ]
+    if not image_attachments:
+        return
+
+    result_embed = embed.copy() if embed else discord.Embed(
+        title="📎 下载信息",
+        color=discord.Color.teal(),
+    )
+    add_image_download_fields(result_embed, image_attachments)
+
+    try:
+        await sent_message.edit(embed=result_embed)
+    except discord.HTTPException:
+        pass
 
 
 async def check_rate_limit_and_report(
