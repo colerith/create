@@ -201,18 +201,13 @@ def add_image_download_fields(embed: discord.Embed, image_link_items):
         chunks.append(current_chunk)
 
     for idx, chunk in enumerate(chunks[:4], start=1):
-        field_name = "🖼️ 图片原文件链接" if idx == 1 else f"🖼️ 图片原文件链接 {idx}"
+        field_name = "下载方式1：原图浏览器跳转" if idx == 1 else f"图片链接 {idx}"
         embed.add_field(
             name=field_name,
             value=chunk,
             inline=False,
         )
 
-    footer_text = "点击图片文件名可在浏览器中打开并下载原图，避免客户端直接另存时转成 webp。"
-    if embed.footer and embed.footer.text:
-        embed.set_footer(text=f"{embed.footer.text} | {footer_text}"[:2048])
-    else:
-        embed.set_footer(text=footer_text)
     return embed
 
 
@@ -498,12 +493,9 @@ async def deliver_protected_content(
         archive_stem = _sanitize_virtual_filename(row["title"] or "images")
         image_archive_file = build_image_archive_file(
             image_archive_pairs,
-            f"{archive_stem}_原始文件名图片包.zip",
+            f"{archive_stem}_图片包.zip",
         )
-        image_archive_notice = (
-            "📦 另附一份保留原始文件名的图片 ZIP，"
-            "可直接下载并解压，避免浏览器预览和 Discord 清理文件名。"
-        )
+        image_archive_notice = "可直接下载并解压，图片保留原始文件名。"
 
     image_link_items = []
     sent_attachments = list(getattr(sent_message, "attachments", []))
@@ -528,9 +520,15 @@ async def deliver_protected_content(
         color=discord.Color.teal(),
     )
     add_image_download_fields(result_embed, image_link_items)
+    if image_link_items:
+        result_embed.add_field(
+            name="图片链接说明",
+            value="点击图片文件名可在浏览器中打开原图；如果客户端内直接另存可能会被转成 webp。",
+            inline=False,
+        )
     if image_archive_notice:
         result_embed.add_field(
-            name="📦 推荐下载方式",
+            name="下载方式2：图片文件打包",
             value=image_archive_notice,
             inline=False,
         )
@@ -543,7 +541,7 @@ async def deliver_protected_content(
     if image_archive_file:
         try:
             await interaction.followup.send(
-                content="📦 保留原始文件名的图片 ZIP：",
+                content="压缩包",
                 file=image_archive_file,
                 ephemeral=True,
             )
