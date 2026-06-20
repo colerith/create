@@ -522,6 +522,7 @@ async def check_rate_limit_and_report(
         recent_history = await protection_db.get_recent_download_history(
             interaction.user.id, limit=10
         )
+        report_title = row["title"] if "title" in row.keys() and row["title"] else "未知标题"
         history_lines = []
         for item in recent_history[:8]:
             try:
@@ -540,7 +541,7 @@ async def check_rate_limit_and_report(
                 f"用户: <@{interaction.user.id}> (`{interaction.user.id}`)\n"
                 f"触发阈值: {DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次\n"
                 f"当前窗口命中: {len(logs)} 次\n"
-                f"尝试下载: {row.get('title', '未知标题')}"
+                f"尝试下载: {report_title}"
             ),
             timestamp=datetime.now(TZ_SHANGHAI),
         )
