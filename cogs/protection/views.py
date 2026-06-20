@@ -7,6 +7,7 @@ import io
 import asyncio
 import os
 import re
+import zipfile
 import aiosqlite
 from urllib.parse import urlparse
 
@@ -213,6 +214,19 @@ def add_image_download_fields(embed: discord.Embed, image_link_items):
     else:
         embed.set_footer(text=footer_text)
     return embed
+
+
+def build_image_archive_file(file_pairs, archive_name: str) -> discord.File | None:
+    if not file_pairs:
+        return None
+
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, file_bytes in file_pairs:
+            archive.writestr(filename, file_bytes)
+
+    archive_buffer.seek(0)
+    return discord.File(archive_buffer, filename=archive_name)
 
 
 def log_attachment_debug(stage, attachment):
@@ -423,6 +437,16 @@ async def deliver_protected_content(
                     {"filename": correct_filename, "bytes": new_bytes}
                 )
 
+    image_archive_pairs = []
+    for file_item, file_result in zip(file_items, file_results):
+        archive_filename = (
+            file_item.get("original_filename")
+            or file_item.get("filename")
+            or file_result["filename"]
+        )
+        if is_image_filename(archive_filename):
+            image_archive_pairs.append((archive_filename, file_result["bytes"]))
+
     embed = None
     text_blocks = build_text_display_blocks(text_items)
     if text_blocks:
@@ -468,6 +492,19 @@ async def deliver_protected_content(
 
     sent_message = await interaction.followup.send(**send_kwargs, wait=True)
 
+    image_archive_notice = None
+    image_archive_file = None
+    if image_archive_pairs:
+        archive_stem = _sanitize_virtual_filename(row["title"] or "images")
+        image_archive_file = build_image_archive_file(
+            image_archive_pairs,
+            f"{archive_stem}_原始文件名图片包.zip",
+        )
+        image_archive_notice = (
+            "📦 另附一份保留原始文件名的图片 ZIP，"
+            "可直接下载并解压，避免浏览器预览和 Discord 清理文件名。"
+        )
+
     image_link_items = []
     sent_attachments = list(getattr(sent_message, "attachments", []))
     for file_item, sent_attachment in zip(file_items, sent_attachments):
@@ -491,11 +528,27 @@ async def deliver_protected_content(
         color=discord.Color.teal(),
     )
     add_image_download_fields(result_embed, image_link_items)
+    if image_archive_notice:
+        result_embed.add_field(
+            name="📦 推荐下载方式",
+            value=image_archive_notice,
+            inline=False,
+        )
 
     try:
         await sent_message.edit(embed=result_embed)
     except discord.HTTPException:
         pass
+
+    if image_archive_file:
+        try:
+            await interaction.followup.send(
+                content="📦 保留原始文件名的图片 ZIP：",
+                file=image_archive_file,
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
 
 
 async def check_rate_limit_and_report(
