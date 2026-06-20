@@ -39,6 +39,26 @@ async def record_download_log(user_id: int, message_id: int, title: str, filenam
         await db.commit()
 
 
+async def record_download_rate_warning(
+    user_id: int,
+    message_id: int | None,
+    title: str | None,
+    timestamp: str,
+    warning_type: str = "rate_limit",
+):
+    """记录下载速率警告行为。"""
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO download_rate_warning_log
+            (user_id, message_id, title, warning_type, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, message_id, title, warning_type, timestamp),
+        )
+        await db.commit()
+
+
 async def log_file_trace(
     trace_id: str,
     user_id: int,
@@ -124,6 +144,23 @@ async def get_user_downloads_since(user_id: int, timestamp: str):
             (user_id, timestamp),
         )
         return await cursor.fetchall()
+
+
+async def count_user_download_rate_warnings_since(
+    user_id: int, timestamp: str, warning_type: str = "rate_limit"
+) -> int:
+    """统计用户自某个时间点以来触发的下载速率警告次数。"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM download_rate_warning_log
+            WHERE user_id = ? AND timestamp >= ? AND warning_type = ?
+            """,
+            (user_id, timestamp, warning_type),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
 
 
 async def get_items_in_channel(channel_id: int, limit: int = 100):

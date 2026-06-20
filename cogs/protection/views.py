@@ -22,6 +22,7 @@ from config import (
     TEST_ROLE_ID,
     DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES,
     DOWNLOAD_RATE_LIMIT_MAX_TIMES,
+    DOWNLOAD_RATE_WARNING_DAILY_REPORT_THRESHOLD,
     ABNORMAL_REPORT_CHANNEL_ID,
 )
 from .utils import (
@@ -558,7 +559,7 @@ async def deliver_protected_content(
 async def check_rate_limit_and_report(
     interaction: discord.Interaction, bot, row
 ) -> tuple[bool, str]:
-    """检查下载速率并在触发异常时上报。"""
+    """检查下载速率，先对用户温和提醒，达到日阈值后再上报。"""
     since_dt = datetime.now(TZ_SHANGHAI) - timedelta(
         minutes=DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES
     )
@@ -568,57 +569,75 @@ async def check_rate_limit_and_report(
     if len(logs) < DOWNLOAD_RATE_LIMIT_MAX_TIMES:
         return True, ""
 
-    report_channel = bot.get_channel(ABNORMAL_REPORT_CHANNEL_ID)
-    if not report_channel:
-        try:
-            report_channel = await bot.fetch_channel(ABNORMAL_REPORT_CHANNEL_ID)
-        except Exception:
-            report_channel = None
+    now = datetime.now(TZ_SHANGHAI)
+    today_start_iso = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    report_title = row["title"] if "title" in row.keys() and row["title"] else "未知标题"
 
-    if report_channel:
-        recent_history = await protection_db.get_recent_download_history(
-            interaction.user.id, limit=10
-        )
-        report_title = row["title"] if "title" in row.keys() and row["title"] else "未知标题"
-        history_lines = []
-        for item in recent_history[:8]:
+    await protection_db.record_download_rate_warning(
+        user_id=interaction.user.id,
+        message_id=row["message_id"] if "message_id" in row.keys() else None,
+        title=report_title,
+        timestamp=now.isoformat(),
+    )
+    warning_count_today = await protection_db.count_user_download_rate_warnings_since(
+        interaction.user.id, today_start_iso
+    )
+
+    should_report = (
+        warning_count_today == DOWNLOAD_RATE_WARNING_DAILY_REPORT_THRESHOLD
+    )
+    if should_report:
+        report_channel = bot.get_channel(ABNORMAL_REPORT_CHANNEL_ID)
+        if not report_channel:
             try:
-                ts = discord.utils.format_dt(datetime.fromisoformat(item["timestamp"]), "T")
+                report_channel = await bot.fetch_channel(ABNORMAL_REPORT_CHANNEL_ID)
             except Exception:
-                ts = item["timestamp"]
-            channel_text = f"<#{item['channel_id']}>" if item["channel_id"] else "未知频道"
-            history_lines.append(
-                f"- {ts} | {channel_text} | {item['title'] or '无标题'}"
-            )
+                report_channel = None
 
-        embed = discord.Embed(
-            title="🚨 异常下载速率告警",
-            color=discord.Color.red(),
-            description=(
-                f"用户: <@{interaction.user.id}> (`{interaction.user.id}`)\n"
-                f"触发阈值: {DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次\n"
-                f"当前窗口命中: {len(logs)} 次\n"
-                f"尝试下载: {report_title}"
-            ),
-            timestamp=datetime.now(TZ_SHANGHAI),
-        )
-        if history_lines:
-            embed.add_field(
-                name="最近操作历史",
-                value="\n".join(history_lines)[:1024],
-                inline=False,
+        if report_channel:
+            recent_history = await protection_db.get_recent_download_history(
+                interaction.user.id, limit=10
             )
+            history_lines = []
+            for item in recent_history[:8]:
+                try:
+                    ts = discord.utils.format_dt(datetime.fromisoformat(item["timestamp"]), "T")
+                except Exception:
+                    ts = item["timestamp"]
+                channel_text = f"<#{item['channel_id']}>" if item["channel_id"] else "未知频道"
+                history_lines.append(
+                    f"- {ts} | {channel_text} | {item['title'] or '无标题'}"
+                )
 
-        try:
-            await report_channel.send(embed=embed)
-        except Exception:
-            pass
+            embed = discord.Embed(
+                title="🚨 异常下载速率告警",
+                color=discord.Color.red(),
+                description=(
+                    f"用户: <@{interaction.user.id}> (`{interaction.user.id}`)\n"
+                    f"短时阈值: {DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次\n"
+                    f"当前窗口命中: {len(logs)} 次\n"
+                    f"当日警告次数: {warning_count_today}/{DOWNLOAD_RATE_WARNING_DAILY_REPORT_THRESHOLD}\n"
+                    f"尝试下载: {report_title}"
+                ),
+                timestamp=now,
+            )
+            if history_lines:
+                embed.add_field(
+                    name="最近操作历史",
+                    value="\n".join(history_lines)[:1024],
+                    inline=False,
+                )
+
+            try:
+                await report_channel.send(embed=embed)
+            except Exception:
+                pass
 
     return (
         False,
         (
-            f"⏱️ 下载过于频繁，请稍后再试。\n"
-            f"限制规则：{DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次。"
+            f"⏱️ 你刚刚下载得有点快啦，先稍微休息一下再继续吧。\n"
+            f"为了照顾大家的使用体验，当前限制为 {DOWNLOAD_RATE_LIMIT_WINDOW_MINUTES} 分钟内最多 {DOWNLOAD_RATE_LIMIT_MAX_TIMES} 次下载。"
         ),
     )
 

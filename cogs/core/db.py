@@ -75,6 +75,19 @@ async def init_db():
                 timestamp TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS download_rate_warning_log (
+                warning_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER,
+                title TEXT,
+                warning_type TEXT NOT NULL DEFAULT 'rate_limit',
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_download_rate_warning_user_ts ON download_rate_warning_log (user_id, timestamp)"
+        )
         # 5. 溯源追踪记录表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS file_traces (
