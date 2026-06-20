@@ -164,22 +164,27 @@ def is_image_filename(filename: str | None) -> bool:
     return os.path.splitext(filename)[1].lower() in IMAGE_FILE_EXTENSIONS
 
 
-def build_markdown_link_lines(attachments, limit=12):
+def sanitize_markdown_link_label(label: str | None, fallback: str = "image") -> str:
+    value = (label or fallback).replace("[", "(").replace("]", ")")
+    return value or fallback
+
+
+def build_markdown_link_lines(link_items, limit=12):
     lines = []
-    for attachment in attachments[:limit]:
-        filename = (getattr(attachment, "filename", None) or "image").replace("[", "(").replace("]", ")")
-        url = getattr(attachment, "url", None)
+    for item in link_items[:limit]:
+        filename = sanitize_markdown_link_label(item.get("label"))
+        url = item.get("url")
         if not url:
             continue
         lines.append(f"[{filename}]({url})")
     return lines
 
 
-def add_image_download_fields(embed: discord.Embed, image_attachments):
-    if not image_attachments:
+def add_image_download_fields(embed: discord.Embed, image_link_items):
+    if not image_link_items:
         return embed
 
-    link_lines = build_markdown_link_lines(image_attachments)
+    link_lines = build_markdown_link_lines(image_link_items)
     if not link_lines:
         return embed
 
@@ -463,19 +468,29 @@ async def deliver_protected_content(
 
     sent_message = await interaction.followup.send(**send_kwargs, wait=True)
 
-    image_attachments = [
-        attachment
-        for attachment in getattr(sent_message, "attachments", [])
-        if is_image_filename(getattr(attachment, "filename", None))
-    ]
-    if not image_attachments:
+    image_link_items = []
+    sent_attachments = list(getattr(sent_message, "attachments", []))
+    for file_item, sent_attachment in zip(file_items, sent_attachments):
+        sent_filename = getattr(sent_attachment, "filename", None)
+        if not is_image_filename(sent_filename):
+            continue
+        image_link_items.append(
+            {
+                "label": file_item.get("original_filename")
+                or file_item.get("filename")
+                or sent_filename,
+                "url": getattr(sent_attachment, "url", None),
+            }
+        )
+
+    if not image_link_items:
         return
 
     result_embed = embed.copy() if embed else discord.Embed(
         title="📎 下载信息",
         color=discord.Color.teal(),
     )
-    add_image_download_fields(result_embed, image_attachments)
+    add_image_download_fields(result_embed, image_link_items)
 
     try:
         await sent_message.edit(embed=result_embed)
