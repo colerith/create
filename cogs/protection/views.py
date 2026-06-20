@@ -201,7 +201,7 @@ def add_image_download_fields(embed: discord.Embed, image_link_items):
         chunks.append(current_chunk)
 
     for idx, chunk in enumerate(chunks[:4], start=1):
-        field_name = "下载方式1：原图浏览器跳转" if idx == 1 else f"图片链接 {idx}"
+        field_name = "下载方式2：原图浏览器快捷跳转" if idx == 1 else f"图片链接 {idx}"
         embed.add_field(
             name=field_name,
             value=chunk,
@@ -516,19 +516,25 @@ async def deliver_protected_content(
         return
 
     result_embed = embed.copy() if embed else discord.Embed(
-        title="📎 下载信息",
+        title="📎 下载指引",
         color=discord.Color.teal(),
     )
+    if image_link_items:
+        result_embed.add_field(
+            name="下载方式1：手动原图浏览器打开",
+            value="点开上方图片打开大图→右上角【浏览器打开】→长按/右键浏览器原图另存为png，图片保留原始文件名。",
+            inline=False,
+        )
     add_image_download_fields(result_embed, image_link_items)
     if image_link_items:
         result_embed.add_field(
-            name="图片链接说明",
-            value="点击图片文件名可在浏览器中打开原图；如果客户端内直接另存可能会被转成 webp。",
+            name="\u200b",
+            value="点击图片文件名可在浏览器中打开原图并另存为，但本方式文件名会丢失中文字符",
             inline=False,
         )
     if image_archive_notice:
         result_embed.add_field(
-            name="下载方式2：图片文件打包",
+            name="下载方式3：图片文件打包",
             value=image_archive_notice,
             inline=False,
         )
