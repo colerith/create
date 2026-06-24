@@ -18,6 +18,7 @@ if not TOKEN:
 
 TEST_GUILD_ID = [1397629012292931726, 1384945301780955246, 1413953986519760908]
 COG_EXTENSIONS = (
+    "cogs.backup",
     "cogs.protection",
     "cogs.statistics",
     "cogs.recommend",
