@@ -57,8 +57,8 @@ class CoreBackupCog(commands.Cog):
                 print(f"❌ [CoreBackup] 无法访问目标频道 {CORE_BACKUP_CHANNEL_ID}: {exc}")
                 return
 
-        if not isinstance(channel, discord.TextChannel):
-            print(f"❌ [CoreBackup] 目标频道 {CORE_BACKUP_CHANNEL_ID} 不是文字频道。")
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            print(f"❌ [CoreBackup] 目标频道 {CORE_BACKUP_CHANNEL_ID} 不是可发送消息的文字频道或帖子频道。")
             return
 
         archive_path = self._build_backup_archive()
