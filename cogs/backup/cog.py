@@ -48,29 +48,81 @@ class CoreBackupCog(commands.Cog):
 
         return archive_path
 
-    async def send_core_backup(self) -> None:
+    def _get_upload_limit_bytes(
+        self, channel: discord.TextChannel | discord.Thread
+    ) -> int:
+        guild = getattr(channel, "guild", None)
+        if guild and getattr(guild, "filesize_limit", None):
+            return guild.filesize_limit
+        return 8 * 1024 * 1024
+
+    def _split_file(self, file_path: Path, chunk_size: int) -> list[Path]:
+        part_paths: list[Path] = []
+        with file_path.open("rb") as src:
+            index = 1
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                part_path = file_path.with_name(f"{file_path.name}.part{index:03d}")
+                part_path.write_bytes(chunk)
+                part_paths.append(part_path)
+                index += 1
+        return part_paths
+
+    async def send_core_backup(self) -> str:
         channel = self.bot.get_channel(CORE_BACKUP_CHANNEL_ID)
         if channel is None:
             try:
                 channel = await self.bot.fetch_channel(CORE_BACKUP_CHANNEL_ID)
             except (discord.NotFound, discord.Forbidden) as exc:
                 print(f"❌ [CoreBackup] 无法访问目标频道 {CORE_BACKUP_CHANNEL_ID}: {exc}")
-                return
+                return f"无法访问目标频道：{exc}"
 
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             print(f"❌ [CoreBackup] 目标频道 {CORE_BACKUP_CHANNEL_ID} 不是可发送消息的文字频道或帖子频道。")
-            return
+            return "目标频道不是可发送消息的文字频道或帖子频道。"
 
         archive_path = self._build_backup_archive()
+        extra_paths: list[Path] = []
         try:
             filename = archive_path.name
+            upload_limit = self._get_upload_limit_bytes(channel)
+            archive_size = archive_path.stat().st_size
+
+            if archive_size <= upload_limit:
+                await channel.send(
+                    content=f"🗂️ 核心数据备份已生成：`{filename}`",
+                    file=discord.File(archive_path, filename=filename),
+                )
+                print(f"✅ [CoreBackup] 已发送核心备份到频道 {CORE_BACKUP_CHANNEL_ID}: {filename}")
+                return f"已发送备份：`{filename}`"
+
+            chunk_size = max(1, upload_limit - 64 * 1024)
+            part_paths = self._split_file(archive_path, chunk_size)
+            extra_paths.extend(part_paths)
+
             await channel.send(
-                content=f"🗂️ 核心数据备份已生成：`{filename}`",
-                file=discord.File(archive_path, filename=filename),
+                content=(
+                    f"🗂️ 核心数据备份过大，已自动分卷发送：`{filename}`\n"
+                    f"共 `{len(part_paths)}` 个分卷，请全部下载后按顺序合并。"
+                )
             )
-            print(f"✅ [CoreBackup] 已发送核心备份到频道 {CORE_BACKUP_CHANNEL_ID}: {filename}")
+
+            for index, part_path in enumerate(part_paths, start=1):
+                await channel.send(
+                    content=f"备份分卷 {index}/{len(part_paths)}：`{part_path.name}`",
+                    file=discord.File(part_path, filename=part_path.name),
+                )
+
+            print(
+                f"✅ [CoreBackup] 备份超过上传限制，已分卷发送到频道 {CORE_BACKUP_CHANNEL_ID}: {filename} ({len(part_paths)} parts)"
+            )
+            return f"备份过大，已分卷发送，共 {len(part_paths)} 个文件。"
         finally:
             archive_path.unlink(missing_ok=True)
+            for extra_path in extra_paths:
+                extra_path.unlink(missing_ok=True)
 
     @tasks.loop(time=time(hour=4, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_core_backup_task(self):
@@ -89,8 +141,8 @@ class CoreBackupCog(commands.Cog):
             return await interaction.response.send_message("仅限管理员使用。", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
-        await self.send_core_backup()
+        result = await self.send_core_backup()
         await interaction.followup.send(
-            f"✅ 已尝试将核心数据备份发送到频道 <#{CORE_BACKUP_CHANNEL_ID}>。",
+            f"✅ {result}\n目标频道：<#{CORE_BACKUP_CHANNEL_ID}>",
             ephemeral=True,
         )
