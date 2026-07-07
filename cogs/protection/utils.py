@@ -281,6 +281,7 @@ def is_valid_comment(content: str) -> bool:
     if content_clean.isdigit(): return False
     if re.search(r'(.)\1{4,}', content_clean): return False
     if len(set(content_clean)) < 4: return False
+    if re.fullmatch(r'[这这一]*[是]?一?条?有意义的评论', content_clean): return False
     return True
 
 async def fetch_files_common(bot, file_data):

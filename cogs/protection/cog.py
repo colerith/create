@@ -277,6 +277,10 @@ class ProtectionCog(commands.Cog):
             await protection_db.add_or_update_comment(
                 message.author.id, message.channel.id, message.content
             )
+            try:
+                await message.add_reaction("💖")
+            except discord.HTTPException:
+                pass
 
     def _session_key(self, user_id: int, channel_id: int):
         return (user_id, channel_id)
