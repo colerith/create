@@ -277,10 +277,27 @@ class ProtectionCog(commands.Cog):
             await protection_db.add_or_update_comment(
                 message.author.id, message.channel.id, message.content
             )
-            try:
-                await message.add_reaction("💖")
-            except discord.HTTPException:
-                pass
+            rows = await protection_db.get_items_in_channel(message.channel.id, limit=1)
+            protected_post = rows[0] if rows else None
+
+            if protected_post and protected_post["unlock_type"] in {
+                "like_comment",
+                "like_comment_password",
+            }:
+                try:
+                    storage_items = json.loads(protected_post["storage_urls"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    storage_items = []
+
+                has_real_attachments = any(
+                    isinstance(item, dict) and item.get("strategy") != "inline_text"
+                    for item in storage_items
+                )
+                if has_real_attachments:
+                    try:
+                        await message.add_reaction("💖")
+                    except discord.HTTPException:
+                        pass
 
     def _session_key(self, user_id: int, channel_id: int):
         return (user_id, channel_id)
