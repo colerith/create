@@ -383,6 +383,7 @@ class ProtectionCog(commands.Cog):
 
         source_messages = session["messages"]
         reusable_attachments = list(session.get("reusable_attachments", []))
+        reusable_metadata = dict(session.get("reusable_metadata", {}) or {})
         try:
             attachments, default_log = await collect_cached_attachments_from_messages(
                 source_messages
@@ -418,6 +419,7 @@ class ProtectionCog(commands.Cog):
             attachments,
             target_message=target_message,
             default_log=default_log,
+            draft_defaults=reusable_metadata,
         )
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
         await interaction.response.edit_message(content=None, embed=embed, view=view)
@@ -676,6 +678,7 @@ class ProtectionCog(commands.Cog):
         self.upload_sessions[key] = {
             "messages": [],
             "reusable_attachments": [],
+            "reusable_metadata": {},
             "expires_at": expires_at,
             "task": task,
         }

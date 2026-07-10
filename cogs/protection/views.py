@@ -544,6 +544,19 @@ def get_reusable_attachments_from_rows(posts_rows, message_id: str | int):
     return row, [ReusableStoredAttachment(item) for item in storage_items]
 
 
+def build_reusable_metadata_from_row(row):
+    if not row:
+        return {}
+    return {
+        "draft_title": row["title"],
+        "draft_log": row["log"],
+        "draft_update_log": row["update_log"],
+        "draft_mode": row["unlock_type"] or "like",
+        "mention_users": bool(row["mention_users"]),
+        "draft_password": row["password"],
+    }
+
+
 def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
     start = page_index * page_size
     end = start + page_size
@@ -1478,6 +1491,7 @@ class UploadSessionReusePublishedView(ui.View):
             )
 
         session.setdefault("reusable_attachments", []).extend(reusable_attachments)
+        session["reusable_metadata"] = build_reusable_metadata_from_row(row)
         await interaction.response.defer(ephemeral=True)
         try:
             await interaction.edit_original_response(
@@ -1487,7 +1501,7 @@ class UploadSessionReusePublishedView(ui.View):
         except Exception:
             pass
         await interaction.followup.send(
-            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前收集会话。",
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前收集会话，并同步了标题、作者提示、更新日志与获取条件配置。",
             ephemeral=True,
         )
 
@@ -1550,16 +1564,25 @@ class DraftReusePublishedView(ui.View):
             )
 
         self.protection_view.append_attachments(reusable_attachments)
+        self.protection_view.apply_draft_defaults(build_reusable_metadata_from_row(row))
         await interaction.response.defer(ephemeral=True)
         await self.protection_view.refresh_dashboard_message()
         await interaction.followup.send(
-            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前草稿。",
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前草稿，并同步了标题、作者提示、更新日志与获取条件配置。",
             ephemeral=True,
         )
 
 
 class ProtectionDraftView(ui.View):
-    def __init__(self, bot, user, attachments, target_message=None, default_log=None):
+    def __init__(
+        self,
+        bot,
+        user,
+        attachments,
+        target_message=None,
+        default_log=None,
+        draft_defaults=None,
+    ):
         super().__init__(timeout=600)
         self.bot = bot
         self.user = user
@@ -1580,6 +1603,23 @@ class ProtectionDraftView(ui.View):
             for idx, entry in enumerate(self.file_entries)
             if entry["filename"] != entry["original_filename"]
         }
+        self.apply_draft_defaults(draft_defaults)
+
+    def apply_draft_defaults(self, draft_defaults):
+        if not draft_defaults:
+            return
+        if draft_defaults.get("draft_title"):
+            self.draft_title = draft_defaults["draft_title"]
+        if "draft_log" in draft_defaults:
+            self.draft_log = draft_defaults.get("draft_log")
+        if "draft_update_log" in draft_defaults:
+            self.draft_update_log = draft_defaults.get("draft_update_log")
+        if draft_defaults.get("draft_mode"):
+            self.draft_mode = draft_defaults["draft_mode"]
+        if "mention_users" in draft_defaults:
+            self.mention_users = bool(draft_defaults.get("mention_users"))
+        if "draft_password" in draft_defaults:
+            self.draft_password = draft_defaults.get("draft_password")
 
     def _build_file_entry_for_attachment(self, att):
         stored_entry = getattr(att, "stored_entry", None)
@@ -2451,6 +2491,7 @@ class PostManagementView(ui.View):
         cog.upload_sessions[key] = {
             "messages": [],
             "reusable_attachments": [],
+            "reusable_metadata": {},
             "expires_at": expires_at,
             "task": task,
             "finish_handler": finish_append_upload,
