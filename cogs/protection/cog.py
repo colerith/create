@@ -382,6 +382,7 @@ class ProtectionCog(commands.Cog):
             session["task"].cancel()
 
         source_messages = session["messages"]
+        reusable_attachments = list(session.get("reusable_attachments", []))
         try:
             attachments, default_log = await collect_cached_attachments_from_messages(
                 source_messages
@@ -393,6 +394,7 @@ class ProtectionCog(commands.Cog):
                 embed=None,
                 view=None,
             )
+        attachments.extend(reusable_attachments)
 
         if not attachments:
             return await interaction.response.edit_message(
@@ -673,6 +675,7 @@ class ProtectionCog(commands.Cog):
         )
         self.upload_sessions[key] = {
             "messages": [],
+            "reusable_attachments": [],
             "expires_at": expires_at,
             "task": task,
         }

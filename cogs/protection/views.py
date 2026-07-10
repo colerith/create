@@ -527,6 +527,23 @@ async def get_user_published_items(user_id: int, limit: int = 25):
         return await cursor.fetchall()
 
 
+def get_reusable_attachments_from_rows(posts_rows, message_id: str | int):
+    row = next((item for item in posts_rows if str(item["message_id"]) == str(message_id)), None)
+    if not row:
+        return None, []
+
+    try:
+        storage_items = json.loads(row["storage_urls"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        storage_items = []
+    storage_items = [
+        ensure_file_entry_defaults(item)
+        for item in storage_items
+        if isinstance(item, dict)
+    ]
+    return row, [ReusableStoredAttachment(item) for item in storage_items]
+
+
 def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
     start = page_index * page_size
     end = start + page_size
@@ -1315,9 +1332,11 @@ class UploadSessionControlView(ui.View):
                 color=discord.Color.red(),
             )
 
-        attachment_count = sum(
+        message_attachment_count = sum(
             count_collectible_message_items(msg) for msg in session["messages"]
         )
+        reused_attachment_count = len(session.get("reusable_attachments", []))
+        attachment_count = message_attachment_count + reused_attachment_count
         msg_count = len(session["messages"])
         expire_text = discord.utils.format_dt(session["expires_at"], "R")
         title = session.get("panel_title") or "📥 保护附件收集中"
@@ -1336,6 +1355,12 @@ class UploadSessionControlView(ui.View):
         embed.add_field(name="已收集消息", value=str(msg_count), inline=True)
         embed.add_field(name="已收集项目", value=str(attachment_count), inline=True)
         embed.add_field(name="截止时间", value=expire_text, inline=True)
+        if reused_attachment_count > 0:
+            embed.add_field(
+                name="复用已发布",
+                value=f"已导入 {reused_attachment_count} 个",
+                inline=True,
+            )
         embed.add_field(
             name="说明",
             value=note_text,
@@ -1348,6 +1373,20 @@ class UploadSessionControlView(ui.View):
         await interaction.response.edit_message(
             embed=self._build_embed(),
             view=self,
+        )
+
+    @ui.button(label="复用已发布", style=discord.ButtonStyle.secondary, emoji="♻️")
+    async def reuse_published(self, interaction: discord.Interaction, button: ui.Button):
+        rows = await get_user_published_items(self.user_id)
+        if not rows:
+            return await interaction.response.send_message(
+                "❌ 你的附件库里还没有已发布内容可复用。",
+                ephemeral=True,
+            )
+        await interaction.response.send_message(
+            "请选择要导入到当前收集会话的已发布附件批次：",
+            view=UploadSessionReusePublishedView(self, rows),
+            ephemeral=True,
         )
 
     @ui.button(label="上传完毕", style=discord.ButtonStyle.success, emoji="✅")
@@ -1371,11 +1410,11 @@ class UploadSessionControlView(ui.View):
 
 
 # --- 草稿/发布视图 ---
-class DraftReusePublishedView(ui.View):
-    def __init__(self, protection_view, posts_rows):
+class UploadSessionReusePublishedView(ui.View):
+    def __init__(self, session_view, posts_rows):
         super().__init__(timeout=120)
-        self.protection_view = protection_view
-        self.posts_map = {str(row["message_id"]): row for row in posts_rows}
+        self.session_view = session_view
+        self.posts_rows = posts_rows
         self.selected_message_id = str(posts_rows[0]["message_id"])
         options = []
         for idx, row in enumerate(posts_rows[:25]):
@@ -1413,25 +1452,103 @@ class DraftReusePublishedView(ui.View):
 
     @ui.button(label="导入整批附件", style=discord.ButtonStyle.success, row=1, emoji="📥")
     async def import_post(self, interaction: discord.Interaction, button: ui.Button):
-        row = self.posts_map.get(self.selected_message_id)
+        row, reusable_attachments = get_reusable_attachments_from_rows(
+            self.posts_rows,
+            self.selected_message_id,
+        )
         if not row:
             return await interaction.response.send_message(
                 "❌ 未找到对应的附件批次，请重试。",
                 ephemeral=True,
             )
-
-        try:
-            storage_items = json.loads(row["storage_urls"] or "[]")
-        except (TypeError, json.JSONDecodeError):
-            storage_items = []
-        storage_items = [ensure_file_entry_defaults(item) for item in storage_items if isinstance(item, dict)]
-        if not storage_items:
+        if not reusable_attachments:
             return await interaction.response.send_message(
                 "❌ 这条已发布记录里没有可复用的附件。",
                 ephemeral=True,
             )
 
-        reusable_attachments = [ReusableStoredAttachment(item) for item in storage_items]
+        session = self.session_view.cog.get_upload_session(
+            self.session_view.user_id,
+            self.session_view.channel_id,
+        )
+        if not session:
+            return await interaction.response.send_message(
+                "❌ 当前收集会话已失效，请重新开始。",
+                ephemeral=True,
+            )
+
+        session.setdefault("reusable_attachments", []).extend(reusable_attachments)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.edit_original_response(
+                embed=self.session_view._build_embed(),
+                view=self.session_view,
+            )
+        except Exception:
+            pass
+        await interaction.followup.send(
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前收集会话。",
+            ephemeral=True,
+        )
+
+
+class DraftReusePublishedView(ui.View):
+    def __init__(self, protection_view, posts_rows):
+        super().__init__(timeout=120)
+        self.protection_view = protection_view
+        self.posts_rows = posts_rows
+        self.selected_message_id = str(posts_rows[0]["message_id"])
+        options = []
+        for idx, row in enumerate(posts_rows[:25]):
+            try:
+                file_count = len(
+                    [item for item in json.loads(row["storage_urls"] or "[]") if isinstance(item, dict)]
+                )
+            except Exception:
+                file_count = 0
+            try:
+                ts_str = datetime.fromisoformat(row["created_at"]).strftime("%m-%d %H:%M")
+            except Exception:
+                ts_str = "未知时间"
+            options.append(
+                discord.SelectOption(
+                    label=(row["title"] or "无标题")[:90],
+                    value=str(row["message_id"]),
+                    description=f"{file_count} 项 | {ts_str} | 频道 {row['channel_id']}",
+                    default=(idx == 0),
+                )
+            )
+        self.select_menu = ui.Select(
+            placeholder="选择要复用的已发布附件批次...",
+            options=options,
+            row=0,
+        )
+        self.select_menu.callback = self.on_select
+        self.add_item(self.select_menu)
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_message_id = self.select_menu.values[0]
+        for option in self.select_menu.options:
+            option.default = option.value == self.selected_message_id
+        await interaction.response.edit_message(view=self)
+
+    @ui.button(label="导入整批附件", style=discord.ButtonStyle.success, row=1, emoji="📥")
+    async def import_post(self, interaction: discord.Interaction, button: ui.Button):
+        row, reusable_attachments = get_reusable_attachments_from_rows(
+            self.posts_rows,
+            self.selected_message_id,
+        )
+        if not row:
+            return await interaction.response.send_message(
+                "❌ 未找到对应的附件批次，请重试。",
+                ephemeral=True,
+            )
+        if not reusable_attachments:
+            return await interaction.response.send_message(
+                "❌ 这条已发布记录里没有可复用的附件。",
+                ephemeral=True,
+            )
+
         self.protection_view.append_attachments(reusable_attachments)
         await interaction.response.defer(ephemeral=True)
         await self.protection_view.refresh_dashboard_message()
@@ -2333,6 +2450,7 @@ class PostManagementView(ui.View):
 
         cog.upload_sessions[key] = {
             "messages": [],
+            "reusable_attachments": [],
             "expires_at": expires_at,
             "task": task,
             "finish_handler": finish_append_upload,
