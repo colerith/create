@@ -84,6 +84,18 @@ class CachedAttachment:
         return self._data
 
 
+class ReusableStoredAttachment:
+    def __init__(self, stored_entry):
+        self.stored_entry = ensure_file_entry_defaults(dict(stored_entry))
+        self.filename = self.stored_entry["filename"]
+        self.title = self.stored_entry.get("original_filename") or self.filename
+        self.content_type = None
+        self.size = None
+
+    async def read(self):
+        raise RuntimeError("ReusableStoredAttachment does not support direct read")
+
+
 def has_collectible_message_content(message: discord.Message) -> bool:
     return bool((message.content or "").strip())
 
@@ -309,6 +321,210 @@ def build_file_line(entry, index=None):
     if original_name and entry["filename"] != original_name:
         original_text = f" (原始: {original_name})"
     return f"{prefix}{entry['filename']}{format_tag_text(entry)}{original_text}"
+
+
+def get_unlock_mode_text(unlock_type: str, *, rich: bool = False) -> str:
+    plain_map = {
+        "like": "👍 点赞首楼",
+        "like_comment": "👍💬 点赞首楼 + 回复本贴",
+        "like_password": "👍🔐 点赞首楼 + 口令",
+        "like_comment_password": "👍💬🔐 点赞首楼 + 回复本贴 + 口令",
+    }
+    rich_map = {
+        "like": "👍 **点赞首楼**",
+        "like_comment": "👍💬 **点赞首楼 + 回复本贴**",
+        "like_password": "👍🔐 **点赞首楼 + 口令**",
+        "like_comment_password": "👍💬🔐 **点赞首楼 + 回复本贴 + 口令**",
+    }
+    mapping = rich_map if rich else plain_map
+    return mapping.get(unlock_type, "未知")
+
+
+def build_protected_post_embed(
+    *,
+    title: str,
+    unlock_type: str,
+    file_count: int,
+    author_name: str | None,
+    author_icon_url: str | None,
+    publish_time_text: str,
+    bot_avatar_url: str | None,
+):
+    final_desc = "📋 **本附件受保护，请按照下方指示获取。**"
+    embed = discord.Embed(
+        title=f"✨ {title}",
+        description=final_desc,
+        color=discord.Color.from_rgb(255, 183, 197),
+    )
+    if author_name:
+        embed.set_author(name=author_name, icon_url=author_icon_url)
+    embed.add_field(
+        name="🔑 获取条件",
+        value=get_unlock_mode_text(unlock_type, rich=True),
+        inline=True,
+    )
+    embed.add_field(name="📦 文件数量", value=f"**{file_count}** 个", inline=True)
+    embed.add_field(name="⏰ 发布时间", value=publish_time_text, inline=True)
+    embed.add_field(
+        name="📥 如何下载？",
+        value="请使用命令：\n**`/保护附件 获取附件`**\n来验证条件并下载文件。",
+        inline=False,
+    )
+    if bot_avatar_url:
+        embed.set_footer(text="由 创作保护助手 强力驱动", icon_url=bot_avatar_url)
+    else:
+        embed.set_footer(text="由 创作保护助手 强力驱动")
+    return embed
+
+
+async def get_protected_item_row(message_id: int):
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM protected_items WHERE message_id = ?",
+            (message_id,),
+        )
+        return await cursor.fetchone()
+
+
+async def refresh_protected_post_embed(bot, message_id: int):
+    row = await get_protected_item_row(message_id)
+    if not row:
+        return False
+
+    try:
+        storage_items = json.loads(row["storage_urls"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        storage_items = []
+    storage_items = [ensure_file_entry_defaults(item) for item in storage_items if isinstance(item, dict)]
+    file_count = len(storage_items)
+
+    channel = bot.get_channel(row["channel_id"])
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(row["channel_id"])
+        except Exception:
+            return False
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except Exception:
+        return False
+
+    existing_embed = message.embeds[0] if message.embeds else None
+    publish_time_text = None
+    author_name = None
+    author_icon_url = None
+    if existing_embed:
+        author_name = existing_embed.author.name if existing_embed.author else None
+        author_icon_url = existing_embed.author.icon_url if existing_embed.author else None
+        for field in existing_embed.fields:
+            if field.name == "⏰ 发布时间":
+                publish_time_text = field.value
+                break
+
+    if not publish_time_text:
+        try:
+            publish_time_text = discord.utils.format_dt(
+                datetime.fromisoformat(row["created_at"])
+            )
+        except Exception:
+            publish_time_text = "未知"
+
+    embed = build_protected_post_embed(
+        title=row["title"],
+        unlock_type=row["unlock_type"],
+        file_count=file_count,
+        author_name=author_name,
+        author_icon_url=str(author_icon_url) if author_icon_url else None,
+        publish_time_text=publish_time_text,
+        bot_avatar_url=(
+            str(bot.user.display_avatar.url)
+            if getattr(bot, "user", None) and getattr(bot.user, "display_avatar", None)
+            else None
+        ),
+    )
+    try:
+        await message.edit(embed=embed)
+    except Exception:
+        return False
+    return True
+
+
+async def collect_cached_attachments_from_messages(source_messages):
+    attachments = []
+    default_log_parts = []
+    for msg in source_messages:
+        has_text_item = has_collectible_message_content(msg)
+        for att in msg.attachments:
+            file_bytes = await att.read()
+            attachments.append(
+                CachedAttachment(
+                    filename=att.filename,
+                    title=getattr(att, "title", None),
+                    data=file_bytes,
+                    content_type=getattr(att, "content_type", None),
+                    size=getattr(att, "size", None),
+                )
+            )
+        if has_text_item and not msg.attachments:
+            attachments.append(build_text_cached_attachment(msg.content.strip()))
+        elif msg.content:
+            default_log_parts.append(msg.content)
+    return attachments, "\n\n".join(default_log_parts).strip() or None
+
+
+async def build_storage_entries_from_attachments(bot, user, title, attachments, file_entries):
+    prepared_files = []
+    inline_text_entries = []
+    reused_entries = []
+    for idx, att in enumerate(attachments):
+        entry = ensure_file_entry_defaults(dict(file_entries[idx]))
+        stored_entry = getattr(att, "stored_entry", None)
+        if stored_entry:
+            merged_entry = ensure_file_entry_defaults(dict(stored_entry))
+            merged_entry["filename"] = entry["filename"]
+            merged_entry["original_filename"] = entry["original_filename"]
+            merged_entry["tag"] = entry.get("tag")
+            reused_entries.append(merged_entry)
+            continue
+
+        file_bytes = await att.read()
+        if getattr(att, "inline_storage_strategy", None) == "inline_text":
+            inline_text_entries.append(
+                {
+                    "strategy": "inline_text",
+                    "filename": entry["filename"],
+                    "original_filename": entry["original_filename"],
+                    "tag": entry.get("tag"),
+                    "text_content": file_bytes.decode("utf-8", errors="replace"),
+                }
+            )
+        else:
+            prepared_files.append((file_bytes, entry["filename"], entry))
+
+    stored_data = []
+    if prepared_files:
+        stored_data = await upload_files_for_storage(bot, user, title, prepared_files)
+    stored_data.extend(inline_text_entries)
+    stored_data.extend(reused_entries)
+    return stored_data
+
+
+async def get_user_published_items(user_id: int, limit: int = 25):
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM protected_items
+            WHERE owner_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cursor.fetchall()
 
 
 def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
@@ -913,6 +1129,8 @@ class PublishedBulkFilePageModal(ui.Modal, title="批量改已发布文件名"):
             )
             await db.commit()
 
+        await refresh_protected_post_embed(interaction.client, self.message_id)
+
         await interaction.response.send_message(
             f"✅ 已更新当前页 {updated} 个已发布文件名。", ephemeral=True
         )
@@ -1102,20 +1320,25 @@ class UploadSessionControlView(ui.View):
         )
         msg_count = len(session["messages"])
         expire_text = discord.utils.format_dt(session["expires_at"], "R")
+        title = session.get("panel_title") or "📥 保护附件收集中"
+        description = session.get("panel_description") or (
+            "接下来 5 分钟内，你在当前频道发送的带附件或纯文本消息都会加入本次保护附件草稿。\n"
+            "推荐做法：直接正常发送文件、链接或文本内容，全部发完后点下方 `上传完毕`。"
+        )
+        note_text = session.get("panel_note") or (
+            "此流程绕开 slash 附件参数，既支持保留原始文件名，也支持把纯文本内容转成可保护的文本附件。"
+        )
         embed = discord.Embed(
-            title="📥 保护附件收集中",
+            title=title,
             color=0x87CEEB,
-            description=(
-                "接下来 5 分钟内，你在当前频道发送的带附件或纯文本消息都会加入本次保护附件草稿。\n"
-                "推荐做法：直接正常发送文件、链接或文本内容，全部发完后点下方 `上传完毕`。"
-            ),
+            description=description,
         )
         embed.add_field(name="已收集消息", value=str(msg_count), inline=True)
         embed.add_field(name="已收集项目", value=str(attachment_count), inline=True)
         embed.add_field(name="截止时间", value=expire_text, inline=True)
         embed.add_field(
             name="说明",
-            value="此流程绕开 slash 附件参数，既支持保留原始文件名，也支持把纯文本内容转成可保护的文本附件。",
+            value=note_text,
             inline=False,
         )
         return embed
@@ -1129,19 +1352,95 @@ class UploadSessionControlView(ui.View):
 
     @ui.button(label="上传完毕", style=discord.ButtonStyle.success, emoji="✅")
     async def finish_upload(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.cog.get_upload_session(self.user_id, self.channel_id)
+        finish_handler = session.get("finish_handler") if session else None
+        if finish_handler:
+            await finish_handler(interaction)
+            return
         await self.cog.finish_upload_session(interaction, self.user_id, self.channel_id)
 
     @ui.button(label="取消上传", style=discord.ButtonStyle.danger, emoji="✖️")
     async def cancel_upload(self, interaction: discord.Interaction, button: ui.Button):
+        session = self.cog.get_upload_session(self.user_id, self.channel_id) or {}
         await self.cog.cancel_upload_session(
             interaction,
             self.user_id,
             self.channel_id,
-            reason="已取消本次附件收集。",
+            reason=session.get("cancel_reason") or "已取消本次附件收集。",
         )
 
 
 # --- 草稿/发布视图 ---
+class DraftReusePublishedView(ui.View):
+    def __init__(self, protection_view, posts_rows):
+        super().__init__(timeout=120)
+        self.protection_view = protection_view
+        self.posts_map = {str(row["message_id"]): row for row in posts_rows}
+        self.selected_message_id = str(posts_rows[0]["message_id"])
+        options = []
+        for idx, row in enumerate(posts_rows[:25]):
+            try:
+                file_count = len(
+                    [item for item in json.loads(row["storage_urls"] or "[]") if isinstance(item, dict)]
+                )
+            except Exception:
+                file_count = 0
+            try:
+                ts_str = datetime.fromisoformat(row["created_at"]).strftime("%m-%d %H:%M")
+            except Exception:
+                ts_str = "未知时间"
+            options.append(
+                discord.SelectOption(
+                    label=(row["title"] or "无标题")[:90],
+                    value=str(row["message_id"]),
+                    description=f"{file_count} 项 | {ts_str} | 频道 {row['channel_id']}",
+                    default=(idx == 0),
+                )
+            )
+        self.select_menu = ui.Select(
+            placeholder="选择要复用的已发布附件批次...",
+            options=options,
+            row=0,
+        )
+        self.select_menu.callback = self.on_select
+        self.add_item(self.select_menu)
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_message_id = self.select_menu.values[0]
+        for option in self.select_menu.options:
+            option.default = option.value == self.selected_message_id
+        await interaction.response.edit_message(view=self)
+
+    @ui.button(label="导入整批附件", style=discord.ButtonStyle.success, row=1, emoji="📥")
+    async def import_post(self, interaction: discord.Interaction, button: ui.Button):
+        row = self.posts_map.get(self.selected_message_id)
+        if not row:
+            return await interaction.response.send_message(
+                "❌ 未找到对应的附件批次，请重试。",
+                ephemeral=True,
+            )
+
+        try:
+            storage_items = json.loads(row["storage_urls"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            storage_items = []
+        storage_items = [ensure_file_entry_defaults(item) for item in storage_items if isinstance(item, dict)]
+        if not storage_items:
+            return await interaction.response.send_message(
+                "❌ 这条已发布记录里没有可复用的附件。",
+                ephemeral=True,
+            )
+
+        reusable_attachments = [ReusableStoredAttachment(item) for item in storage_items]
+        self.protection_view.append_attachments(reusable_attachments)
+        await interaction.response.defer(ephemeral=True)
+        await self.protection_view.refresh_dashboard_message()
+        await interaction.followup.send(
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前草稿。",
+            ephemeral=True,
+        )
+
+
 class ProtectionDraftView(ui.View):
     def __init__(self, bot, user, attachments, target_message=None, default_log=None):
         super().__init__(timeout=600)
@@ -1155,23 +1454,35 @@ class ProtectionDraftView(ui.View):
         self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
+        self.dashboard_message = None
         self.file_entries = []
         for att in attachments:
-            original_name = get_attachment_original_name(att)
-            self.file_entries.append(
-                ensure_file_entry_defaults(
-                    {
-                        "filename": original_name,
-                        "original_filename": original_name,
-                        "tag": None,
-                    }
-                )
-            )
+            self.file_entries.append(self._build_file_entry_for_attachment(att))
         self.custom_names = {
             idx: entry["filename"]
             for idx, entry in enumerate(self.file_entries)
             if entry["filename"] != entry["original_filename"]
         }
+
+    def _build_file_entry_for_attachment(self, att):
+        stored_entry = getattr(att, "stored_entry", None)
+        if stored_entry:
+            return ensure_file_entry_defaults(dict(stored_entry))
+
+        original_name = get_attachment_original_name(att)
+        return ensure_file_entry_defaults(
+            {
+                "filename": original_name,
+                "original_filename": original_name,
+                "tag": None,
+            }
+        )
+
+    def append_attachments(self, attachments):
+        for att in attachments:
+            self.attachments.append(att)
+            self.file_entries.append(self._build_file_entry_for_attachment(att))
+        self.sync_custom_names_from_entries()
 
     def sync_custom_names_from_entries(self):
         self.custom_names = {
@@ -1183,7 +1494,7 @@ class ProtectionDraftView(ui.View):
     def count_tagged_files(self):
         return sum(1 for entry in self.file_entries if entry.get("tag"))
 
-    async def update_dashboard(self, interaction: discord.Interaction):
+    def build_dashboard_embed(self):
         log_preview = (
             self.draft_log[:50] + "..."
             if self.draft_log and len(self.draft_log) > 50
@@ -1221,6 +1532,24 @@ class ProtectionDraftView(ui.View):
         embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False)
         embed.add_field(name="📖 操作指引", value=guide_desc, inline=False)
         embed.set_footer(text="此面板仅你自己可见")
+        return embed
+
+    async def refresh_dashboard_message(self):
+        if not self.dashboard_message:
+            return
+        try:
+            await self.dashboard_message.edit(
+                content=None,
+                embed=self.build_dashboard_embed(),
+                view=self,
+            )
+        except Exception:
+            pass
+
+    async def update_dashboard(self, interaction: discord.Interaction):
+        embed = self.build_dashboard_embed()
+        if self.dashboard_message is None and interaction.message:
+            self.dashboard_message = interaction.message
 
         if interaction.response.is_done():
             try:
@@ -1228,11 +1557,12 @@ class ProtectionDraftView(ui.View):
                     content=None, embed=embed, view=self
                 )
             except:
-                pass
+                await self.refresh_dashboard_message()
         else:
             await interaction.response.edit_message(
                 content=None, embed=embed, view=self
             )
+            self.dashboard_message = interaction.message
 
     @ui.button(label="修改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
     async def btn_set_title(self, i: discord.Interaction, b: ui.Button):
@@ -1275,6 +1605,20 @@ class ProtectionDraftView(ui.View):
             f"**当前文件列表：**\n" + "\n".join(names)[:1900], ephemeral=True
         )
 
+    @ui.button(label="复用已发布", style=discord.ButtonStyle.secondary, row=1, emoji="♻️")
+    async def btn_reuse_published(self, i: discord.Interaction, b: ui.Button):
+        rows = await get_user_published_items(self.user.id)
+        if not rows:
+            return await i.response.send_message(
+                "❌ 你的附件库里还没有已发布内容可复用。",
+                ephemeral=True,
+            )
+        await i.response.send_message(
+            "请选择要导入到当前草稿的已发布附件批次：",
+            view=DraftReusePublishedView(self, rows),
+            ephemeral=True,
+        )
+
     @ui.button(label="点赞", style=discord.ButtonStyle.primary, row=2)
     async def mode_like(self, i: discord.Interaction, b: ui.Button):
         self.draft_mode = "like"
@@ -1315,40 +1659,16 @@ class ProtectionDraftView(ui.View):
         self.stop()
 
     async def publish(self, interaction: discord.Interaction):
-        prepared_files = []
-        inline_text_entries = []
         try:
-            for idx, att in enumerate(self.attachments):
-                file_bytes = await att.read()
-                entry = self.file_entries[idx]
-                final_filename = entry["filename"]
-                if getattr(att, "inline_storage_strategy", None) == "inline_text":
-                    inline_text_entries.append(
-                        {
-                            "strategy": "inline_text",
-                            "filename": final_filename,
-                            "original_filename": entry["original_filename"],
-                            "tag": entry.get("tag"),
-                            "text_content": file_bytes.decode("utf-8", errors="replace"),
-                        }
-                    )
-                else:
-                    prepared_files.append((file_bytes, final_filename, dict(entry)))
+            stored_data = await build_storage_entries_from_attachments(
+                self.bot,
+                self.user,
+                self.draft_title,
+                self.attachments,
+                self.file_entries,
+            )
         except Exception as e:
             return await interaction.followup.send(f"文件读取失败：{e}", ephemeral=True)
-
-        stored_data = []
-        if prepared_files:
-            try:
-                stored_data = await upload_files_for_storage(
-                    self.bot,
-                    self.user,
-                    self.draft_title,
-                    prepared_files,
-                )
-            except Exception as e:
-                return await interaction.followup.send(f"备份发送失败：{e}", ephemeral=True)
-        stored_data.extend(inline_text_entries)
 
         if self.target_message:
             try:
@@ -1356,38 +1676,15 @@ class ProtectionDraftView(ui.View):
             except:
                 pass
 
-        final_desc = "📋 **本附件受保护，请按照下方指示获取。**"
-        embed = discord.Embed(
-            title=f"✨ {self.draft_title}",
-            description=final_desc,
-            color=discord.Color.from_rgb(255, 183, 197),
-        )
-        embed.set_author(
-            name=f"由 {self.user.display_name} 发布",
-            icon_url=self.user.display_avatar.url,
-        )
-        mode_map = {
-            "like": "👍 **点赞首楼**",
-            "like_comment": "👍💬 **点赞首楼 + 回复本贴**",
-            "like_password": "👍🔐 **点赞首楼 + 口令**",
-            "like_comment_password": "👍💬🔐 **点赞首楼 + 回复本贴 + 口令**",
-        }
-        embed.add_field(
-            name="🔑 获取条件", value=mode_map.get(self.draft_mode, "未知"), inline=True
-        )
-        embed.add_field(
-            name="📦 文件数量", value=f"**{len(stored_data)}** 个", inline=True
-        )
         now_ts = discord.utils.format_dt(datetime.now(TZ_SHANGHAI))
-        embed.add_field(name="⏰ 发布时间", value=now_ts, inline=True)
-
-        embed.add_field(
-            name="📥 如何下载？",
-            value="请使用命令：\n**`/保护附件 获取附件`**\n来验证条件并下载文件。",
-            inline=False,
-        )
-        embed.set_footer(
-            text="由 创作保护助手 强力驱动", icon_url=self.bot.user.display_avatar.url
+        embed = build_protected_post_embed(
+            title=self.draft_title,
+            unlock_type=self.draft_mode,
+            file_count=len(stored_data),
+            author_name=f"由 {self.user.display_name} 发布",
+            author_icon_url=self.user.display_avatar.url,
+            publish_time_text=now_ts,
+            bot_avatar_url=self.bot.user.display_avatar.url,
         )
 
         final_msg = await interaction.channel.send(embed=embed)
@@ -1489,6 +1786,8 @@ class EditPublishedFileModal(ui.Modal, title="修改已发布文件名"):
             )
             await db.commit()
 
+        await refresh_protected_post_embed(interaction.client, self.message_id)
+
         await interaction.response.send_message(
             f"✅ 修改成功！文件已更名为 `{new_full_name}`", ephemeral=True
         )
@@ -1515,6 +1814,8 @@ class EditProtectionTitleModal(ui.Modal, title="修改附件标题"):
                 (new_title, self.message_id),
             )
             await db.commit()
+
+        await refresh_protected_post_embed(interaction.client, self.message_id)
 
         await interaction.response.send_message(
             f"✅ 标题已更新为：**{new_title}**", ephemeral=True
@@ -1578,6 +1879,8 @@ class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
                     (self.new_mode, self.message_id),
                 )
             await db.commit()
+
+        await refresh_protected_post_embed(interaction.client, self.message_id)
 
         mode_text = "点赞+口令" if self.new_mode == "like_password" else "全套验证"
         msg = f"✅ 验证模式已切换为 **{mode_text}**"
@@ -1699,6 +2002,8 @@ class ManageFilesSelectView(ui.View):
             )
             await db.commit()
 
+        await refresh_protected_post_embed(interaction.client, self.message_id)
+
         try:
             await msg.delete()
         except Exception:
@@ -1744,6 +2049,8 @@ class ManageFilesSelectView(ui.View):
             )
             await db.commit()
 
+        await refresh_protected_post_embed(interaction.client, self.message_id)
+
         self.select.options = []
         for i, f in enumerate(self.file_data):
             ensure_file_entry_defaults(f)
@@ -1784,6 +2091,8 @@ class EditUnlockModeView(ui.View):
                     (mode, self.message_id),
                 )
                 await db.commit()
+
+            await refresh_protected_post_embed(interaction.client, self.message_id)
 
             mode_text = "点赞解锁" if mode == "like" else "点赞+评论"
             await interaction.response.send_message(
@@ -1921,6 +2230,127 @@ class PostManagementView(ui.View):
         view = PublishedTagBatchView(self.message_id, self.file_data)
         _, _, preview = view.build_preview()
         await interaction.response.send_message(preview, view=view, ephemeral=True)
+
+    @ui.button(label="追加附件", style=discord.ButtonStyle.primary, row=1, emoji="➕")
+    async def append_files(self, interaction: discord.Interaction, button: ui.Button):
+        cog = self.bot.get_cog("ProtectionCog")
+        if not cog:
+            return await interaction.response.send_message(
+                "❌ 未找到 ProtectionCog，暂时无法启动追加会话。",
+                ephemeral=True,
+            )
+
+        key = cog._session_key(interaction.user.id, interaction.channel.id)
+        old_session = cog.upload_sessions.pop(key, None)
+        if old_session and old_session.get("task"):
+            old_session["task"].cancel()
+
+        expires_at = datetime.now(TZ_SHANGHAI) + timedelta(
+            seconds=UPLOAD_SESSION_TIMEOUT_SECONDS
+        )
+        task = self.bot.loop.create_task(
+            cog._expire_upload_session(
+                interaction.user.id, interaction.channel.id, expires_at
+            )
+        )
+
+        async def finish_append_upload(done_interaction: discord.Interaction):
+            session = cog.upload_sessions.pop(key, None)
+            if not session:
+                return await done_interaction.response.edit_message(
+                    content="❌ 当前没有可提交的附件收集会话。",
+                    embed=None,
+                    view=None,
+                )
+
+            if session.get("task"):
+                session["task"].cancel()
+
+            source_messages = session["messages"]
+            if not source_messages:
+                return await done_interaction.response.edit_message(
+                    content="❌ 还没有收集到任何可追加内容，请先发送带附件或纯文本的消息。",
+                    embed=None,
+                    view=None,
+                )
+
+            try:
+                latest_row = await get_protected_item_row(self.message_id)
+                latest_title = latest_row["title"] if latest_row else self.current_title
+                attachments, _default_log = await collect_cached_attachments_from_messages(
+                    source_messages
+                )
+                file_entries = []
+                for att in attachments:
+                    if getattr(att, "stored_entry", None):
+                        file_entries.append(ensure_file_entry_defaults(dict(att.stored_entry)))
+                    else:
+                        original_name = get_attachment_original_name(att)
+                        file_entries.append(
+                            ensure_file_entry_defaults(
+                                {
+                                    "filename": original_name,
+                                    "original_filename": original_name,
+                                    "tag": None,
+                                }
+                            )
+                        )
+                stored_items = await build_storage_entries_from_attachments(
+                    self.bot,
+                    done_interaction.user,
+                    f"管理追加: {latest_title}",
+                    attachments,
+                    file_entries,
+                )
+            except Exception as exc:
+                return await done_interaction.response.edit_message(
+                    content=f"❌ 追加附件失败：{exc}",
+                    embed=None,
+                    view=None,
+                )
+
+            self.file_data.extend(stored_items)
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE protected_items SET storage_urls = ? WHERE message_id = ?",
+                    (json.dumps(self.file_data), self.message_id),
+                )
+                await db.commit()
+
+            await refresh_protected_post_embed(done_interaction.client, self.message_id)
+
+            for msg in source_messages:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+
+            await done_interaction.response.edit_message(
+                content=f"✅ 已成功追加 **{len(stored_items)}** 个附件到当前已发布批次。",
+                embed=None,
+                view=None,
+            )
+
+        cog.upload_sessions[key] = {
+            "messages": [],
+            "expires_at": expires_at,
+            "task": task,
+            "finish_handler": finish_append_upload,
+            "cancel_reason": "已取消本次附件追加。",
+            "panel_title": "📥 追加附件收集中",
+            "panel_description": (
+                "接下来 5 分钟内，你在当前频道发送的带附件或纯文本消息都会追加到这条已发布附件里。\n"
+                "全部发完后点击下方 `上传完毕` 即可写入当前批次。"
+            ),
+            "panel_note": "收集规则与发布附件一致：支持多条消息、多附件，纯文本会自动转成可保护的文本附件。",
+        }
+
+        view = UploadSessionControlView(cog, interaction.user.id, interaction.channel.id)
+        await interaction.response.send_message(
+            embed=view._build_embed(),
+            view=view,
+            ephemeral=True,
+        )
 
     # 第二排：逻辑修改与删除
     @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=2)

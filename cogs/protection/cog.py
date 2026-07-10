@@ -25,8 +25,8 @@ from .views import (
     BumpButtonView,
     UploadSessionControlView,
     UPLOAD_SESSION_TIMEOUT_SECONDS,
-    CachedAttachment,
     build_text_cached_attachment,
+    collect_cached_attachments_from_messages,
     count_collectible_message_items,
     has_collectible_message_content,
 )
@@ -381,37 +381,18 @@ class ProtectionCog(commands.Cog):
         if session.get("task"):
             session["task"].cancel()
 
-        attachments = []
-        default_log_parts = []
         source_messages = session["messages"]
-        for msg in source_messages:
-            has_text_item = has_collectible_message_content(msg)
-            for att in msg.attachments:
-                try:
-                    file_bytes = await att.read()
-                except Exception as exc:
-                    print(
-                        f"[ProtectionDebug] upload-session-read-source-failed: message={msg.id} attachment={getattr(att, 'id', None)} error={exc}"
-                    )
-                    return await interaction.response.edit_message(
-                        content=f"❌ 收纳附件失败：{exc}",
-                        embed=None,
-                        view=None,
-                    )
-
-                attachments.append(
-                    CachedAttachment(
-                        filename=att.filename,
-                        title=getattr(att, "title", None),
-                        data=file_bytes,
-                        content_type=getattr(att, "content_type", None),
-                        size=getattr(att, "size", None),
-                    )
-                )
-            if has_text_item and not msg.attachments:
-                attachments.append(build_text_cached_attachment(msg.content.strip()))
-            elif msg.content:
-                default_log_parts.append(msg.content)
+        try:
+            attachments, default_log = await collect_cached_attachments_from_messages(
+                source_messages
+            )
+        except Exception as exc:
+            print(f"[ProtectionDebug] upload-session-read-source-failed: error={exc}")
+            return await interaction.response.edit_message(
+                content=f"❌ 收纳附件失败：{exc}",
+                embed=None,
+                view=None,
+            )
 
         if not attachments:
             return await interaction.response.edit_message(
@@ -429,7 +410,6 @@ class ProtectionCog(commands.Cog):
                 )
 
         target_message = None
-        default_log = "\n\n".join(default_log_parts).strip() or None
         view = ProtectionDraftView(
             self.bot,
             interaction.user,
