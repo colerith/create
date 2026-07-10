@@ -511,6 +511,41 @@ async def build_storage_entries_from_attachments(bot, user, title, attachments, 
     return stored_data
 
 
+async def build_storage_entry_from_message(bot, user, post_title, msg, old_tag=None):
+    if msg.attachments:
+        attachment = msg.attachments[0]
+        file_bytes = await attachment.read()
+        new_original_name = get_attachment_original_name(attachment)
+        stored_data = await upload_files_for_storage(
+            bot,
+            user,
+            post_title,
+            [(
+                file_bytes,
+                new_original_name,
+                {
+                    "filename": new_original_name,
+                    "original_filename": new_original_name,
+                    "tag": old_tag,
+                },
+            )],
+        )
+        return stored_data[0]
+
+    text_attachment = build_text_cached_attachment(msg.content.strip())
+    file_bytes = await text_attachment.read()
+    new_original_name = text_attachment.filename
+    return ensure_file_entry_defaults(
+        {
+            "strategy": "inline_text",
+            "filename": new_original_name,
+            "original_filename": new_original_name,
+            "tag": old_tag,
+            "text_content": file_bytes.decode("utf-8", errors="replace"),
+        }
+    )
+
+
 async def get_user_published_items(user_id: int, limit: int = 25):
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
@@ -989,6 +1024,151 @@ class FileSelectView(ui.View):
         current_name = self.protection_view.file_entries[idx]["filename"]
         await interaction.response.send_modal(
             RenameFileModal(self.protection_view, idx, current_name)
+        )
+
+
+class DraftManageFilesSelectView(ui.View):
+    def __init__(self, protection_view):
+        super().__init__(timeout=180)
+        self.protection_view = protection_view
+        self.selected_index = 0
+        options = []
+        for i, entry in enumerate(self.protection_view.file_entries):
+            options.append(
+                discord.SelectOption(
+                    label=f"{i + 1}. {entry['filename'][:90]}",
+                    value=str(i),
+                    description=(entry.get("original_filename") or entry["filename"])[:100],
+                    default=(i == 0),
+                )
+            )
+        self.select = ui.Select(placeholder="选择要操作的文件...", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_index = int(self.select.values[0])
+        for idx, option in enumerate(self.select.options):
+            option.default = idx == self.selected_index
+        entry = self.protection_view.file_entries[self.selected_index]
+        await interaction.response.edit_message(
+            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}",
+            view=self,
+        )
+
+    @ui.button(label="改名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
+    async def rename_file(self, interaction: discord.Interaction, button: ui.Button):
+        current_name = self.protection_view.file_entries[self.selected_index]["filename"]
+        await interaction.response.send_modal(
+            RenameFileModal(self.protection_view, self.selected_index, current_name)
+        )
+
+    @ui.button(label="替换文件", style=discord.ButtonStyle.primary, row=1, emoji="♻️")
+    async def replace_file(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(
+            "请在当前频道 5 分钟内发送 1 条带附件或纯文本的消息（附件会取第一个，纯文本会转成 .txt 进行替换）。",
+            ephemeral=True,
+        )
+
+        def check(msg: discord.Message):
+            return (
+                msg.author.id == self.protection_view.user.id
+                and msg.channel.id == interaction.channel.id
+                and (len(msg.attachments) > 0 or has_collectible_message_content(msg))
+            )
+
+        try:
+            msg = await self.protection_view.bot.wait_for("message", timeout=300, check=check)
+        except asyncio.TimeoutError:
+            return await interaction.followup.send(
+                "⏰ 超时未收到可替换内容，已取消替换。",
+                ephemeral=True,
+            )
+
+        old_entry = ensure_file_entry_defaults(
+            self.protection_view.file_entries[self.selected_index]
+        )
+        try:
+            updated_entry = await build_storage_entry_from_message(
+                self.protection_view.bot,
+                interaction.user,
+                f"草稿替换: {self.protection_view.draft_title}",
+                msg,
+                old_tag=old_entry.get("tag"),
+            )
+        except Exception as exc:
+            return await interaction.followup.send(
+                f"❌ 替换文件失败：{exc}",
+                ephemeral=True,
+            )
+
+        self.protection_view.attachments[self.selected_index] = ReusableStoredAttachment(
+            updated_entry
+        )
+        self.protection_view.file_entries[self.selected_index] = ensure_file_entry_defaults(
+            updated_entry
+        )
+        self.protection_view.sync_custom_names_from_entries()
+
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        for idx, option in enumerate(self.select.options):
+            name = self.protection_view.file_entries[idx].get("filename", "unknown")
+            option.label = f"{idx + 1}. {name[:90]}"
+            option.description = (
+                self.protection_view.file_entries[idx].get("original_filename") or name
+            )[:100]
+            option.default = idx == self.selected_index
+
+        try:
+            await interaction.message.edit(
+                content=f"当前选中：{build_file_line(self.protection_view.file_entries[self.selected_index], self.selected_index + 1)}",
+                view=self,
+            )
+        except Exception:
+            pass
+
+        await self.protection_view.refresh_dashboard_message()
+        await interaction.followup.send(
+            f"✅ 已替换为：{self.protection_view.file_entries[self.selected_index]['filename']}",
+            ephemeral=True,
+        )
+
+    @ui.button(label="删除文件", style=discord.ButtonStyle.danger, row=1, emoji="🗑️")
+    async def delete_file(self, interaction: discord.Interaction, button: ui.Button):
+        if len(self.protection_view.file_entries) <= 1:
+            return await interaction.response.send_message(
+                "❌ 当前仅剩 1 个文件，无法单独删除。",
+                ephemeral=True,
+            )
+
+        removed = self.protection_view.file_entries.pop(self.selected_index)
+        self.protection_view.attachments.pop(self.selected_index)
+        if self.selected_index >= len(self.protection_view.file_entries):
+            self.selected_index = len(self.protection_view.file_entries) - 1
+        self.protection_view.sync_custom_names_from_entries()
+
+        self.select.options = []
+        for i, entry in enumerate(self.protection_view.file_entries):
+            self.select.options.append(
+                discord.SelectOption(
+                    label=f"{i + 1}. {entry['filename'][:90]}",
+                    value=str(i),
+                    description=(entry.get("original_filename") or entry["filename"])[:100],
+                    default=(i == self.selected_index),
+                )
+            )
+
+        await self.protection_view.refresh_dashboard_message()
+        await interaction.response.edit_message(
+            content=(
+                f"✅ 已删除：{removed.get('filename', 'unknown')}\n"
+                f"当前选中：{build_file_line(self.protection_view.file_entries[self.selected_index], self.selected_index + 1)}"
+            ),
+            view=self,
         )
 
 
@@ -1641,6 +1821,104 @@ class ProtectionDraftView(ui.View):
             self.file_entries.append(self._build_file_entry_for_attachment(att))
         self.sync_custom_names_from_entries()
 
+    async def start_append_session(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ProtectionCog")
+        if not cog:
+            return await interaction.response.send_message(
+                "❌ 未找到 ProtectionCog，暂时无法启动追加会话。",
+                ephemeral=True,
+            )
+
+        key = cog._session_key(interaction.user.id, interaction.channel.id)
+        old_session = cog.upload_sessions.pop(key, None)
+        if old_session and old_session.get("task"):
+            old_session["task"].cancel()
+
+        expires_at = datetime.now(TZ_SHANGHAI) + timedelta(
+            seconds=UPLOAD_SESSION_TIMEOUT_SECONDS
+        )
+        task = self.bot.loop.create_task(
+            cog._expire_upload_session(
+                interaction.user.id,
+                interaction.channel.id,
+                expires_at,
+            )
+        )
+
+        async def finish_append_upload(done_interaction: discord.Interaction):
+            session = cog.upload_sessions.pop(key, None)
+            if not session:
+                return await done_interaction.response.edit_message(
+                    content="❌ 当前没有可提交的附件收集会话。",
+                    embed=None,
+                    view=None,
+                )
+
+            if session.get("task"):
+                session["task"].cancel()
+
+            source_messages = session["messages"]
+            reusable_attachments = list(session.get("reusable_attachments", []))
+            try:
+                attachments, _default_log = await collect_cached_attachments_from_messages(
+                    source_messages
+                )
+            except Exception as exc:
+                return await done_interaction.response.edit_message(
+                    content=f"❌ 追加附件失败：{exc}",
+                    embed=None,
+                    view=None,
+                )
+
+            attachments.extend(reusable_attachments)
+            if not attachments:
+                return await done_interaction.response.edit_message(
+                    content="❌ 还没有收集到任何可追加内容，请先发送带附件或纯文本的消息。",
+                    embed=None,
+                    view=None,
+                )
+
+            self.append_attachments(attachments)
+            reusable_metadata = dict(session.get("reusable_metadata", {}) or {})
+            if reusable_metadata:
+                self.apply_draft_defaults(reusable_metadata)
+
+            for msg in source_messages:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+
+            await self.refresh_dashboard_message()
+            await done_interaction.response.edit_message(
+                content=f"✅ 已成功追加 **{len(attachments)}** 个附件到当前草稿。",
+                embed=None,
+                view=None,
+            )
+
+        cog.upload_sessions[key] = {
+            "messages": [],
+            "reusable_attachments": [],
+            "reusable_metadata": {},
+            "expires_at": expires_at,
+            "task": task,
+            "finish_handler": finish_append_upload,
+            "cancel_reason": "已取消本次草稿附件追加。",
+            "panel_title": "📥 草稿附件收集中",
+            "panel_description": (
+                "接下来 5 分钟内，你在当前频道发送的带附件或纯文本消息都会追加到当前草稿里。\n"
+                "全部发完后点击下方 `上传完毕` 即可写入草稿。"
+            ),
+            "panel_note": "收集规则与发布附件一致：支持多条消息、多附件，纯文本会自动转成可保护的文本附件。",
+        }
+
+        view = UploadSessionControlView(cog, interaction.user.id, interaction.channel.id)
+        await interaction.response.send_message(
+            embed=view._build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+
     def sync_custom_names_from_entries(self):
         self.custom_names = {
             idx: entry["filename"]
@@ -1684,7 +1962,7 @@ class ProtectionDraftView(ui.View):
             "like_comment_password": f"🔐💬 点赞+评论+口令 (口令: ||{self.draft_password}||)",
         }
         status_desc += f"⚙️ **获取方式**: {mode_map.get(self.draft_mode)}"
-        guide_desc = "1️⃣ 点击 **第一排** 修改标题、说明、更新日志，或进入单文件/批量文件编辑。\n2️⃣ 批量编辑支持分批处理文件名与标签。\n3️⃣ 点击 **第二排** 选择解锁条件或配置 **艾特贴内用户**。\n4️⃣ 确认无误后点击 **🚀 确认发布**。"
+        guide_desc = "1️⃣ 点击 **第一排** 修改标题、说明、更新日志，查看当前文件列表。\n2️⃣ 点击 **第二排** 进行单文件操作、批量编辑、设置标签、复用已发布或追加附件。\n3️⃣ 点击 **第三排** 选择解锁条件或配置 **艾特贴内用户**。\n4️⃣ 确认无误后点击 **🚀 确认发布**。"
         embed = discord.Embed(title="🛠️ 附件保护控制台", color=0x87CEEB)
         embed.add_field(name="📊 当前配置状态", value=status_desc, inline=False)
         embed.add_field(name="📖 操作指引", value=guide_desc, inline=False)
@@ -1733,10 +2011,12 @@ class ProtectionDraftView(ui.View):
     async def btn_set_update_log(self, i: discord.Interaction, b: ui.Button):
         await i.response.send_modal(DraftUpdateLogModal(self))
 
-    @ui.button(label="改文件名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
+    @ui.button(label="单文件操作", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
     async def btn_rename_files(self, i: discord.Interaction, b: ui.Button):
         await i.response.send_message(
-            "请选择要重命名的文件：", view=FileSelectView(self), ephemeral=True
+            "请选择文件并执行操作（改名/替换/删除）：",
+            view=DraftManageFilesSelectView(self),
+            ephemeral=True,
         )
 
     @ui.button(
@@ -1753,7 +2033,7 @@ class ProtectionDraftView(ui.View):
         _, _, preview = view.build_preview()
         await i.response.send_message(preview, view=view, ephemeral=True)
 
-    @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=1, emoji="📦")
+    @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
     async def btn_view_files(self, i: discord.Interaction, b: ui.Button):
         names = []
         for idx, entry in enumerate(self.file_entries):
@@ -1775,6 +2055,10 @@ class ProtectionDraftView(ui.View):
             view=DraftReusePublishedView(self, rows),
             ephemeral=True,
         )
+
+    @ui.button(label="追加附件", style=discord.ButtonStyle.primary, row=1, emoji="➕")
+    async def btn_append_files(self, i: discord.Interaction, b: ui.Button):
+        await self.start_append_session(i)
 
     @ui.button(label="点赞", style=discord.ButtonStyle.primary, row=2)
     async def mode_like(self, i: discord.Interaction, b: ui.Button):
@@ -1803,14 +2087,14 @@ class ProtectionDraftView(ui.View):
         self.mention_users = not self.mention_users
         await self.update_dashboard(i)
 
-    @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=3, emoji="🚀")
+    @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=4, emoji="🚀")
     async def btn_confirm(self, i: discord.Interaction, b: ui.Button):
         await i.response.edit_message(
             content="⏳ 正在加密上传...", embed=None, view=None
         )
         await self.publish(i)
 
-    @ui.button(label="取消", style=discord.ButtonStyle.gray, row=3, emoji="✖️")
+    @ui.button(label="取消", style=discord.ButtonStyle.gray, row=4, emoji="✖️")
     async def btn_cancel(self, i: discord.Interaction, b: ui.Button):
         await i.response.edit_message(content="操作已取消。", embed=None, view=None)
         self.stop()
