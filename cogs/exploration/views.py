@@ -230,26 +230,34 @@ class SearchResultContainer(ui.LayoutView):
             await interaction.response.edit_message(view=self)
 
 
-class UpdateSummaryContainer(ui.LayoutView):
-    """日报下方的当日附件更新汇总面板。"""
+class DailyReportContainer(ui.LayoutView):
+    """今日新帖与更新汇总合并到同一条消息。"""
 
-    def __init__(self, rows, title: str, user, guild: discord.Guild | None = None):
+    def __init__(self, threads, update_rows, title: str, user, guild: discord.Guild | None = None):
         super().__init__(timeout=None)
-        self.rows = list(rows)
+        self.threads = list(threads)
+        self.update_rows = list(update_rows)
         self.title = title
         self.user = user
         self.guild = guild
-        self.per_page = 8
-        self.current_page = 0
-        self.total_pages = math.ceil(len(self.rows) / self.per_page) if self.rows else 1
+        self.thread_page = 0
+        self.update_page = 0
+        self.thread_per_page = 4
+        self.update_per_page = 5
+        self.thread_total_pages = math.ceil(len(self.threads) / self.thread_per_page) if self.threads else 1
+        self.update_total_pages = math.ceil(len(self.update_rows) / self.update_per_page) if self.update_rows else 1
 
-        self.btn_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id=f"update_prev_{id(self)}")
-        self.btn_prev.callback = self.on_prev
+        self.btn_thread_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary)
+        self.btn_thread_prev.callback = self.on_thread_prev
+        self.btn_thread_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary)
+        self.btn_thread_next.callback = self.on_thread_next
+        self.btn_thread_page = ui.Button(label="1/1", disabled=True, style=discord.ButtonStyle.secondary)
 
-        self.btn_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary, custom_id=f"update_next_{id(self)}")
-        self.btn_next.callback = self.on_next
-
-        self.btn_indicator = ui.Button(label=f"1/{self.total_pages}", disabled=True, style=discord.ButtonStyle.secondary)
+        self.btn_update_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary)
+        self.btn_update_prev.callback = self.on_update_prev
+        self.btn_update_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary)
+        self.btn_update_next.callback = self.on_update_next
+        self.btn_update_page = ui.Button(label="1/1", disabled=True, style=discord.ButtonStyle.secondary)
 
         self.update_container()
 
@@ -266,41 +274,81 @@ class UpdateSummaryContainer(ui.LayoutView):
         channel = self.guild.get_channel(channel_id) if self.guild else None
         return channel.name if channel else f"频道 {channel_id}"
 
-    def update_container(self):
-        self.clear_items()
-
+    def _build_threads_container(self):
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
         icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
         header_desc = (
-            f"### {self.title}\n今日共记录 **{len(self.rows)}** 条作品更新。"
-            if self.rows
-            else f"### {self.title}\n今天还没有发布更新日志的作品。"
+            f"📅 **今日新帖**: 已在全服发现 {len(self.threads)} 个新话题！"
+            if self.threads
+            else "今天好安静唷，还没有新帖子捏..."
         )
-
         elements = [
             ui.Section(
-                ui.TextDisplay(content=header_desc),
-                ui.TextDisplay(content=f"-# 最后更新: {timestamp}"),
+                ui.TextDisplay(content=f"### {header_desc}"),
+                ui.TextDisplay(content=f"-# {self.title} · 最后更新: {timestamp}"),
                 accessory=ui.Thumbnail(media=icon_url),
             ),
             ui.Separator(),
         ]
 
-        start = self.current_page * self.per_page
-        current_rows = self.rows[start : start + self.per_page]
+        start = self.thread_page * self.thread_per_page
+        current_threads = self.threads[start : start + self.thread_per_page]
+        if not current_threads:
+            elements.append(ui.TextDisplay(content="*暂无新帖*"))
+        else:
+            for thread in current_threads:
+                author = thread.owner
+                author_name = author.display_name if author else "未知作者"
+                tags_str = ""
+                if thread.applied_tags:
+                    tags_str = "🏷️ " + " ".join(t.name for t in thread.applied_tags[:3])
+                category_name = thread.parent.name if thread.parent else "未知分区"
+                section_content = [
+                    ui.TextDisplay(content=f"**{self._clip(thread.name, 52)}**"),
+                    ui.TextDisplay(content=f"👤 {author_name} · 📂 {category_name}"),
+                ]
+                if tags_str:
+                    section_content.append(ui.TextDisplay(content=f"-# {tags_str}"))
+                elements.append(
+                    ui.Section(
+                        *section_content,
+                        accessory=ui.Button(label="传送", url=thread.jump_url, style=discord.ButtonStyle.link),
+                    )
+                )
 
+        self.btn_thread_prev.disabled = self.thread_page == 0
+        self.btn_thread_next.disabled = self.thread_page >= self.thread_total_pages - 1
+        self.btn_thread_page.label = f"新帖 {self.thread_page + 1}/{self.thread_total_pages}"
+        if self.thread_total_pages > 1:
+            elements.append(ui.ActionRow(self.btn_thread_prev, self.btn_thread_page, self.btn_thread_next))
+        return ui.Container(*elements, accent_colour=discord.Color.gold())
+
+    def _build_updates_container(self):
+        timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
+        elements = [
+            ui.TextDisplay(
+                content=(
+                    f"### ✨ 更新汇总\n今日共记录 **{len(self.update_rows)}** 条作品更新。"
+                    if self.update_rows
+                    else "### ✨ 更新汇总\n今天还没有发布更新日志的作品。"
+                )
+            ),
+            ui.TextDisplay(content=f"-# 最后更新: {timestamp}"),
+            ui.Separator(),
+        ]
+
+        start = self.update_page * self.update_per_page
+        current_rows = self.update_rows[start : start + self.update_per_page]
         if not current_rows:
             elements.append(ui.TextDisplay(content="*暂无更新记录*"))
         else:
             grouped = {}
             for row in current_rows:
                 grouped.setdefault(row["channel_id"], []).append(row)
-
             for channel_id, channel_rows in grouped.items():
                 lines = [f"**#{self._channel_name(channel_id)}**"]
                 for row in channel_rows:
-                    title = self._clip(row["title"], 48)
-                    log_title = self._clip(f"{title} 更新日志", 56)
+                    title = self._clip(row["title"], 38)
                     guild_id = row["guild_id"] or (self.guild.id if self.guild else None)
                     jump_url = (
                         f"https://discord.com/channels/{guild_id}/{row['channel_id']}/{row['update_message_id']}"
@@ -308,37 +356,44 @@ class UpdateSummaryContainer(ui.LayoutView):
                         else None
                     )
                     jump_text = f"[跳转]({jump_url})" if jump_url else "跳转不可用"
-                    lines.append(
-                        f"- 作者: <@{row['owner_id']}> | 作品: **{title}** | 日志: **{log_title}** | {jump_text}"
-                    )
+                    lines.append(f"- <@{row['owner_id']}> · **{title}** · {jump_text}")
                 elements.append(ui.TextDisplay(content="\n".join(lines)))
 
-        self.btn_prev.disabled = self.current_page == 0
-        self.btn_next.disabled = self.current_page >= self.total_pages - 1
-        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
+        self.btn_update_prev.disabled = self.update_page == 0
+        self.btn_update_next.disabled = self.update_page >= self.update_total_pages - 1
+        self.btn_update_page.label = f"更新 {self.update_page + 1}/{self.update_total_pages}"
+        if self.update_total_pages > 1:
+            elements.append(ui.ActionRow(self.btn_update_prev, self.btn_update_page, self.btn_update_next))
+        return ui.Container(*elements, accent_colour=discord.Color.green())
 
-        action_rows = []
-        if self.total_pages > 1:
-            action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+    def update_container(self):
+        self.clear_items()
+        self.add_item(self._build_threads_container())
+        self.add_item(self._build_updates_container())
 
-        container = ui.Container(
-            *elements,
-            *action_rows,
-            accent_colour=discord.Color.green(),
-        )
-        self.add_item(container)
+    async def on_thread_prev(self, interaction: discord.Interaction):
+        if self.thread_page > 0:
+            self.thread_page -= 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
 
-    async def on_prev(self, interaction: discord.Interaction):
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.update_container()
-            await interaction.response.edit_message(view=self)
+    async def on_thread_next(self, interaction: discord.Interaction):
+        if self.thread_page < self.thread_total_pages - 1:
+            self.thread_page += 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
 
-    async def on_next(self, interaction: discord.Interaction):
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.update_container()
-            await interaction.response.edit_message(view=self)
+    async def on_update_prev(self, interaction: discord.Interaction):
+        if self.update_page > 0:
+            self.update_page -= 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
+
+    async def on_update_next(self, interaction: discord.Interaction):
+        if self.update_page < self.update_total_pages - 1:
+            self.update_page += 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
 
 
 class SearchPanelContainer(ui.LayoutView):
@@ -386,15 +441,30 @@ class SearchPanelContainer(ui.LayoutView):
 
         container = ui.Container(
             ui.Section(
-                ui.TextDisplay(content="### 🔍 奇米蛋搜索雷达"),
-                ui.TextDisplay(content="欢迎使用全服务器资源检索系统。"),
-                ui.TextDisplay(content="-# 支持跨频道搜索、标签筛选与用户定位。"),
+                ui.TextDisplay(content="### 🥚 奇米蛋探索台"),
+                ui.TextDisplay(content="把散落在论坛里的作品、更新和足迹都收进一只小蛋壳。"),
+                ui.TextDisplay(content="-# 搜索、回访、整理自己的作品，都从这里出发。"),
                 accessory=ui.Thumbnail(media=deco_img)
             ),
             ui.Separator(),
+            ui.TextDisplay(
+                content=(
+                    "**🔎 找作品**\n"
+                    "-# 用关键词翻标题和首楼内容，或直接按作者定位帖子。"
+                )
+            ),
             ui.ActionRow(self.btn_keyword, self.btn_user),
+            ui.Separator(),
+            ui.TextDisplay(
+                content=(
+                    "**📚 我的收藏与创作**\n"
+                    "-# 下载记录会把最近更新的作品放在前面；我的作品按帖子汇总，可筛选分区并推送。"
+                )
+            ),
             ui.ActionRow(self.btn_downloads, self.btn_my_works),
-            accent_colour=discord.Color.from_rgb(100, 149, 237) # Cornflower Blue
+            ui.Separator(),
+            ui.TextDisplay(content="-# 今日状态：雷达待命中，轻点按钮就开始找蛋。"),
+            accent_colour=discord.Color.from_rgb(255, 183, 197)
         )
         self.add_item(container)
 
@@ -785,8 +855,8 @@ class MyWorksContainer(PagedRecordContainer):
                 tags = self._clip(row.get("tags") or "无标签", 44)
                 category = self._clip(row.get("category") or "其他", 16)
                 forum = self._clip(row.get("forum_name") or "未知分区", 24)
-                like_count = int(row.get("like_count") or 0)
-                comment_count = int(row.get("comment_count") or 0)
+                like_count = "--" if row.get("like_count") is None else str(int(row.get("like_count") or 0))
+                comment_count = "--" if row.get("comment_count") is None else str(int(row.get("comment_count") or 0))
                 attachment_count = int(row.get("attachment_count") or 0)
                 jump_url = row.get("jump_url") or self._jump_url(row.get("channel_id"), row.get("latest_message_id"))
                 content_items.append(

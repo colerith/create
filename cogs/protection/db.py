@@ -408,7 +408,7 @@ async def get_user_published_items(user_id: int, limit: int = 200):
 
 
 async def get_user_published_thread_stats(user_id: int, channel_ids: list[int]):
-    """按帖子线程统计用户保护附件的数量、点赞数和评论数。"""
+    """按帖子线程统计用户通过 bot 发布的保护附件数量。"""
     if not channel_ids:
         return {}
 
@@ -420,12 +420,8 @@ async def get_user_published_thread_stats(user_id: int, channel_ids: list[int]):
             f"""
             SELECT
                 pi.channel_id,
-                COUNT(*) AS attachment_count,
-                COUNT(DISTINCT ul.user_id || ':' || ul.message_id) AS like_count,
-                COUNT(DISTINCT uc.user_id || ':' || uc.message_id) AS comment_count
+                COUNT(*) AS attachment_count
             FROM protected_items pi
-            LEFT JOIN user_likes ul ON ul.message_id = pi.message_id
-            LEFT JOIN user_comments uc ON uc.message_id = pi.message_id
             WHERE pi.owner_id = ? AND pi.channel_id IN ({placeholders})
             GROUP BY pi.channel_id
             """,

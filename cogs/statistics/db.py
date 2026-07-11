@@ -422,6 +422,27 @@ async def get_cached_threads_by_forums_and_likes(
         return result
 
 
+async def get_cached_threads_by_ids(thread_ids: list[int]) -> dict[int, dict]:
+    """按帖子 ID 获取统计缓存快照。"""
+    if not thread_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in thread_ids)
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT * FROM forum_thread_cache WHERE thread_id IN ({placeholders})",
+            thread_ids,
+        )
+        rows = await cursor.fetchall()
+        result = {}
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.get("tags_json") or "[]")
+            result[item["thread_id"]] = item
+        return result
+
+
 async def get_recently_bumped_threads(days: int = 7) -> set:
     """获取最近指定天数内被顶过的帖子的ID集合。"""
     async with get_db() as db:

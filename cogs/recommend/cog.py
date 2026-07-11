@@ -109,5 +109,11 @@ class RecommendCog(commands.Cog):
             return await interaction.response.send_message("此命令只能在文字频道使用。", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
+        exploration_cog = self.bot.get_cog("ExplorationCog")
+        if exploration_cog and hasattr(exploration_cog, "rebuild_ordered_public_panels"):
+            await exploration_cog.rebuild_ordered_public_panels(interaction.channel, include_recommend=True)
+            await interaction.followup.send("✅ 公开面板已按固定顺序重建。", ephemeral=True)
+            return
+
         await self.refresh_recommendation_panel(interaction.channel)
         await interaction.followup.send("✅ 面板已刷新！", ephemeral=True)

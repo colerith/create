@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import random
 import re
 from datetime import datetime
 
@@ -10,17 +11,27 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands, tasks
 
-from config import EXPLORATION_TARGET_CHANNEL_IDS, ADMIN_USER_ID, RECOMMEND_TARGET_KEYWORDS, TZ_SHANGHAI
+from config import (
+    ADMIN_USER_ID,
+    EXPLORATION_TARGET_CHANNEL_IDS,
+    RECOMMEND_DAILY_CHANNEL_IDS,
+    RECOMMEND_TARGET_KEYWORDS,
+    TZ_SHANGHAI,
+)
 from . import db as exploration_db
 from .views import (
+    DailyReportContainer,
     DownloadLibraryContainer,
     MyWorksContainer,
     SearchPanelContainer,
     SearchResultContainer,
-    UpdateSummaryContainer,
 )
 from ..core.db import get_panel_message_id, set_panel_message_id, remove_panel_record
 from ..protection import db as protection_db
+from ..recommend import db as recommend_db
+from ..recommend import utils as recommend_utils
+from ..recommend.views import DailyRecommendContainer
+from ..statistics import db as statistics_db
 
 
 DOWNLOAD_RECORDS_PER_PAGE = 10
@@ -193,11 +204,9 @@ class ExplorationCog(commands.Cog):
         self.bot = bot
         self.bot.add_view(SearchPanelContainer(self.bot))
         self.daily_task.start()
-        self.pushed_panel_refresh_task.start()
 
     async def cog_unload(self):
         self.daily_task.cancel()
-        self.pushed_panel_refresh_task.cancel()
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == ADMIN_USER_ID or interaction.user.guild_permissions.administrator
@@ -233,7 +242,9 @@ class ExplorationCog(commands.Cog):
                 threads.append(thread)
 
         threads.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
-        stats = await protection_db.get_user_published_thread_stats(user_id, [thread.id for thread in threads])
+        thread_ids = [thread.id for thread in threads]
+        attachment_stats = await protection_db.get_user_published_thread_stats(user_id, thread_ids)
+        thread_stats = await statistics_db.get_cached_threads_by_ids(thread_ids)
 
         rows = []
         for thread in threads:
@@ -241,7 +252,8 @@ class ExplorationCog(commands.Cog):
             tags = [tag.name for tag in getattr(thread, "applied_tags", [])[:6]]
             haystack = " ".join([forum.name if forum else "", thread.name, " ".join(tags)])
             category = next((keyword for keyword in RECOMMEND_TARGET_KEYWORDS if keyword in haystack), "其他")
-            stat = stats.get(thread.id)
+            attachment_stat = attachment_stats.get(thread.id)
+            thread_stat = thread_stats.get(thread.id)
             rows.append(
                 {
                     "channel_id": thread.id,
@@ -251,9 +263,9 @@ class ExplorationCog(commands.Cog):
                     "forum_name": forum.name if forum else "未知分区",
                     "tags": " ".join(tags) if tags else "无标签",
                     "category": category,
-                    "like_count": stat["like_count"] if stat else 0,
-                    "comment_count": stat["comment_count"] if stat else 0,
-                    "attachment_count": stat["attachment_count"] if stat else 0,
+                    "like_count": thread_stat["likes"] if thread_stat else None,
+                    "comment_count": thread_stat["comments"] if thread_stat else None,
+                    "attachment_count": attachment_stat["attachment_count"] if attachment_stat else 0,
                 }
             )
         return rows
@@ -330,6 +342,111 @@ class ExplorationCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         view = await self._build_my_works_view(interaction.user, interaction.guild, selected_channel_ids)
         await interaction.followup.send(view=view, ephemeral=True)
+
+    async def _build_daily_report_view(self, channel: discord.TextChannel):
+        threads = await self.get_todays_threads(channel.guild)
+        update_rows = await self.get_todays_update_logs(channel.guild)
+        date_str = datetime.now(TZ_SHANGHAI).strftime("%Y年%m月%d日")
+        return DailyReportContainer(
+            threads,
+            update_rows,
+            title=f"📮 {date_str} 更新日报",
+            user=self.bot.user,
+            guild=channel.guild,
+        )
+
+    async def _build_daily_recommend_view(self, channel: discord.TextChannel):
+        pool = await recommend_utils.get_random_thread_pool(channel.guild)
+        return DailyRecommendContainer(
+            await recommend_utils.fetch_thread_details(random.choice(pool)) if pool else {},
+            is_empty=not pool,
+        )
+
+    async def _delete_message_if_exists(self, channel: discord.TextChannel, message_id: int | None):
+        if not message_id:
+            return
+        try:
+            await channel.get_partial_message(message_id).delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as e:
+            print(f"删除旧面板消息失败({message_id}): {e}")
+
+    def _component_tree_has_custom_id(self, components, custom_id: str) -> bool:
+        for component in components:
+            if getattr(component, "custom_id", None) == custom_id:
+                return True
+            children = getattr(component, "children", None)
+            if children and self._component_tree_has_custom_id(children, custom_id):
+                return True
+        return False
+
+    def _looks_like_public_panel(self, message: discord.Message) -> bool:
+        if not message.components:
+            return False
+        if self._component_tree_has_custom_id(message.components, "search_panel_btn_keyword_v2"):
+            return True
+        if self._component_tree_has_custom_id(message.components, "daily_gacha_open_btn"):
+            return True
+        for component in message.components:
+            children = getattr(component, "children", None)
+            if not children:
+                continue
+            for child in children:
+                if (
+                    isinstance(child, discord.ui.Container)
+                    and child.accent_colour in (discord.Color.gold(), discord.Color.green())
+                ):
+                    return True
+        return False
+
+    async def _cleanup_untracked_public_panels(self, channel: discord.TextChannel):
+        try:
+            async for msg in channel.history(limit=80):
+                if msg.author == self.bot.user and self._looks_like_public_panel(msg):
+                    try:
+                        await msg.delete()
+                        await asyncio.sleep(0.5)
+                    except discord.NotFound:
+                        pass
+        except Exception as e:
+            print(f"清理重复公开面板失败: {e}")
+
+    async def rebuild_ordered_public_panels(
+        self,
+        channel: discord.TextChannel,
+        include_recommend: bool | None = None,
+    ):
+        """按固定顺序重建公开面板：搜索 -> 日报/更新 -> 每日精选。"""
+        if include_recommend is None:
+            include_recommend = channel.id in RECOMMEND_DAILY_CHANNEL_IDS
+
+        search_id = await get_panel_message_id(channel.id, "search_panel")
+        daily_id = await get_panel_message_id(channel.id, "daily_report")
+        old_summary_id = await get_panel_message_id(channel.id, "daily_update_summary")
+        recommend_id = await recommend_db.get_panel_message_id(channel.id)
+
+        for message_id in {search_id, daily_id, old_summary_id, recommend_id}:
+            await self._delete_message_if_exists(channel, message_id)
+
+        await self._cleanup_untracked_public_panels(channel)
+
+        await remove_panel_record(channel.id, "search_panel")
+        await remove_panel_record(channel.id, "daily_report")
+        await remove_panel_record(channel.id, "daily_update_summary")
+        await recommend_db.remove_panel_message(channel.id)
+
+        search_msg = await channel.send(view=SearchPanelContainer(self.bot))
+        await set_panel_message_id(channel.id, search_msg.id, "search_panel")
+        await asyncio.sleep(1)
+
+        daily_msg = await channel.send(view=await self._build_daily_report_view(channel))
+        await set_panel_message_id(channel.id, daily_msg.id, "daily_report")
+        await asyncio.sleep(1)
+
+        if include_recommend:
+            recommend_msg = await channel.send(view=await self._build_daily_recommend_view(channel))
+            await recommend_db.set_panel_message(channel.id, recommend_msg.id)
 
     async def _fetch_push_user_and_guild(self, user_id: int, guild_id: int):
         guild = self.bot.get_guild(guild_id)
@@ -480,46 +597,13 @@ class ExplorationCog(commands.Cog):
             guild_id=guild.id,
         )
 
-    async def refresh_channel_update_summary_panel(self, channel: discord.TextChannel, resend: bool = False):
-        """刷新日报下方的更新汇总面板。"""
-        rows = await self.get_todays_update_logs(channel.guild)
-        view = UpdateSummaryContainer(
-            rows,
-            title="✨ 更新汇总",
-            user=self.bot.user,
-            guild=channel.guild,
-        )
-        panel_type = "daily_update_summary"
-        message_id = await get_panel_message_id(channel.id, panel_type)
-
-        if message_id and not resend:
-            try:
-                target_msg = await channel.fetch_message(message_id)
-                await target_msg.edit(view=view)
-                return
-            except discord.NotFound:
-                await remove_panel_record(channel.id, panel_type)
-            except Exception as e:
-                print(f"编辑数据库记录的更新汇总面板({message_id})失败: {e}")
-
-        if resend and message_id:
-            try:
-                old_msg = await channel.fetch_message(message_id)
-                await old_msg.delete()
-            except discord.NotFound:
-                pass
-            finally:
-                await remove_panel_record(channel.id, panel_type)
-
-        new_msg = await channel.send(view=view)
-        await set_panel_message_id(channel.id, new_msg.id, panel_type)
-
     async def refresh_channel_daily_panel(self, channel: discord.TextChannel, resend: bool = False):
         """刷新频道日报面板。"""
-        threads = await self.get_todays_threads(channel.guild)
-        date_str = datetime.now(TZ_SHANGHAI).strftime("%Y年%m月%d日")
-        panel_title = f"📮 {date_str} 更新日报"
-        view = SearchResultContainer(threads, title=panel_title, user=self.bot.user, is_daily=True)
+        if resend:
+            await self.rebuild_ordered_public_panels(channel)
+            return
+
+        view = await self._build_daily_report_view(channel)
 
         message_id = await get_panel_message_id(channel.id, "daily_report")
 
@@ -527,27 +611,16 @@ class ExplorationCog(commands.Cog):
             try:
                 target_msg = await channel.fetch_message(message_id)
                 await target_msg.edit(view=view)
-                await self.refresh_channel_update_summary_panel(channel, resend=False)
                 return
             except discord.NotFound:
                 await remove_panel_record(channel.id, "daily_report")
             except Exception as e:
                 print(f"编辑数据库记录的日报面板({message_id})失败: {e}")
 
-        if resend and message_id:
-            try:
-                old_msg = await channel.fetch_message(message_id)
-                await old_msg.delete()
-            except discord.NotFound:
-                pass
-            finally:
-                await remove_panel_record(channel.id, "daily_report")
-
         summary_message_id = await get_panel_message_id(channel.id, "daily_update_summary")
-        if resend and summary_message_id:
+        if summary_message_id:
             try:
-                old_summary_msg = await channel.fetch_message(summary_message_id)
-                await old_summary_msg.delete()
+                await channel.get_partial_message(summary_message_id).delete()
             except discord.NotFound:
                 pass
             finally:
@@ -569,7 +642,6 @@ class ExplorationCog(commands.Cog):
 
         new_msg = await channel.send(view=view)
         await set_panel_message_id(channel.id, new_msg.id, "daily_report")
-        await self.refresh_channel_update_summary_panel(channel, resend=False)
 
     @tasks.loop(minutes=10)
     async def daily_task(self):
@@ -656,6 +728,23 @@ class ExplorationCog(commands.Cog):
             return await interaction.response.send_message("你没有权限执行此命令。", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
+        if interaction.channel_id in set(EXPLORATION_TARGET_CHANNEL_IDS) | set(RECOMMEND_DAILY_CHANNEL_IDS):
+            await self.rebuild_ordered_public_panels(interaction.channel)
+            await interaction.followup.send("公开面板已按固定顺序重建：搜索面板 → 今日新帖+更新汇总 → 每日精选。", ephemeral=True)
+            return
+
+        message_id = await get_panel_message_id(interaction.channel.id, "search_panel")
+        if message_id:
+            try:
+                msg = await interaction.channel.fetch_message(message_id)
+                await msg.edit(view=SearchPanelContainer(self.bot))
+                await interaction.followup.send("搜索面板已刷新。", ephemeral=True)
+                return
+            except discord.NotFound:
+                await remove_panel_record(interaction.channel.id, "search_panel")
+            except Exception as e:
+                print(f"编辑搜索面板失败({message_id}): {e}")
+
         try:
             async for msg in interaction.channel.history(limit=50):
                 if msg.author == self.bot.user and msg.components:
@@ -678,7 +767,8 @@ class ExplorationCog(commands.Cog):
         except Exception as e:
             print(f"清理搜索面板失败: {e}")
 
-        await interaction.channel.send(view=SearchPanelContainer(self.bot))
+        new_msg = await interaction.channel.send(view=SearchPanelContainer(self.bot))
+        await set_panel_message_id(interaction.channel.id, new_msg.id, "search_panel")
         await interaction.followup.send("最新的搜索面板已部署。", ephemeral=True)
 
     @app_commands.command(name="查询下载记录", description="[管理] 查询用户通过本Bot下载的所有记录")
