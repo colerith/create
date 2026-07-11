@@ -252,6 +252,16 @@ class ProtectionLayoutView(ui.LayoutView):
         flush()
 
 
+def build_status_view(
+    content: str,
+    *,
+    accent_colour: discord.Color | int | None = None,
+) -> ProtectionLayoutView:
+    view = ProtectionLayoutView(timeout=None, accent_colour=accent_colour or PALETTE_HONEYDEW)
+    view.set_message_content(content=content)
+    return view
+
+
 class CachedAttachment:
     def __init__(self, filename, title, data, content_type=None, size=None):
         self.filename = filename
@@ -2042,9 +2052,7 @@ class ProtectionDraftView(ProtectionLayoutView):
             session = cog.upload_sessions.pop(key, None)
             if not session:
                 return await done_interaction.response.edit_message(
-                    content="❌ 当前没有可提交的附件收集会话。",
-                    embed=None,
-                    view=None,
+                    view=build_status_view("❌ 当前没有可提交的附件收集会话。", accent_colour=PALETTE_CORAL_GLOW),
                 )
 
             if session.get("task"):
@@ -2058,17 +2066,13 @@ class ProtectionDraftView(ProtectionLayoutView):
                 )
             except Exception as exc:
                 return await done_interaction.response.edit_message(
-                    content=f"❌ 追加附件失败：{exc}",
-                    embed=None,
-                    view=None,
+                    view=build_status_view(f"❌ 追加附件失败：{exc}", accent_colour=PALETTE_CORAL_GLOW),
                 )
 
             attachments.extend(reusable_attachments)
             if not attachments:
                 return await done_interaction.response.edit_message(
-                    content="❌ 还没有收集到任何可追加内容，请先发送带附件或纯文本的消息。",
-                    embed=None,
-                    view=None,
+                    view=build_status_view("❌ 还没有收集到任何可追加内容，请先发送带附件或纯文本的消息。", accent_colour=PALETTE_CORAL_GLOW),
                 )
 
             self.append_attachments(attachments)
@@ -2084,9 +2088,7 @@ class ProtectionDraftView(ProtectionLayoutView):
 
             await self.refresh_dashboard_message()
             await done_interaction.response.edit_message(
-                content=f"✅ 已成功追加 **{len(attachments)}** 个附件到当前草稿。",
-                embed=None,
-                view=None,
+                view=build_status_view(f"✅ 已成功追加 **{len(attachments)}** 个附件到当前草稿。", accent_colour=PALETTE_HONEYDEW),
             )
 
         cog.upload_sessions[key] = {
@@ -2386,13 +2388,15 @@ class ProtectionDraftView(ProtectionLayoutView):
     @ui.button(label="确认发布", style=discord.ButtonStyle.danger, row=4, emoji="🚀")
     async def btn_confirm(self, i: discord.Interaction, b: ui.Button):
         await i.response.edit_message(
-            content="⏳ 正在加密上传...", embed=None, view=None
+            view=build_status_view("⏳ 正在加密上传...", accent_colour=PALETTE_SOFT_PEACH)
         )
         await self.publish(i)
 
     @ui.button(label="取消", style=discord.ButtonStyle.gray, row=4, emoji="✖️")
     async def btn_cancel(self, i: discord.Interaction, b: ui.Button):
-        await i.response.edit_message(content="操作已取消。", embed=None, view=None)
+        await i.response.edit_message(
+            view=build_status_view("操作已取消。", accent_colour=PALETTE_HONEYDEW)
+        )
         self.stop()
 
     async def publish(self, interaction: discord.Interaction):
@@ -3080,9 +3084,7 @@ class PostManagementView(ProtectionLayoutView):
                     pass
 
             await done_interaction.response.edit_message(
-                content=f"✅ 已成功追加 **{len(stored_items)}** 个附件到当前已发布批次。",
-                embed=None,
-                view=None,
+                view=build_status_view(f"✅ 已成功追加 **{len(stored_items)}** 个附件到当前已发布批次。", accent_colour=PALETTE_HONEYDEW),
             )
 
         cog.upload_sessions[key] = {
@@ -3131,7 +3133,7 @@ class PostManagementView(ProtectionLayoutView):
             pass
 
         await interaction.response.edit_message(
-            content="✅ 帖子已删除！相关记录已清理。", embed=None, view=None
+            view=build_status_view("✅ 帖子已删除！相关记录已清理。", accent_colour=PALETTE_HONEYDEW)
         )
 
 

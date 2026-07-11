@@ -25,6 +25,9 @@ from .views import (
     BumpButtonView,
     UploadSessionControlView,
     UPLOAD_SESSION_TIMEOUT_SECONDS,
+    PALETTE_CORAL_GLOW,
+    PALETTE_HONEYDEW,
+    build_status_view,
     build_text_cached_attachment,
     collect_cached_attachments_from_messages,
     count_collectible_message_items,
@@ -367,7 +370,9 @@ class ProtectionCog(commands.Cog):
         session = self.upload_sessions.pop(key, None)
         if session and session.get("task"):
             session["task"].cancel()
-        await interaction.response.edit_message(content=reason, embed=None, view=None)
+        await interaction.response.edit_message(
+            view=build_status_view(reason, accent_colour=PALETTE_HONEYDEW)
+        )
 
     async def finish_upload_session(
         self, interaction: discord.Interaction, user_id: int, channel_id: int
@@ -376,9 +381,7 @@ class ProtectionCog(commands.Cog):
         session = self.upload_sessions.pop(key, None)
         if not session:
             return await interaction.response.edit_message(
-                content="❌ 当前没有可提交的附件收集会话。",
-                embed=None,
-                view=None,
+                view=build_status_view("❌ 当前没有可提交的附件收集会话。", accent_colour=PALETTE_CORAL_GLOW),
             )
 
         if session.get("task"):
@@ -394,17 +397,13 @@ class ProtectionCog(commands.Cog):
         except Exception as exc:
             print(f"[ProtectionDebug] upload-session-read-source-failed: error={exc}")
             return await interaction.response.edit_message(
-                content=f"❌ 收纳附件失败：{exc}",
-                embed=None,
-                view=None,
+                view=build_status_view(f"❌ 收纳附件失败：{exc}", accent_colour=PALETTE_CORAL_GLOW),
             )
         attachments.extend(reusable_attachments)
 
         if not attachments:
             return await interaction.response.edit_message(
-                content="❌ 还没有收集到任何可保护内容，请先发送带附件或纯文本的消息。",
-                embed=None,
-                view=None,
+                view=build_status_view("❌ 还没有收集到任何可保护内容，请先发送带附件或纯文本的消息。", accent_colour=PALETTE_CORAL_GLOW),
             )
 
         for msg in source_messages:
