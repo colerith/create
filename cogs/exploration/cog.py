@@ -251,8 +251,10 @@ class ExplorationCog(commands.Cog):
                 continue
 
             parent = getattr(channel, "parent", None)
-            data["channel_name"] = getattr(channel, "name", None) or f"频道 {data.get('channel_id')}"
-            data["forum_name"] = getattr(parent, "name", None) or data["channel_name"]
+            channel_name = getattr(channel, "name", None) or f"频道 {data.get('channel_id')}"
+            data["post_name"] = channel_name if isinstance(channel, discord.Thread) else (data.get("title") or channel_name)
+            data["channel_name"] = channel_name
+            data["forum_name"] = getattr(parent, "name", None) or channel_name
 
             tags = []
             if isinstance(channel, discord.Thread):

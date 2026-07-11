@@ -584,8 +584,22 @@ class DownloadLibraryContainer(PagedRecordContainer):
             ordered_keys = list(grouped.keys())
         return [(key, grouped[key]) for key in ordered_keys]
 
+    def _display_units(self):
+        units = []
+        chunk_size = 4
+        if self.summary_mode == "latest":
+            for start in range(0, len(self.rows), chunk_size):
+                units.append(("最新足迹", self.rows[start : start + chunk_size], start, len(self.rows)))
+            return units
+
+        for group_name, group_rows in self._grouped_blocks():
+            for start in range(0, len(group_rows), chunk_size):
+                units.append((group_name, group_rows[start : start + chunk_size], start, len(group_rows)))
+        return units
+
     def _item_line(self, row, idx: int | None = None):
         title = self._clip(row.get("title"), 46)
+        post_name = self._clip(row.get("post_name") or row.get("channel_name") or title, 46)
         author = self._clip(row.get("author_name") or f"作者 {row.get('owner_id')}", 24)
         channel = self._clip(row.get("forum_name") or row.get("channel_name"), 28)
         tags = self._clip(row.get("tags") or "无标签", 46)
@@ -597,7 +611,8 @@ class DownloadLibraryContainer(PagedRecordContainer):
         prefix = f"{idx}. " if idx is not None else ""
         return (
             f"{prefix}**{title}**\n"
-            f"-# 作者: {author} · 原帖频道: {channel} · 标签: {tags}\n"
+            f"-# 作者: {author} · 原帖: **{post_name}** · 频道: {channel}\n"
+            f"-# 标签: {tags}\n"
             f"-# {update_text} · {post_link}{update_link}"
         )
 
@@ -614,13 +629,13 @@ class DownloadLibraryContainer(PagedRecordContainer):
         self.clear_items()
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
         icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
-        self.per_page = 5 if self.summary_mode == "latest" else 3
-        data_units = self.rows if self.summary_mode == "latest" else self._grouped_blocks()
+        self.per_page = 5
+        data_units = self._display_units()
         self.total_pages = math.ceil(len(data_units) / self.per_page) if data_units else 1
         if self.current_page >= self.total_pages:
             self.current_page = max(0, self.total_pages - 1)
 
-        elements = [
+        header_elements = [
             ui.Section(
                 ui.TextDisplay(content=f"### 🥚 下载记录小窝\n摸摸蛋壳，今天帮你收好 **{len(self.rows)}** 个看过/关注过的作品。"),
                 ui.TextDisplay(content=f"-# {self._mode_label()} · 最后更新: {timestamp}"),
@@ -628,32 +643,41 @@ class DownloadLibraryContainer(PagedRecordContainer):
             ),
             ui.Separator(),
         ]
+        self.add_item(ui.Container(*header_elements, accent_colour=self.accent_colour))
 
         if not data_units:
-            elements.append(
-                ui.TextDisplay(
+            self.add_item(
+                ui.Container(
+                    ui.TextDisplay(
                     content=(
                         "### 🌸 小篮子还是空的\n"
                         "下载、点赞或评论过的保护帖会出现在这里；有更新日志的作品会被悄悄捧到前面。"
                     )
+                    ),
+                    accent_colour=discord.Color.from_rgb(255, 210, 225),
                 )
             )
         else:
             start = self.current_page * self.per_page
             current_units = data_units[start : start + self.per_page]
-            if self.summary_mode == "latest":
-                lines = [self._item_line(row, idx) for idx, row in enumerate(current_units, start=start + 1)]
-                elements.append(ui.TextDisplay(content="### 🐣 最新足迹\n" + "\n\n".join(lines)))
-            else:
-                for group_name, group_rows in current_units:
-                    preview_rows = group_rows[:3]
-                    lines = [self._item_line(row) for row in preview_rows]
-                    more = f"\n-# 还有 {len(group_rows) - len(preview_rows)} 个作品藏在这个小格子里。" if len(group_rows) > len(preview_rows) else ""
-                    elements.append(
-                        ui.TextDisplay(
-                            content=f"### ✨ {self._clip(group_name, 32)} · {len(group_rows)} 个\n" + "\n\n".join(lines) + more
-                        )
+            for group_name, group_rows, group_start, group_total in current_units:
+                start_no = group_start + 1
+                end_no = group_start + len(group_rows)
+                if self.summary_mode == "latest":
+                    title = f"### 🐣 最新足迹 · {start_no}-{end_no}/{group_total}"
+                    lines = [
+                        self._item_line(row, idx)
+                        for idx, row in enumerate(group_rows, start=group_start + 1)
+                    ]
+                else:
+                    title = f"### ✨ {self._clip(group_name, 32)} · {start_no}-{end_no}/{group_total}"
+                    lines = [self._item_line(row) for row in group_rows]
+                self.add_item(
+                    ui.Container(
+                        ui.TextDisplay(content=title + "\n" + "\n\n".join(lines)),
+                        accent_colour=discord.Color.from_rgb(255, 224, 232),
                     )
+                )
 
         self.btn_prev.disabled = self.current_page == 0
         self.btn_next.disabled = self.current_page >= self.total_pages - 1
@@ -673,7 +697,7 @@ class DownloadLibraryContainer(PagedRecordContainer):
         if self.total_pages > 1:
             action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
 
-        self.add_item(ui.Container(*elements, *action_rows, accent_colour=self.accent_colour))
+        self.add_item(ui.Container(*action_rows, accent_colour=discord.Color.from_rgb(245, 245, 245)))
 
     async def _set_mode(self, interaction: discord.Interaction, mode: str):
         self.summary_mode = mode
