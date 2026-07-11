@@ -88,6 +88,27 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_download_rate_warning_user_ts ON download_rate_warning_log (user_id, timestamp)"
         )
+        # 4.1 发布保护附件时的更新日志记录表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS attachment_update_publish_log (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER NOT NULL,
+                protected_message_id INTEGER NOT NULL,
+                update_message_id INTEGER NOT NULL,
+                title TEXT,
+                update_log TEXT NOT NULL,
+                mention_users INTEGER NOT NULL DEFAULT 0,
+                timestamp TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachment_update_publish_owner_ts ON attachment_update_publish_log (owner_id, timestamp)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachment_update_publish_channel_ts ON attachment_update_publish_log (channel_id, timestamp)"
+        )
         # 5. 溯源追踪记录表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS file_traces (

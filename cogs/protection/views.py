@@ -2180,6 +2180,17 @@ class ProtectionDraftView(ui.View):
                 update_msg = await interaction.channel.send(
                     f"{update_header}\n{self.draft_update_log}"
                 )
+                await protection_db.record_attachment_update_publish_log(
+                    owner_id=self.user.id,
+                    guild_id=getattr(interaction.guild, "id", None),
+                    channel_id=interaction.channel.id,
+                    protected_message_id=final_msg.id,
+                    update_message_id=update_msg.id,
+                    title=self.draft_title,
+                    update_log=self.draft_update_log,
+                    timestamp=datetime.now(TZ_SHANGHAI).isoformat(),
+                    mention_users=self.mention_users,
+                )
                 try:
                     await update_msg.pin(reason="附件更新日志标注")
                 except:

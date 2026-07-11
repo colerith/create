@@ -59,6 +59,50 @@ async def record_download_rate_warning(
         await db.commit()
 
 
+async def record_attachment_update_publish_log(
+    owner_id: int,
+    guild_id: int | None,
+    channel_id: int,
+    protected_message_id: int,
+    update_message_id: int,
+    title: str | None,
+    update_log: str,
+    timestamp: str,
+    mention_users: bool = False,
+):
+    """记录通过 bot 发布保护附件时同步发送更新日志的行为。"""
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO attachment_update_publish_log
+            (
+                owner_id,
+                guild_id,
+                channel_id,
+                protected_message_id,
+                update_message_id,
+                title,
+                update_log,
+                mention_users,
+                timestamp
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                owner_id,
+                guild_id,
+                channel_id,
+                protected_message_id,
+                update_message_id,
+                title,
+                update_log,
+                int(mention_users),
+                timestamp,
+            ),
+        )
+        await db.commit()
+
+
 async def log_file_trace(
     trace_id: str,
     user_id: int,
