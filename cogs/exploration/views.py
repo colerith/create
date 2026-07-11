@@ -611,7 +611,8 @@ class DownloadLibraryContainer(PagedRecordContainer):
         prefix = f"{idx}. " if idx is not None else ""
         return (
             f"{prefix}**{title}**\n"
-            f"-# 作者: {author} · 原帖: {post_name}\n"
+            f"-# 作者: {author}\n"
+            f"-# 原帖: {post_name}\n"
             f"-# 频道: {channel} · 标签: {tags}\n"
             f"-# {update_text} · {post_link}{update_link}"
         )

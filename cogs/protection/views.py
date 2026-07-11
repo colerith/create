@@ -368,6 +368,69 @@ def is_image_filename(filename: str | None) -> bool:
     return os.path.splitext(filename)[1].lower() in IMAGE_FILE_EXTENSIONS
 
 
+def guess_extension_from_bytes(file_bytes: bytes | None) -> str | None:
+    if not file_bytes:
+        return None
+    signatures = [
+        (b"\x89PNG\r\n\x1a\n", ".png"),
+        (b"\xff\xd8\xff", ".jpg"),
+        (b"GIF87a", ".gif"),
+        (b"GIF89a", ".gif"),
+        (b"BM", ".bmp"),
+    ]
+    for magic, ext in signatures:
+        if file_bytes.startswith(magic):
+            return ext
+    if len(file_bytes) >= 12 and file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def guess_extension_from_content_type(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return {
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tiff",
+        "image/svg+xml": ".svg",
+        "application/json": ".json",
+        "text/plain": ".txt",
+    }.get(mime)
+
+
+def normalize_extension_for_attachment_name(
+    filename: str,
+    attachment=None,
+    file_bytes: bytes | None = None,
+) -> str:
+    current_ext = os.path.splitext(filename)[1].lower()
+    real_ext = guess_extension_from_bytes(file_bytes) or guess_extension_from_content_type(
+        getattr(attachment, "content_type", None)
+    )
+    if not real_ext or current_ext == real_ext:
+        return filename
+    root = os.path.splitext(filename)[0] or "file"
+    return f"{root}{real_ext}"
+
+
+def unique_archive_filename(filename: str, used_names: set[str]) -> str:
+    root, ext = os.path.splitext(filename or "file")
+    root = root or "file"
+    candidate = f"{root}{ext}"
+    counter = 2
+    while candidate in used_names:
+        candidate = f"{root} ({counter}){ext}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
 def sanitize_markdown_link_label(label: str | None, fallback: str = "image") -> str:
     value = (label or fallback).replace("[", "(").replace("]", ")")
     return value or fallback
@@ -420,8 +483,9 @@ def build_image_archive_file(file_pairs, archive_name: str) -> discord.File | No
 
     archive_buffer = io.BytesIO()
     with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        used_names = set()
         for filename, file_bytes in file_pairs:
-            archive.writestr(filename, file_bytes)
+            archive.writestr(unique_archive_filename(filename, used_names), file_bytes)
 
     archive_buffer.seek(0)
     return discord.File(archive_buffer, filename=archive_name)
@@ -470,7 +534,7 @@ def log_attachment_debug(stage, attachment):
     print(f"[ProtectionDebug] {stage}: {payload}")
 
 
-def get_attachment_original_name(attachment):
+def get_attachment_original_name(attachment, file_bytes: bytes | None = None):
     log_attachment_debug("attachment-name-detect", attachment)
     title = getattr(attachment, "title", None)
     filename = getattr(attachment, "filename", None)
@@ -481,12 +545,15 @@ def get_attachment_original_name(attachment):
         if filename_ext and not candidate.lower().endswith(filename_ext.lower()):
             candidate = f"{candidate}{filename_ext}"
 
+    candidate = normalize_extension_for_attachment_name(candidate, attachment, file_bytes)
+
     print(
         "[ProtectionDebug] attachment-name-result:",
         {
             "chosen_name": candidate or "unknown",
             "title": title,
             "filename": filename,
+            "content_type": getattr(attachment, "content_type", None),
         },
     )
     return candidate or "unknown"
@@ -705,7 +772,7 @@ async def build_storage_entry_from_message(bot, user, post_title, msg, old_tag=N
     if msg.attachments:
         attachment = msg.attachments[0]
         file_bytes = await attachment.read()
-        new_original_name = get_attachment_original_name(attachment)
+        new_original_name = get_attachment_original_name(attachment, file_bytes)
         stored_data = await upload_files_for_storage(
             bot,
             user,
@@ -2713,7 +2780,7 @@ class ManageFilesSelectView(ProtectionLayoutView):
                 return await interaction.followup.send(
                     f"❌ 读取附件失败：{exc}", ephemeral=True
                 )
-            new_original_name = get_attachment_original_name(attachment)
+            new_original_name = get_attachment_original_name(attachment, file_bytes)
             try:
                 stored_data = await upload_files_for_storage(
                     self.bot,
