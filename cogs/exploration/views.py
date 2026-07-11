@@ -366,6 +366,22 @@ class SearchPanelContainer(ui.LayoutView):
         )
         self.btn_user.callback = self.on_user
 
+        self.btn_downloads = ui.Button(
+            label="下载记录",
+            style=discord.ButtonStyle.secondary,
+            emoji="📥",
+            custom_id="search_panel_btn_downloads_v1"
+        )
+        self.btn_downloads.callback = self.on_downloads
+
+        self.btn_my_works = ui.Button(
+            label="我的作品",
+            style=discord.ButtonStyle.secondary,
+            emoji="📚",
+            custom_id="search_panel_btn_my_works_v1"
+        )
+        self.btn_my_works.callback = self.on_my_works
+
         deco_img = self.bot.user.display_avatar.url
 
         container = ui.Container(
@@ -377,6 +393,7 @@ class SearchPanelContainer(ui.LayoutView):
             ),
             ui.Separator(),
             ui.ActionRow(self.btn_keyword, self.btn_user),
+            ui.ActionRow(self.btn_downloads, self.btn_my_works),
             accent_colour=discord.Color.from_rgb(100, 149, 237) # Cornflower Blue
         )
         self.add_item(container)
@@ -389,6 +406,245 @@ class SearchPanelContainer(ui.LayoutView):
             "请选择你要查找的用户：",
             view=UserSelectView(),
             ephemeral=True
+        )
+
+    async def on_downloads(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        await cog.send_download_library_panel(interaction)
+
+    async def on_my_works(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "请选择要筛选的作品分区，留空可查看全部。",
+            view=MyWorksFilterView(self.bot),
+            ephemeral=True
+        )
+
+
+class PagedRecordContainer(ui.LayoutView):
+    """下载记录/我的作品共用的文本分页面板基类。"""
+
+    panel_type = ""
+    accent_colour = discord.Color.blurple()
+
+    def __init__(self, rows, title: str, user, guild: discord.Guild | None, bot: discord.Client, timeout=300):
+        super().__init__(timeout=timeout)
+        self.rows = list(rows)
+        self.title = title
+        self.user = user
+        self.guild = guild
+        self.bot = bot
+        self.per_page = 6
+        self.current_page = 0
+        self.total_pages = math.ceil(len(self.rows) / self.per_page) if self.rows else 1
+
+        uid = user.id if user else id(self)
+        self.btn_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id=f"{self.panel_type}_prev_{uid}_{id(self)}")
+        self.btn_prev.callback = self.on_prev
+        self.btn_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary, custom_id=f"{self.panel_type}_next_{uid}_{id(self)}")
+        self.btn_next.callback = self.on_next
+        self.btn_indicator = ui.Button(label=f"1/{self.total_pages}", disabled=True, style=discord.ButtonStyle.secondary)
+        self.btn_push_dm = ui.Button(label="推送到私信", emoji="📬", style=discord.ButtonStyle.primary)
+        self.btn_push_dm.callback = self.on_push_dm
+        self.btn_delete_dm = ui.Button(label="删除私信推送", emoji="🗑️", style=discord.ButtonStyle.danger)
+        self.btn_delete_dm.callback = self.on_delete_dm
+
+        self.update_container()
+
+    @staticmethod
+    def _clip(text, limit: int) -> str:
+        text = "" if text is None else str(text).strip()
+        if not text:
+            text = "未命名"
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
+    def _jump_url(self, channel_id: int | None, message_id: int | None) -> str | None:
+        guild_id = self.guild.id if self.guild else None
+        if not guild_id or not channel_id or not message_id:
+            return None
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.user and interaction.user.id != self.user.id:
+            await interaction.response.send_message("这个面板只属于发起者。", ephemeral=True)
+            return False
+        return True
+
+    def _row_lines(self, current_rows):
+        return ["*暂无数据*"]
+
+    def update_container(self):
+        self.clear_items()
+
+        timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
+        icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
+        elements = [
+            ui.Section(
+                ui.TextDisplay(content=f"### {self.title}\n共 **{len(self.rows)}** 条记录。"),
+                ui.TextDisplay(content=f"-# 最后更新: {timestamp}"),
+                accessory=ui.Thumbnail(media=icon_url),
+            ),
+            ui.Separator(),
+        ]
+
+        start = self.current_page * self.per_page
+        current_rows = self.rows[start : start + self.per_page]
+        elements.append(ui.TextDisplay(content="\n\n".join(self._row_lines(current_rows))))
+
+        self.btn_prev.disabled = self.current_page == 0
+        self.btn_next.disabled = self.current_page >= self.total_pages - 1
+        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
+
+        rows = [ui.ActionRow(self.btn_push_dm, self.btn_delete_dm)]
+        if self.total_pages > 1:
+            rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+
+        self.add_item(ui.Container(*elements, *rows, accent_colour=self.accent_colour))
+
+    async def on_prev(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+        self.update_container()
+        await interaction.response.edit_message(view=self)
+
+    async def on_push_dm(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        await cog.push_panel_to_dm(interaction, self.panel_type, self.user.id)
+
+    async def on_delete_dm(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        await cog.delete_dm_panel_push(interaction, self.panel_type, self.user.id)
+
+
+class DownloadLibraryContainer(PagedRecordContainer):
+    panel_type = "download_library"
+    accent_colour = discord.Color.from_rgb(93, 173, 226)
+
+    def _row_lines(self, current_rows):
+        if not current_rows:
+            return ["*还没有下载、点赞或评论过的保护帖。*"]
+        lines = []
+        for idx, row in enumerate(current_rows, start=self.current_page * self.per_page + 1):
+            title = self._clip(row["title"], 64)
+            post_url = self._jump_url(row["channel_id"], row["message_id"])
+            update_url = self._jump_url(row["channel_id"], row["latest_update_message_id"])
+            sources = self._clip(row["sources"], 24)
+            updated = "最近更新" if row["latest_update_at"] else "暂无更新"
+            link = f"[帖子]({post_url})" if post_url else "帖子链接不可用"
+            update_link = f" | [更新日志]({update_url})" if update_url else ""
+            lines.append(f"**{idx}. {title}**\n-# {updated} · 来源: {sources} · {link}{update_link}")
+        return lines
+
+
+class MyWorksContainer(PagedRecordContainer):
+    panel_type = "my_works"
+    accent_colour = discord.Color.from_rgb(82, 190, 128)
+
+    def __init__(self, rows, title: str, user, guild: discord.Guild | None, bot: discord.Client, selected_channel_ids=None, timeout=300):
+        self.selected_channel_ids = list(selected_channel_ids or [])
+        self.btn_push_channel = ui.Button(label="推送到频道", emoji="📣", style=discord.ButtonStyle.success)
+        self.btn_push_channel.callback = self.on_push_channel
+        super().__init__(rows, title, user, guild, bot, timeout=timeout)
+        self.update_container()
+
+    def _row_lines(self, current_rows):
+        if not current_rows:
+            return ["*还没有找到你发布过的作品。*"]
+        lines = []
+        for idx, row in enumerate(current_rows, start=self.current_page * self.per_page + 1):
+            title = self._clip(row["title"], 64)
+            post_url = self._jump_url(row["channel_id"], row["message_id"])
+            channel = self.guild.get_channel(row["channel_id"]) if self.guild else None
+            parent = getattr(channel, "parent", None)
+            channel_name = parent.name if parent else (channel.name if channel else f"频道 {row['channel_id']}")
+            tags = row.get("tags") if isinstance(row, dict) else None
+            if not tags and hasattr(row, "keys") and "tags" in row.keys():
+                tags = row["tags"]
+            tags_text = self._clip(tags or "无标签", 60)
+            link = f"[跳转]({post_url})" if post_url else "链接不可用"
+            lines.append(f"**{idx}. {title}**\n-# 分区: {channel_name} · 标签: {tags_text} · {link}")
+        return lines
+
+    def update_container(self):
+        super().update_container()
+        container = self.children[0]
+        action_rows = [item for item in container.children if isinstance(item, ui.ActionRow)]
+        if action_rows and self.btn_push_channel not in action_rows[0].children:
+            action_rows[0].add_item(self.btn_push_channel)
+
+    async def on_push_channel(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(MyWorksChannelPushModal(self.bot, self.user.id, self.selected_channel_ids))
+
+    async def on_push_dm(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        await cog.push_panel_to_dm(
+            interaction,
+            self.panel_type,
+            self.user.id,
+            selected_channel_ids=self.selected_channel_ids,
+        )
+
+
+class MyWorksFilterView(ui.View):
+    def __init__(self, bot: discord.Client):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.channel_select = ui.ChannelSelect(
+            placeholder="[可选] 选择作品分区...",
+            channel_types=[discord.ChannelType.forum, discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+            row=0,
+        )
+        self.add_item(self.channel_select)
+
+    @ui.button(label="查看我的作品", style=discord.ButtonStyle.primary, row=1, emoji="📚")
+    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        selected_ids = [ch.id for ch in self.channel_select.values]
+        await cog.send_my_works_panel(interaction, selected_channel_ids=selected_ids)
+
+
+class MyWorksChannelPushModal(ui.Modal, title="推送我的作品到频道"):
+    channel_link = ui.TextInput(
+        label="频道链接或频道ID",
+        placeholder="https://discord.com/channels/服务器ID/频道ID 或直接输入频道ID",
+        min_length=1,
+        max_length=200,
+    )
+
+    def __init__(self, bot: discord.Client, user_id: int, selected_channel_ids=None):
+        super().__init__(timeout=180)
+        self.bot = bot
+        self.user_id = user_id
+        self.selected_channel_ids = list(selected_channel_ids or [])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cog = self.bot.get_cog("ExplorationCog")
+        if not cog:
+            return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
+        await cog.push_my_works_to_channel(
+            interaction,
+            self.user_id,
+            str(self.channel_link.value),
+            selected_channel_ids=self.selected_channel_ids,
         )
 
 

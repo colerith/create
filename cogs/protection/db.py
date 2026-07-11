@@ -303,6 +303,96 @@ async def get_user_download_logs_page(user_id: int, limit: int = 10, offset: int
         return await cursor.fetchall()
 
 
+async def get_user_library_items(user_id: int, limit: int = 100):
+    """获取用户下载过、点赞过或评论过的保护帖，并把最近更新过的排在前面。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            WITH user_items AS (
+                SELECT message_id, MAX(timestamp) AS touched_at, '下载' AS source
+                FROM download_log
+                WHERE user_id = ?
+                GROUP BY message_id
+                UNION ALL
+                SELECT message_id, MAX(timestamp) AS touched_at, '点赞' AS source
+                FROM user_likes
+                WHERE user_id = ?
+                GROUP BY message_id
+                UNION ALL
+                SELECT message_id, MAX(timestamp) AS touched_at, '评论' AS source
+                FROM user_comments
+                WHERE user_id = ?
+                GROUP BY message_id
+            ),
+            grouped_items AS (
+                SELECT message_id, MAX(touched_at) AS touched_at, GROUP_CONCAT(source) AS sources
+                FROM user_items
+                GROUP BY message_id
+            )
+            SELECT
+                pi.message_id,
+                pi.channel_id,
+                pi.owner_id,
+                pi.title,
+                pi.created_at,
+                gi.touched_at,
+                gi.sources,
+                (
+                    SELECT MAX(a.timestamp)
+                    FROM attachment_update_publish_log a
+                    WHERE a.protected_message_id = pi.message_id
+                ) AS latest_update_at,
+                (
+                    SELECT a.update_message_id
+                    FROM attachment_update_publish_log a
+                    WHERE a.protected_message_id = pi.message_id
+                    ORDER BY a.timestamp DESC, a.log_id DESC
+                    LIMIT 1
+                ) AS latest_update_message_id,
+                (
+                    SELECT a.update_log
+                    FROM attachment_update_publish_log a
+                    WHERE a.protected_message_id = pi.message_id
+                    ORDER BY a.timestamp DESC, a.log_id DESC
+                    LIMIT 1
+                ) AS latest_update_log
+            FROM grouped_items gi
+            JOIN protected_items pi ON pi.message_id = gi.message_id
+            ORDER BY
+                latest_update_at IS NOT NULL DESC,
+                latest_update_at DESC,
+                gi.touched_at DESC
+            LIMIT ?
+            """,
+            (user_id, user_id, user_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def get_user_published_items(user_id: int, limit: int = 200):
+    """获取用户发布过的保护作品。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                message_id,
+                channel_id,
+                owner_id,
+                title,
+                created_at,
+                update_log
+            FROM protected_items
+            WHERE owner_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cursor.fetchall()
+
+
 async def count_suspicious_users_in_window(since_ts: str, min_downloads: int) -> int:
     """统计时间窗口内达到阈值下载次数的用户数。"""
     async with get_db() as db:

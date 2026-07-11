@@ -172,6 +172,29 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_panel_type ON panel_records (panel_type)"
         )
 
+        # 9. 探索面板推送记录：用于定时编辑刷新 DM/频道里的旧面板
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS exploration_panel_pushes (
+                push_key TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                panel_type TEXT NOT NULL,
+                delivery_type TEXT NOT NULL,
+                target_channel_id INTEGER,
+                filter_channel_ids TEXT,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        try:
+            await db.execute("ALTER TABLE exploration_panel_pushes ADD COLUMN filter_channel_ids TEXT")
+        except:
+            pass
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exploration_panel_pushes_refresh ON exploration_panel_pushes (panel_type, delivery_type)"
+        )
+
         await db.commit()
     print("✅ 数据库初始化完成，所有表结构已就绪。")
 

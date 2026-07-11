@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import re
 from datetime import datetime
 
 import discord
@@ -10,7 +11,14 @@ from discord import app_commands, ui
 from discord.ext import commands, tasks
 
 from config import EXPLORATION_TARGET_CHANNEL_IDS, ADMIN_USER_ID, TZ_SHANGHAI
-from .views import SearchPanelContainer, SearchResultContainer, UpdateSummaryContainer
+from . import db as exploration_db
+from .views import (
+    DownloadLibraryContainer,
+    MyWorksContainer,
+    SearchPanelContainer,
+    SearchResultContainer,
+    UpdateSummaryContainer,
+)
 from ..core.db import get_panel_message_id, set_panel_message_id, remove_panel_record
 from ..protection import db as protection_db
 
@@ -185,12 +193,220 @@ class ExplorationCog(commands.Cog):
         self.bot = bot
         self.bot.add_view(SearchPanelContainer(self.bot))
         self.daily_task.start()
+        self.pushed_panel_refresh_task.start()
 
     async def cog_unload(self):
         self.daily_task.cancel()
+        self.pushed_panel_refresh_task.cancel()
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == ADMIN_USER_ID or interaction.user.guild_permissions.administrator
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        return {key: row[key] for key in row.keys()}
+
+    def _resolve_item_channel(self, guild: discord.Guild, channel_id: int | None):
+        return guild.get_channel(channel_id) if guild and channel_id else None
+
+    async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_channel_ids: list[int] | None = None):
+        selected = set(selected_channel_ids or [])
+        decorated = []
+        for row in rows:
+            data = self._row_to_dict(row)
+            channel = self._resolve_item_channel(guild, data.get("channel_id"))
+            parent = getattr(channel, "parent", None)
+            if selected:
+                channel_matches = data.get("channel_id") in selected
+                parent_matches = getattr(parent, "id", None) in selected
+                if not channel_matches and not parent_matches:
+                    continue
+
+            tags = []
+            if isinstance(channel, discord.Thread):
+                tags = [tag.name for tag in getattr(channel, "applied_tags", [])[:4]]
+            data["tags"] = " ".join(tags) if tags else "无标签"
+            decorated.append(data)
+        return decorated
+
+    async def _build_download_library_view(
+        self,
+        user: discord.User | discord.Member,
+        guild: discord.Guild,
+        timeout: int | None = 300,
+    ):
+        rows = await protection_db.get_user_library_items(user.id)
+        return DownloadLibraryContainer(
+            [self._row_to_dict(row) for row in rows],
+            title="📥 下载记录",
+            user=user,
+            guild=guild,
+            bot=self.bot,
+            timeout=timeout,
+        )
+
+    async def _build_my_works_view(
+        self,
+        user: discord.User | discord.Member,
+        guild: discord.Guild,
+        selected_channel_ids: list[int] | None = None,
+        timeout: int | None = 300,
+    ):
+        rows = await protection_db.get_user_published_items(user.id)
+        decorated = await self._decorate_work_rows(guild, rows, selected_channel_ids)
+        suffix = "（已筛选）" if selected_channel_ids else ""
+        return MyWorksContainer(
+            decorated,
+            title=f"📚 我的作品{suffix}",
+            user=user,
+            guild=guild,
+            bot=self.bot,
+            selected_channel_ids=selected_channel_ids,
+            timeout=timeout,
+        )
+
+    async def send_download_library_panel(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = await self._build_download_library_view(interaction.user, interaction.guild)
+        await interaction.followup.send(view=view, ephemeral=True)
+
+    async def send_my_works_panel(self, interaction: discord.Interaction, selected_channel_ids: list[int] | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = await self._build_my_works_view(interaction.user, interaction.guild, selected_channel_ids)
+        await interaction.followup.send(view=view, ephemeral=True)
+
+    async def _fetch_push_user_and_guild(self, user_id: int, guild_id: int):
+        guild = self.bot.get_guild(guild_id)
+        user = guild.get_member(user_id) if guild else None
+        if user is None:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+        return user, guild
+
+    async def _build_pushed_view(self, panel_type: str, user, guild, selected_channel_ids=None):
+        if panel_type == "download_library":
+            return await self._build_download_library_view(user, guild, timeout=None)
+        if panel_type == "my_works":
+            return await self._build_my_works_view(user, guild, selected_channel_ids, timeout=None)
+        raise ValueError(f"未知面板类型: {panel_type}")
+
+    async def push_panel_to_dm(
+        self,
+        interaction: discord.Interaction,
+        panel_type: str,
+        user_id: int,
+        selected_channel_ids: list[int] | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != user_id:
+            return await interaction.followup.send("只能推送自己的面板。", ephemeral=True)
+
+        user, guild = await self._fetch_push_user_and_guild(user_id, interaction.guild_id)
+        if not guild:
+            return await interaction.followup.send("无法定位服务器，暂时不能创建私信推送。", ephemeral=True)
+
+        view = await self._build_pushed_view(panel_type, user, guild, selected_channel_ids)
+        dm = await user.create_dm()
+        record = await exploration_db.get_panel_push(user_id, guild.id, panel_type, "dm")
+        sent_msg = None
+        if record:
+            try:
+                sent_msg = await dm.fetch_message(record["message_id"])
+                await sent_msg.edit(view=view)
+            except discord.NotFound:
+                sent_msg = None
+        if sent_msg is None:
+            sent_msg = await dm.send(view=view)
+
+        now = datetime.now(TZ_SHANGHAI).isoformat()
+        await exploration_db.upsert_panel_push(
+            user_id,
+            guild.id,
+            panel_type,
+            "dm",
+            sent_msg.id,
+            now,
+            filter_channel_ids=json.dumps(selected_channel_ids or []),
+        )
+        await interaction.followup.send("已推送到私信；之后会定期编辑刷新同一条私信面板。", ephemeral=True)
+
+    async def delete_dm_panel_push(self, interaction: discord.Interaction, panel_type: str, user_id: int):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != user_id:
+            return await interaction.followup.send("只能删除自己的私信推送。", ephemeral=True)
+        record = await exploration_db.get_panel_push(user_id, interaction.guild_id, panel_type, "dm")
+        if record:
+            try:
+                dm = await interaction.user.create_dm()
+                msg = await dm.fetch_message(record["message_id"])
+                await msg.delete()
+            except discord.NotFound:
+                pass
+            await exploration_db.remove_panel_push(user_id, interaction.guild_id, panel_type, "dm")
+        await interaction.followup.send("私信推送已删除，记录也已清除。", ephemeral=True)
+
+    @staticmethod
+    def _parse_channel_id(raw: str) -> int | None:
+        raw = raw.strip()
+        match = re.search(r"/channels/\d+/(\d+)", raw)
+        if match:
+            return int(match.group(1))
+        digits = re.search(r"\d{15,25}", raw)
+        return int(digits.group(0)) if digits else None
+
+    async def push_my_works_to_channel(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+        channel_input: str,
+        selected_channel_ids: list[int] | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != user_id:
+            return await interaction.followup.send("只能推送自己的作品面板。", ephemeral=True)
+
+        channel_id = self._parse_channel_id(channel_input)
+        if not channel_id:
+            return await interaction.followup.send("没有识别到有效频道链接或频道 ID。", ephemeral=True)
+
+        target = self.bot.get_channel(channel_id)
+        if target is None:
+            try:
+                target = await self.bot.fetch_channel(channel_id)
+            except Exception:
+                target = None
+        if not target or not hasattr(target, "send"):
+            return await interaction.followup.send("找不到可发送消息的目标频道。", ephemeral=True)
+        if getattr(getattr(target, "guild", None), "id", None) != interaction.guild_id:
+            return await interaction.followup.send("只能推送到当前服务器内的频道。", ephemeral=True)
+        perms = target.permissions_for(interaction.guild.me)
+        if not perms.send_messages:
+            return await interaction.followup.send("我没有在该频道发送消息的权限。", ephemeral=True)
+
+        guild = interaction.guild
+        view = await self._build_my_works_view(interaction.user, guild, selected_channel_ids, timeout=None)
+        record = await exploration_db.get_panel_push(user_id, guild.id, "my_works", "channel", channel_id)
+        sent_msg = None
+        if record:
+            try:
+                sent_msg = await target.fetch_message(record["message_id"])
+                await sent_msg.edit(view=view)
+            except discord.NotFound:
+                sent_msg = None
+        if sent_msg is None:
+            sent_msg = await target.send(view=view)
+
+        now = datetime.now(TZ_SHANGHAI).isoformat()
+        await exploration_db.upsert_panel_push(
+            user_id,
+            guild.id,
+            "my_works",
+            "channel",
+            sent_msg.id,
+            now,
+            target_channel_id=channel_id,
+            filter_channel_ids=json.dumps(selected_channel_ids or []),
+        )
+        await interaction.followup.send("作品面板已推送到指定频道；之后会定期编辑刷新旧面板。", ephemeral=True)
 
     async def get_todays_threads(self, guild: discord.Guild) -> list[discord.Thread]:
         """获取今天发布的所有帖子。"""
@@ -311,6 +527,72 @@ class ExplorationCog(commands.Cog):
 
     @daily_task.before_loop
     async def before_daily_task(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=30)
+    async def pushed_panel_refresh_task(self):
+        """定期编辑刷新用户推送出去的探索面板。"""
+        rows = await exploration_db.get_all_panel_pushes()
+        for row in rows:
+            try:
+                selected_channel_ids = json.loads(row["filter_channel_ids"] or "[]")
+            except Exception:
+                selected_channel_ids = []
+
+            try:
+                user, guild = await self._fetch_push_user_and_guild(row["user_id"], row["guild_id"])
+                if not guild:
+                    continue
+                view = await self._build_pushed_view(row["panel_type"], user, guild, selected_channel_ids)
+
+                if row["delivery_type"] == "dm":
+                    target = await user.create_dm()
+                    remove_target_channel_id = None
+                else:
+                    target = self.bot.get_channel(row["target_channel_id"])
+                    if target is None:
+                        try:
+                            target = await self.bot.fetch_channel(row["target_channel_id"])
+                        except Exception:
+                            target = None
+                    remove_target_channel_id = row["target_channel_id"]
+
+                if not target:
+                    await exploration_db.remove_panel_push(
+                        row["user_id"],
+                        row["guild_id"],
+                        row["panel_type"],
+                        row["delivery_type"],
+                        remove_target_channel_id,
+                    )
+                    continue
+
+                try:
+                    msg = await target.fetch_message(row["message_id"])
+                    await msg.edit(view=view)
+                    await exploration_db.upsert_panel_push(
+                        row["user_id"],
+                        row["guild_id"],
+                        row["panel_type"],
+                        row["delivery_type"],
+                        row["message_id"],
+                        datetime.now(TZ_SHANGHAI).isoformat(),
+                        target_channel_id=remove_target_channel_id,
+                        filter_channel_ids=json.dumps(selected_channel_ids),
+                    )
+                except discord.NotFound:
+                    await exploration_db.remove_panel_push(
+                        row["user_id"],
+                        row["guild_id"],
+                        row["panel_type"],
+                        row["delivery_type"],
+                        remove_target_channel_id,
+                    )
+            except Exception as e:
+                print(f"刷新探索推送面板失败: {e}")
+
+    @pushed_panel_refresh_task.before_loop
+    async def before_pushed_panel_refresh_task(self):
         await self.bot.wait_until_ready()
 
     @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道日报面板")
