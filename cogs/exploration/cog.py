@@ -211,40 +211,52 @@ class ExplorationCog(commands.Cog):
             return None
         return guild.get_channel(channel_id) or guild.get_thread(channel_id)
 
-    async def _resolve_item_channel_deep(self, guild: discord.Guild, channel_id: int | None):
-        channel = self._resolve_item_channel(guild, channel_id)
-        if channel is not None:
-            return channel
-        if not guild or not channel_id:
-            return None
-        try:
-            return await guild.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException, discord.InvalidData):
-            return None
-
-    async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_keywords: list[str] | None = None):
+    async def _get_user_work_thread_rows(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        selected_keywords: list[str] | None = None,
+    ):
         selected = set(selected_keywords or [])
-        decorated = []
-        for row in rows:
-            data = self._row_to_dict(row)
-            channel = self._resolve_item_channel(guild, data.get("channel_id"))
-            if channel is None:
+        threads: list[discord.Thread] = []
+        for forum in guild.forums:
+            if not forum.permissions_for(guild.me).read_messages:
                 continue
-            parent = getattr(channel, "parent", None)
+            for thread in forum.threads:
+                if thread.owner_id != user_id:
+                    continue
+                tags = [tag.name for tag in getattr(thread, "applied_tags", [])]
+                haystack = " ".join([forum.name, thread.name, " ".join(tags)])
+                category = next((keyword for keyword in RECOMMEND_TARGET_KEYWORDS if keyword in haystack), "其他")
+                if selected and category not in selected:
+                    continue
+                threads.append(thread)
 
-            tags = []
-            if isinstance(channel, discord.Thread):
-                tags = [tag.name for tag in getattr(channel, "applied_tags", [])[:6]]
-            data["tags"] = " ".join(tags) if tags else "无标签"
-            data["post_name"] = getattr(channel, "name", None) or f"帖子 {data.get('channel_id')}"
-            data["forum_name"] = getattr(parent, "name", None) or data["post_name"]
-            haystack = " ".join([data["post_name"], data["forum_name"], data["tags"]])
-            data["category"] = next((keyword for keyword in RECOMMEND_TARGET_KEYWORDS if keyword in haystack), "其他")
+        threads.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
+        stats = await protection_db.get_user_published_thread_stats(user_id, [thread.id for thread in threads])
 
-            if selected and data["category"] not in selected:
-                continue
-            decorated.append(data)
-        return decorated
+        rows = []
+        for thread in threads:
+            forum = thread.parent
+            tags = [tag.name for tag in getattr(thread, "applied_tags", [])[:6]]
+            haystack = " ".join([forum.name if forum else "", thread.name, " ".join(tags)])
+            category = next((keyword for keyword in RECOMMEND_TARGET_KEYWORDS if keyword in haystack), "其他")
+            stat = stats.get(thread.id)
+            rows.append(
+                {
+                    "channel_id": thread.id,
+                    "latest_message_id": thread.id,
+                    "jump_url": thread.jump_url,
+                    "post_name": thread.name,
+                    "forum_name": forum.name if forum else "未知分区",
+                    "tags": " ".join(tags) if tags else "无标签",
+                    "category": category,
+                    "like_count": stat["like_count"] if stat else 0,
+                    "comment_count": stat["comment_count"] if stat else 0,
+                    "attachment_count": stat["attachment_count"] if stat else 0,
+                }
+            )
+        return rows
 
     async def _decorate_download_rows(self, guild: discord.Guild, rows):
         decorated = []
@@ -297,8 +309,7 @@ class ExplorationCog(commands.Cog):
         selected_channel_ids: list[str] | None = None,
         timeout: int | None = 300,
     ):
-        rows = await protection_db.get_user_published_items(user.id)
-        decorated = await self._decorate_work_rows(guild, rows, selected_channel_ids)
+        decorated = await self._get_user_work_thread_rows(guild, user.id, selected_channel_ids)
         suffix = f"（{'/'.join(selected_channel_ids)}）" if selected_channel_ids else ""
         return MyWorksContainer(
             decorated,
@@ -355,8 +366,7 @@ class ExplorationCog(commands.Cog):
         sent_msg = None
         if record:
             try:
-                sent_msg = await dm.fetch_message(record["message_id"])
-                await sent_msg.edit(view=view)
+                sent_msg = await dm.get_partial_message(record["message_id"]).edit(view=view)
             except discord.NotFound:
                 sent_msg = None
         if sent_msg is None:
@@ -382,8 +392,7 @@ class ExplorationCog(commands.Cog):
         if record:
             try:
                 dm = await interaction.user.create_dm()
-                msg = await dm.fetch_message(record["message_id"])
-                await msg.delete()
+                await dm.get_partial_message(record["message_id"]).delete()
             except discord.NotFound:
                 pass
             await exploration_db.remove_panel_push(user_id, interaction.guild_id, panel_type, "dm")
@@ -433,8 +442,7 @@ class ExplorationCog(commands.Cog):
         sent_msg = None
         if record:
             try:
-                sent_msg = await target.fetch_message(record["message_id"])
-                await sent_msg.edit(view=view)
+                sent_msg = await target.get_partial_message(record["message_id"]).edit(view=view)
             except discord.NotFound:
                 sent_msg = None
         if sent_msg is None:
@@ -578,7 +586,7 @@ class ExplorationCog(commands.Cog):
     async def pushed_panel_refresh_task(self):
         """定期编辑刷新用户推送出去的探索面板。"""
         rows = await exploration_db.get_all_panel_pushes()
-        for row in rows:
+        for row in rows[:8]:
             try:
                 selected_channel_ids = json.loads(row["filter_channel_ids"] or "[]")
             except Exception:
@@ -595,26 +603,13 @@ class ExplorationCog(commands.Cog):
                     remove_target_channel_id = None
                 else:
                     target = self.bot.get_channel(row["target_channel_id"])
-                    if target is None:
-                        try:
-                            target = await self.bot.fetch_channel(row["target_channel_id"])
-                        except Exception:
-                            target = None
                     remove_target_channel_id = row["target_channel_id"]
 
                 if not target:
-                    await exploration_db.remove_panel_push(
-                        row["user_id"],
-                        row["guild_id"],
-                        row["panel_type"],
-                        row["delivery_type"],
-                        remove_target_channel_id,
-                    )
                     continue
 
                 try:
-                    msg = await target.fetch_message(row["message_id"])
-                    await msg.edit(view=view)
+                    await target.get_partial_message(row["message_id"]).edit(view=view)
                     await exploration_db.upsert_panel_push(
                         row["user_id"],
                         row["guild_id"],
@@ -625,6 +620,7 @@ class ExplorationCog(commands.Cog):
                         target_channel_id=remove_target_channel_id,
                         filter_channel_ids=json.dumps(selected_channel_ids),
                     )
+                    await asyncio.sleep(2)
                 except discord.NotFound:
                     await exploration_db.remove_panel_push(
                         row["user_id"],

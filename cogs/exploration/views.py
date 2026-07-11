@@ -788,7 +788,7 @@ class MyWorksContainer(PagedRecordContainer):
                 like_count = int(row.get("like_count") or 0)
                 comment_count = int(row.get("comment_count") or 0)
                 attachment_count = int(row.get("attachment_count") or 0)
-                jump_url = self._jump_url(row.get("channel_id"), row.get("latest_message_id"))
+                jump_url = row.get("jump_url") or self._jump_url(row.get("channel_id"), row.get("latest_message_id"))
                 content_items.append(
                     ui.Section(
                         ui.TextDisplay(content=f"**{idx}. {post_name}**"),

@@ -407,6 +407,34 @@ async def get_user_published_items(user_id: int, limit: int = 200):
         return await cursor.fetchall()
 
 
+async def get_user_published_thread_stats(user_id: int, channel_ids: list[int]):
+    """按帖子线程统计用户保护附件的数量、点赞数和评论数。"""
+    if not channel_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in channel_ids)
+    params = [user_id, *channel_ids]
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"""
+            SELECT
+                pi.channel_id,
+                COUNT(*) AS attachment_count,
+                COUNT(DISTINCT ul.user_id || ':' || ul.message_id) AS like_count,
+                COUNT(DISTINCT uc.user_id || ':' || uc.message_id) AS comment_count
+            FROM protected_items pi
+            LEFT JOIN user_likes ul ON ul.message_id = pi.message_id
+            LEFT JOIN user_comments uc ON uc.message_id = pi.message_id
+            WHERE pi.owner_id = ? AND pi.channel_id IN ({placeholders})
+            GROUP BY pi.channel_id
+            """,
+            params,
+        )
+        rows = await cursor.fetchall()
+        return {row["channel_id"]: row for row in rows}
+
+
 async def count_suspicious_users_in_window(since_ts: str, min_downloads: int) -> int:
     """统计时间窗口内达到阈值下载次数的用户数。"""
     async with get_db() as db:
