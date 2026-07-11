@@ -219,7 +219,7 @@ class ExplorationCog(commands.Cog):
             return None
         try:
             return await guild.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, discord.InvalidData):
             return None
 
     async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_channel_ids: list[int] | None = None):
