@@ -274,6 +274,21 @@ class DailyReportContainer(ui.LayoutView):
         channel = self.guild.get_channel(channel_id) if self.guild else None
         return channel.name if channel else f"频道 {channel_id}"
 
+    def _thread_info(self, channel_id: int):
+        thread = self.guild.get_thread(channel_id) if self.guild else None
+        if thread is None and self.guild:
+            channel = self.guild.get_channel(channel_id)
+            thread = channel if isinstance(channel, discord.Thread) else None
+        if not thread:
+            return None
+        parent = thread.parent
+        tags = [tag.name for tag in getattr(thread, "applied_tags", [])[:4]]
+        return {
+            "name": thread.name,
+            "forum": parent.name if parent else "未知分区",
+            "tags": " ".join(tags) if tags else "无标签",
+        }
+
     def _build_threads_container(self):
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
         icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
@@ -342,22 +357,27 @@ class DailyReportContainer(ui.LayoutView):
         if not current_rows:
             elements.append(ui.TextDisplay(content="*暂无更新记录*"))
         else:
-            grouped = {}
             for row in current_rows:
-                grouped.setdefault(row["channel_id"], []).append(row)
-            for channel_id, channel_rows in grouped.items():
-                lines = [f"**#{self._channel_name(channel_id)}**"]
-                for row in channel_rows:
-                    title = self._clip(row["title"], 38)
-                    guild_id = row["guild_id"] or (self.guild.id if self.guild else None)
-                    jump_url = (
-                        f"https://discord.com/channels/{guild_id}/{row['channel_id']}/{row['update_message_id']}"
-                        if guild_id
-                        else None
+                info = self._thread_info(row["channel_id"])
+                title = self._clip((info or {}).get("name") or row["title"], 42)
+                forum = self._clip((info or {}).get("forum") or self._channel_name(row["channel_id"]), 24)
+                tags = self._clip((info or {}).get("tags") or "无标签", 42)
+                guild_id = row["guild_id"] or (self.guild.id if self.guild else None)
+                jump_url = (
+                    f"https://discord.com/channels/{guild_id}/{row['channel_id']}/{row['update_message_id']}"
+                    if guild_id
+                    else None
+                )
+                jump_text = f"[跳转]({jump_url})" if jump_url else "跳转不可用"
+                elements.append(
+                    ui.TextDisplay(
+                        content=(
+                            f"**{title}**\n"
+                            f"-# 作者: <@{row['owner_id']}> · 分区: {forum}\n"
+                            f"-# 标签: {tags} · {jump_text}"
+                        )
                     )
-                    jump_text = f"[跳转]({jump_url})" if jump_url else "跳转不可用"
-                    lines.append(f"- <@{row['owner_id']}> · **{title}** · {jump_text}")
-                elements.append(ui.TextDisplay(content="\n".join(lines)))
+                )
 
         self.btn_update_prev.disabled = self.update_page == 0
         self.btn_update_next.disabled = self.update_page >= self.update_total_pages - 1
