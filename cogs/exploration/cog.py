@@ -216,7 +216,7 @@ class ExplorationCog(commands.Cog):
         rows = await self.get_todays_update_logs(channel.guild)
         view = UpdateSummaryContainer(
             rows,
-            title="更新汇总",
+            title="✨ 更新汇总",
             user=self.bot.user,
             guild=channel.guild,
         )
