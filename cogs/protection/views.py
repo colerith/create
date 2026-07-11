@@ -72,6 +72,12 @@ FILE_TAG_OPTIONS = [
     "其他",
 ]
 
+PALETTE_HONEYDEW = 0xF6FFEA
+PALETTE_SOFT_PEACH = 0xFFDE96
+PALETTE_CORAL_GLOW = 0xFA855A
+PALETTE_TOMATO_JAM = 0xC93638
+PALETTE_SKY_BLUE = 0x62C4DA
+
 
 class _LayoutItemCallback:
     def __init__(self, callback, parent, item):
@@ -104,7 +110,7 @@ class ProtectionLayoutView(ui.LayoutView):
         super().__init__(timeout=timeout)
         self._layout_items = []
         self._layout_header_items = []
-        self._layout_accent_colour = accent_colour or discord.Color.from_rgb(135, 206, 235)
+        self._layout_accent_colour = accent_colour or PALETTE_SKY_BLUE
         self._init_decorated_items()
         self._rebuild_layout_containers()
 
@@ -1100,7 +1106,7 @@ async def check_rate_limit_and_report(
 # --- 延迟下载视图 (核心修改区域) ---
 class AuthorNoteView(ProtectionLayoutView):
     def __init__(self, bot, row):
-        super().__init__(timeout=300)
+        super().__init__(timeout=300, accent_colour=PALETTE_HONEYDEW)
         self.bot = bot
         self.row = row
         self.downloaded = False
@@ -1173,7 +1179,7 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
 # --- 自定义文件名选择视图 ---
 class FileSelectView(ProtectionLayoutView):
     def __init__(self, protection_view):
-        super().__init__(timeout=60)
+        super().__init__(timeout=60, accent_colour=PALETTE_HONEYDEW)
         self.protection_view = protection_view
         options = []
         for i, entry in enumerate(protection_view.file_entries):
@@ -1208,7 +1214,7 @@ class FileSelectView(ProtectionLayoutView):
 
 class DraftManageFilesSelectView(ProtectionLayoutView):
     def __init__(self, protection_view):
-        super().__init__(timeout=180)
+        super().__init__(timeout=180, accent_colour=PALETTE_SOFT_PEACH)
         self.protection_view = protection_view
         self.selected_index = 0
         options = []
@@ -1353,7 +1359,7 @@ class DraftManageFilesSelectView(ProtectionLayoutView):
 
 class DraftBatchFileView(ProtectionLayoutView):
     def __init__(self, protection_view, page_index=0):
-        super().__init__(timeout=120)
+        super().__init__(timeout=120, accent_colour=PALETTE_SOFT_PEACH)
         self.protection_view = protection_view
         self.page_index = page_index
         self.total_pages = max(
@@ -1441,7 +1447,7 @@ class DraftBulkFilePageModal(ui.Modal, title="批量改文件名"):
 
 class PublishedBatchFileView(ProtectionLayoutView):
     def __init__(self, message_id, file_data, page_index=0):
-        super().__init__(timeout=120)
+        super().__init__(timeout=120, accent_colour=PALETTE_SOFT_PEACH)
         self.message_id = message_id
         self.file_data = file_data
         self.page_index = page_index
@@ -1593,7 +1599,7 @@ class FileTagSelect(ui.Select):
 
 class BaseFileTagView(ProtectionLayoutView):
     def __init__(self, page_index=0, timeout=120):
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=timeout, accent_colour=PALETTE_HONEYDEW)
         self.page_index = page_index
         self.selected_file_index = 0
 
@@ -1698,7 +1704,7 @@ class PublishedTagBatchView(BaseFileTagView):
 
 class UploadSessionControlView(ProtectionLayoutView):
     def __init__(self, cog, user_id, channel_id):
-        super().__init__(timeout=UPLOAD_SESSION_TIMEOUT_SECONDS)
+        super().__init__(timeout=UPLOAD_SESSION_TIMEOUT_SECONDS, accent_colour=PALETTE_SOFT_PEACH)
         self.cog = cog
         self.user_id = user_id
         self.channel_id = channel_id
@@ -1793,7 +1799,7 @@ class UploadSessionControlView(ProtectionLayoutView):
 # --- 草稿/发布视图 ---
 class UploadSessionReusePublishedView(ProtectionLayoutView):
     def __init__(self, session_view, posts_rows):
-        super().__init__(timeout=120)
+        super().__init__(timeout=120, accent_colour=PALETTE_HONEYDEW)
         self.session_view = session_view
         self.posts_rows = posts_rows
         self.selected_message_id = str(posts_rows[0]["message_id"])
@@ -1875,7 +1881,7 @@ class UploadSessionReusePublishedView(ProtectionLayoutView):
 
 class DraftReusePublishedView(ProtectionLayoutView):
     def __init__(self, protection_view, posts_rows):
-        super().__init__(timeout=120)
+        super().__init__(timeout=120, accent_colour=PALETTE_HONEYDEW)
         self.protection_view = protection_view
         self.posts_rows = posts_rows
         self.selected_message_id = str(posts_rows[0]["message_id"])
@@ -1950,7 +1956,7 @@ class ProtectionDraftView(ProtectionLayoutView):
         default_log=None,
         draft_defaults=None,
     ):
-        super().__init__(timeout=600)
+        super().__init__(timeout=600, accent_colour=PALETTE_SKY_BLUE)
         self.bot = bot
         self.user = user
         self.attachments = attachments
@@ -2634,7 +2640,7 @@ class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
 # --- 管理视图组件 ---
 class ManageFilesSelectView(ProtectionLayoutView):
     def __init__(self, bot, owner_id, message_id, file_data, post_title):
-        super().__init__(timeout=180)
+        super().__init__(timeout=180, accent_colour=PALETTE_SOFT_PEACH)
         self.bot = bot
         self.owner_id = owner_id
         self.message_id = message_id
@@ -2817,7 +2823,7 @@ class ManageFilesSelectView(ProtectionLayoutView):
 
 class EditUnlockModeView(ProtectionLayoutView):
     def __init__(self, message_id):
-        super().__init__(timeout=60)
+        super().__init__(timeout=60, accent_colour=PALETTE_HONEYDEW)
         self.message_id = message_id
 
     async def update_mode(self, interaction, mode, needs_password=False):
@@ -2868,7 +2874,7 @@ class PostManagementView(ProtectionLayoutView):
         current_note,
         posts_rows=None,
     ):
-        super().__init__(timeout=600)
+        super().__init__(timeout=600, accent_colour=PALETTE_SKY_BLUE)
         self.message_id = message_id
         self.bot = bot
         self.file_data = [ensure_file_entry_defaults(f) for f in file_data]
@@ -3131,7 +3137,7 @@ class PostManagementView(ProtectionLayoutView):
 
 class PostSelectionView(ProtectionLayoutView):
     def __init__(self, bot, posts_rows):
-        super().__init__(timeout=60)
+        super().__init__(timeout=60, accent_colour=PALETTE_HONEYDEW)
         self.bot = bot
         self.posts_rows = posts_rows
         options = []
@@ -3185,7 +3191,7 @@ class PostSelectionView(ProtectionLayoutView):
 
 class PostListView(ProtectionLayoutView):
     def __init__(self, bot, posts_rows):
-        super().__init__(timeout=600)
+        super().__init__(timeout=600, accent_colour=PALETTE_HONEYDEW)
         self.bot = bot
         self.posts = posts_rows
         self.selected_row = None
@@ -3296,7 +3302,7 @@ class PostListView(ProtectionLayoutView):
 
 class BumpButtonView(ProtectionLayoutView):
     def __init__(self, bot, top_url: str | None = None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=None, accent_colour=PALETTE_SKY_BLUE)
         self.bot = bot
         self.top_url = top_url
         if self.top_url:
