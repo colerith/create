@@ -229,6 +229,31 @@ class ExplorationCog(commands.Cog):
             decorated.append(data)
         return decorated
 
+    async def _decorate_download_rows(self, guild: discord.Guild, rows):
+        decorated = []
+        for row in rows:
+            data = self._row_to_dict(row)
+            channel = self._resolve_item_channel(guild, data.get("channel_id"))
+            if channel is None:
+                continue
+
+            parent = getattr(channel, "parent", None)
+            data["channel_name"] = getattr(channel, "name", None) or f"频道 {data.get('channel_id')}"
+            data["forum_name"] = getattr(parent, "name", None) or data["channel_name"]
+
+            tags = []
+            if isinstance(channel, discord.Thread):
+                tags = [tag.name for tag in getattr(channel, "applied_tags", [])[:5]]
+            data["tags"] = " ".join(tags) if tags else "无标签"
+
+            owner_id = data.get("owner_id")
+            author = guild.get_member(owner_id) if owner_id else None
+            if author is None and owner_id:
+                author = self.bot.get_user(owner_id)
+            data["author_name"] = author.display_name if author else (f"用户 {owner_id}" if owner_id else "未知作者")
+            decorated.append(data)
+        return decorated
+
     async def _build_download_library_view(
         self,
         user: discord.User | discord.Member,
@@ -236,8 +261,9 @@ class ExplorationCog(commands.Cog):
         timeout: int | None = 300,
     ):
         rows = await protection_db.get_user_library_items(user.id)
+        rows = await self._decorate_download_rows(guild, rows)
         return DownloadLibraryContainer(
-            [self._row_to_dict(row) for row in rows],
+            rows,
             title="📥 下载记录",
             user=user,
             guild=guild,

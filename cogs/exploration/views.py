@@ -6,7 +6,7 @@ from datetime import datetime
 import asyncio
 import math
 
-from config import TZ_SHANGHAI
+from config import RECOMMEND_TARGET_KEYWORDS, TZ_SHANGHAI
 
 # ==========================================
 # Part 1. 核心搜索执行逻辑
@@ -531,7 +531,167 @@ class PagedRecordContainer(ui.LayoutView):
 
 class DownloadLibraryContainer(PagedRecordContainer):
     panel_type = "download_library"
-    accent_colour = discord.Color.from_rgb(93, 173, 226)
+    accent_colour = discord.Color.from_rgb(255, 183, 197)
+
+    def __init__(self, rows, title: str, user, guild: discord.Guild | None, bot: discord.Client, timeout=300):
+        self.summary_mode = "category"
+        self.btn_mode_category = ui.Button(label="分类汇总", style=discord.ButtonStyle.primary)
+        self.btn_mode_category.callback = self.on_mode_category
+        self.btn_mode_month = ui.Button(label="月份汇总", style=discord.ButtonStyle.secondary)
+        self.btn_mode_month.callback = self.on_mode_month
+        self.btn_mode_author = ui.Button(label="作者汇总", style=discord.ButtonStyle.secondary)
+        self.btn_mode_author.callback = self.on_mode_author
+        self.btn_mode_latest = ui.Button(label="无汇总", style=discord.ButtonStyle.secondary)
+        self.btn_mode_latest.callback = self.on_mode_latest
+        super().__init__(rows, title, user, guild, bot, timeout=timeout)
+
+    def _row_time(self, row):
+        return row.get("latest_update_at") or row.get("touched_at") or row.get("created_at") or ""
+
+    def _row_month(self, row):
+        raw = self._row_time(row)
+        try:
+            return datetime.fromisoformat(raw).strftime("%Y年%m月")
+        except Exception:
+            return "时间未明"
+
+    def _category_name(self, row):
+        haystack = " ".join(
+            str(row.get(key) or "")
+            for key in ("title", "channel_name", "forum_name", "tags")
+        )
+        for keyword in RECOMMEND_TARGET_KEYWORDS:
+            if keyword in haystack:
+                return keyword
+        return "其他作品"
+
+    def _grouped_blocks(self):
+        grouped = {}
+        if self.summary_mode == "month":
+            key_func = self._row_month
+        elif self.summary_mode == "author":
+            key_func = lambda row: row.get("author_name") or f"作者 {row.get('owner_id')}"
+        else:
+            key_func = self._category_name
+
+        for row in self.rows:
+            grouped.setdefault(key_func(row), []).append(row)
+
+        if self.summary_mode == "category":
+            ordered_keys = [key for key in RECOMMEND_TARGET_KEYWORDS if key in grouped]
+            ordered_keys.extend(key for key in grouped if key not in ordered_keys)
+        else:
+            ordered_keys = list(grouped.keys())
+        return [(key, grouped[key]) for key in ordered_keys]
+
+    def _item_line(self, row, idx: int | None = None):
+        title = self._clip(row.get("title"), 46)
+        author = self._clip(row.get("author_name") or f"作者 {row.get('owner_id')}", 24)
+        channel = self._clip(row.get("forum_name") or row.get("channel_name"), 28)
+        tags = self._clip(row.get("tags") or "无标签", 46)
+        post_url = self._jump_url(row.get("channel_id"), row.get("message_id"))
+        update_url = self._jump_url(row.get("channel_id"), row.get("latest_update_message_id"))
+        post_link = f"[去看看]({post_url})" if post_url else "链接暂不可用"
+        update_text = "有新鲜更新" if row.get("latest_update_at") else "暂未更新"
+        update_link = f" · [更新日志]({update_url})" if update_url else ""
+        prefix = f"{idx}. " if idx is not None else ""
+        return (
+            f"{prefix}**{title}**\n"
+            f"-# 作者: {author} · 原帖频道: {channel} · 标签: {tags}\n"
+            f"-# {update_text} · {post_link}{update_link}"
+        )
+
+    def _mode_label(self):
+        labels = {
+            "category": "按奇米蛋分区小篮子收好啦",
+            "month": "按月份把下载足迹叠成小册子",
+            "author": "按作者摆成一排创作小摊",
+            "latest": "从最新到最旧，一路顺滑翻下去",
+        }
+        return labels.get(self.summary_mode, labels["category"])
+
+    def update_container(self):
+        self.clear_items()
+        timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
+        icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
+        self.per_page = 5 if self.summary_mode == "latest" else 3
+        data_units = self.rows if self.summary_mode == "latest" else self._grouped_blocks()
+        self.total_pages = math.ceil(len(data_units) / self.per_page) if data_units else 1
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+        elements = [
+            ui.Section(
+                ui.TextDisplay(content=f"### 🥚 下载记录小窝\n摸摸蛋壳，今天帮你收好 **{len(self.rows)}** 个看过/关注过的作品。"),
+                ui.TextDisplay(content=f"-# {self._mode_label()} · 最后更新: {timestamp}"),
+                accessory=ui.Thumbnail(media=icon_url),
+            ),
+            ui.Separator(),
+        ]
+
+        if not data_units:
+            elements.append(
+                ui.TextDisplay(
+                    content=(
+                        "### 🌸 小篮子还是空的\n"
+                        "下载、点赞或评论过的保护帖会出现在这里；有更新日志的作品会被悄悄捧到前面。"
+                    )
+                )
+            )
+        else:
+            start = self.current_page * self.per_page
+            current_units = data_units[start : start + self.per_page]
+            if self.summary_mode == "latest":
+                lines = [self._item_line(row, idx) for idx, row in enumerate(current_units, start=start + 1)]
+                elements.append(ui.TextDisplay(content="### 🐣 最新足迹\n" + "\n\n".join(lines)))
+            else:
+                for group_name, group_rows in current_units:
+                    preview_rows = group_rows[:3]
+                    lines = [self._item_line(row) for row in preview_rows]
+                    more = f"\n-# 还有 {len(group_rows) - len(preview_rows)} 个作品藏在这个小格子里。" if len(group_rows) > len(preview_rows) else ""
+                    elements.append(
+                        ui.TextDisplay(
+                            content=f"### ✨ {self._clip(group_name, 32)} · {len(group_rows)} 个\n" + "\n\n".join(lines) + more
+                        )
+                    )
+
+        self.btn_prev.disabled = self.current_page == 0
+        self.btn_next.disabled = self.current_page >= self.total_pages - 1
+        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
+        for mode, button in (
+            ("category", self.btn_mode_category),
+            ("month", self.btn_mode_month),
+            ("author", self.btn_mode_author),
+            ("latest", self.btn_mode_latest),
+        ):
+            button.style = discord.ButtonStyle.primary if self.summary_mode == mode else discord.ButtonStyle.secondary
+
+        action_rows = [
+            ui.ActionRow(self.btn_mode_category, self.btn_mode_month, self.btn_mode_author, self.btn_mode_latest),
+            ui.ActionRow(self.btn_push_dm, self.btn_delete_dm),
+        ]
+        if self.total_pages > 1:
+            action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+
+        self.add_item(ui.Container(*elements, *action_rows, accent_colour=self.accent_colour))
+
+    async def _set_mode(self, interaction: discord.Interaction, mode: str):
+        self.summary_mode = mode
+        self.current_page = 0
+        self.update_container()
+        await interaction.response.edit_message(view=self)
+
+    async def on_mode_category(self, interaction: discord.Interaction):
+        await self._set_mode(interaction, "category")
+
+    async def on_mode_month(self, interaction: discord.Interaction):
+        await self._set_mode(interaction, "month")
+
+    async def on_mode_author(self, interaction: discord.Interaction):
+        await self._set_mode(interaction, "author")
+
+    async def on_mode_latest(self, interaction: discord.Interaction):
+        await self._set_mode(interaction, "latest")
 
     def _row_lines(self, current_rows):
         if not current_rows:
