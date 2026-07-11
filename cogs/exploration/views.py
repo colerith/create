@@ -851,7 +851,11 @@ class MyWorksFilterView(ui.View):
             max_values=len(options),
             row=0,
         )
+        self.category_select.callback = self.on_category_select
         self.add_item(self.category_select)
+
+    async def on_category_select(self, interaction: discord.Interaction):
+        await interaction.response.defer()
 
     @ui.button(label="查看我的作品", style=discord.ButtonStyle.primary, row=1, emoji="📚")
     async def confirm(self, interaction: discord.Interaction, button: ui.Button):

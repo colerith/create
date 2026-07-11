@@ -227,7 +227,7 @@ class ExplorationCog(commands.Cog):
         decorated = []
         for row in rows:
             data = self._row_to_dict(row)
-            channel = await self._resolve_item_channel_deep(guild, data.get("channel_id"))
+            channel = self._resolve_item_channel(guild, data.get("channel_id"))
             if channel is None:
                 continue
             parent = getattr(channel, "parent", None)
@@ -250,7 +250,7 @@ class ExplorationCog(commands.Cog):
         decorated = []
         for row in rows:
             data = self._row_to_dict(row)
-            channel = await self._resolve_item_channel_deep(guild, data.get("channel_id"))
+            channel = self._resolve_item_channel(guild, data.get("channel_id"))
             if channel is None:
                 continue
 
