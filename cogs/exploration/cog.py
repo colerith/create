@@ -207,14 +207,27 @@ class ExplorationCog(commands.Cog):
         return {key: row[key] for key in row.keys()}
 
     def _resolve_item_channel(self, guild: discord.Guild, channel_id: int | None):
-        return guild.get_channel(channel_id) if guild and channel_id else None
+        if not guild or not channel_id:
+            return None
+        return guild.get_channel(channel_id) or guild.get_thread(channel_id)
+
+    async def _resolve_item_channel_deep(self, guild: discord.Guild, channel_id: int | None):
+        channel = self._resolve_item_channel(guild, channel_id)
+        if channel is not None:
+            return channel
+        if not guild or not channel_id:
+            return None
+        try:
+            return await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
 
     async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_channel_ids: list[int] | None = None):
         selected = set(selected_channel_ids or [])
         decorated = []
         for row in rows:
             data = self._row_to_dict(row)
-            channel = self._resolve_item_channel(guild, data.get("channel_id"))
+            channel = await self._resolve_item_channel_deep(guild, data.get("channel_id"))
             parent = getattr(channel, "parent", None)
             if selected:
                 channel_matches = data.get("channel_id") in selected
@@ -233,7 +246,7 @@ class ExplorationCog(commands.Cog):
         decorated = []
         for row in rows:
             data = self._row_to_dict(row)
-            channel = self._resolve_item_channel(guild, data.get("channel_id"))
+            channel = await self._resolve_item_channel_deep(guild, data.get("channel_id"))
             if channel is None:
                 continue
 
