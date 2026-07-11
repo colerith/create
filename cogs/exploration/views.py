@@ -586,7 +586,7 @@ class DownloadLibraryContainer(PagedRecordContainer):
 
     def _display_units(self):
         units = []
-        chunk_size = 4
+        chunk_size = 3
         if self.summary_mode == "latest":
             for start in range(0, len(self.rows), chunk_size):
                 units.append(("最新足迹", self.rows[start : start + chunk_size], start, len(self.rows)))
@@ -598,11 +598,11 @@ class DownloadLibraryContainer(PagedRecordContainer):
         return units
 
     def _item_line(self, row, idx: int | None = None):
-        title = self._clip(row.get("title"), 46)
-        post_name = self._clip(row.get("post_name") or row.get("channel_name") or title, 46)
-        author = self._clip(row.get("author_name") or f"作者 {row.get('owner_id')}", 24)
-        channel = self._clip(row.get("forum_name") or row.get("channel_name"), 28)
-        tags = self._clip(row.get("tags") or "无标签", 46)
+        title = self._clip(row.get("title"), 34)
+        post_name = self._clip(row.get("post_name") or row.get("channel_name") or title, 34)
+        author = self._clip(row.get("author_name") or f"作者 {row.get('owner_id')}", 18)
+        channel = self._clip(row.get("forum_name") or row.get("channel_name"), 20)
+        tags = self._clip(row.get("tags") or "无标签", 28)
         post_url = self._jump_url(row.get("channel_id"), row.get("message_id"))
         update_url = self._jump_url(row.get("channel_id"), row.get("latest_update_message_id"))
         post_link = f"[去看看]({post_url})" if post_url else "链接暂不可用"
@@ -611,8 +611,8 @@ class DownloadLibraryContainer(PagedRecordContainer):
         prefix = f"{idx}. " if idx is not None else ""
         return (
             f"{prefix}**{title}**\n"
-            f"-# 作者: {author} · 原帖: **{post_name}** · 频道: {channel}\n"
-            f"-# 标签: {tags}\n"
+            f"-# 作者: {author} · 原帖: {post_name}\n"
+            f"-# 频道: {channel} · 标签: {tags}\n"
             f"-# {update_text} · {post_link}{update_link}"
         )
 
@@ -629,7 +629,7 @@ class DownloadLibraryContainer(PagedRecordContainer):
         self.clear_items()
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
         icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
-        self.per_page = 5
+        self.per_page = 2
         data_units = self._display_units()
         self.total_pages = math.ceil(len(data_units) / self.per_page) if data_units else 1
         if self.current_page >= self.total_pages:
@@ -672,9 +672,10 @@ class DownloadLibraryContainer(PagedRecordContainer):
                 else:
                     title = f"### ✨ {self._clip(group_name, 32)} · {start_no}-{end_no}/{group_total}"
                     lines = [self._item_line(row) for row in group_rows]
+                block_content = title + "\n" + "\n\n".join(lines)
                 self.add_item(
                     ui.Container(
-                        ui.TextDisplay(content=title + "\n" + "\n\n".join(lines)),
+                        ui.TextDisplay(content=block_content),
                         accent_colour=discord.Color.from_rgb(255, 224, 232),
                     )
                 )
