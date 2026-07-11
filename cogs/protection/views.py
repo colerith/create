@@ -2114,6 +2114,108 @@ class ProtectionDraftView(ProtectionLayoutView):
     def count_tagged_files(self):
         return sum(1 for entry in self.file_entries if entry.get("tag"))
 
+    def _short_text(self, value, empty_text="已关闭", limit=90):
+        if not value:
+            return empty_text
+        value = str(value).replace("\n", " ").strip()
+        return value[: limit - 3] + "..." if len(value) > limit else value
+
+    def _file_status_text(self):
+        renamed_count = len(self.custom_names)
+        tagged_count = self.count_tagged_files()
+        parts = [f"{len(self.attachments)} 个"]
+        if renamed_count:
+            parts.append(f"已改名 {renamed_count} 个")
+        if tagged_count:
+            parts.append(f"已标记 {tagged_count} 个")
+        return " / ".join(parts)
+
+    def _mode_label(self):
+        mode_map = {
+            "like": "仅点赞",
+            "like_comment": "互动（点赞+评论）",
+            "like_password": "点赞 + 提取码",
+            "like_comment_password": "互动 + 提取码",
+        }
+        return mode_map.get(self.draft_mode, "仅点赞")
+
+    def _update_dashboard_buttons(self):
+        mode_buttons = {
+            "like": self.mode_like,
+            "like_comment": self.mode_like_comment,
+            "like_password": self.mode_like_pass,
+            "like_comment_password": self.mode_like_comm_pass,
+        }
+        for mode, button in mode_buttons.items():
+            button.style = (
+                discord.ButtonStyle.success
+                if self.draft_mode == mode
+                else discord.ButtonStyle.secondary
+            )
+
+        self.mode_like.label = "仅点赞"
+        self.mode_like_comment.label = "互动（点赞+评论）"
+        self.mode_like_pass.label = "点赞 + 提取码"
+        self.mode_like_comm_pass.label = "互动 + 提取码"
+        self.toggle_mention_users.label = (
+            "艾特贴内用户：开启" if self.mention_users else "艾特贴内用户：关闭"
+        )
+        self.toggle_mention_users.style = (
+            discord.ButtonStyle.primary
+            if self.mention_users
+            else discord.ButtonStyle.secondary
+        )
+
+    def _build_action_rows(self):
+        if not hasattr(self, "draft_title"):
+            return super()._build_action_rows()
+
+        self._update_dashboard_buttons()
+        password_text = (
+            f"已设置：||{self.draft_password}||"
+            if self.draft_password
+            else "留空为关闭"
+        )
+        note_text = self._short_text(self.draft_log, empty_text="已关闭")
+        update_log_text = self._short_text(self.draft_update_log, empty_text="已关闭")
+        mention_text = "已开启，发布更新时会提醒贴内用户" if self.mention_users else "已关闭"
+
+        return [
+            ui.TextDisplay(content="### 作品发布面板"),
+            ui.TextDisplay(
+                content=(
+                    f"**当前标题:** {self.draft_title}\n"
+                    f"**当前附件:** {self._file_status_text()}\n"
+                    f"**获取需求:** {self._mode_label()}\n"
+                    f"**提取码:** {password_text}\n"
+                    f"**作者声明:** {note_text}"
+                )
+            ),
+            ui.Separator(),
+            ui.TextDisplay(content="**基础信息**\n设置作品标题、作者声明和更新日志。"),
+            ui.ActionRow(self.btn_set_title, self.btn_set_note, self.btn_set_update_log),
+            ui.TextDisplay(content=f"**更新日志:** {update_log_text}"),
+            ui.ActionRow(self.btn_view_files),
+            ui.Separator(),
+            ui.TextDisplay(
+                content=(
+                    "**附件管理**\n"
+                    "建议单个文件不超过 10MB。支持改名、替换、删除、批量编辑、标签和复用已发布附件。"
+                )
+            ),
+            ui.ActionRow(self.btn_rename_files, self.btn_batch_edit_files, self.btn_set_tags),
+            ui.ActionRow(self.btn_reuse_published, self.btn_append_files),
+            ui.Separator(),
+            ui.TextDisplay(content=f"**获取需求:** {self._mode_label()}"),
+            ui.ActionRow(self.mode_like, self.mode_like_comment),
+            ui.ActionRow(self.mode_like_pass, self.mode_like_comm_pass),
+            ui.TextDisplay(content=f"**贴内提醒:** {mention_text}"),
+            ui.ActionRow(self.toggle_mention_users),
+            ui.Separator(),
+            ui.TextDisplay(content="**发布区**\n确认无误后发布作品；取消会关闭当前草稿面板。\n-# 只有你可以看到此面板。"),
+            ui.ActionRow(self.btn_confirm, self.btn_cancel),
+        ]
+
     def build_dashboard_embed(self):
         log_preview = (
             self.draft_log[:50] + "..."
@@ -2158,30 +2260,25 @@ class ProtectionDraftView(ProtectionLayoutView):
         if not self.dashboard_message:
             return
         try:
-            await self.dashboard_message.edit(
-                content=None,
-                embed=self.build_dashboard_embed(),
-                view=self,
-            )
+            self._layout_header_items = []
+            self._rebuild_layout_containers()
+            await self.dashboard_message.edit(view=self)
         except Exception:
             pass
 
     async def update_dashboard(self, interaction: discord.Interaction):
-        embed = self.build_dashboard_embed()
         if self.dashboard_message is None and interaction.message:
             self.dashboard_message = interaction.message
+        self._layout_header_items = []
+        self._rebuild_layout_containers()
 
         if interaction.response.is_done():
             try:
-                await interaction.edit_original_response(
-                    **self.to_message_kwargs(embed=embed)
-                )
+                await interaction.edit_original_response(view=self)
             except:
                 await self.refresh_dashboard_message()
         else:
-            await interaction.response.edit_message(
-                **self.to_message_kwargs(embed=embed)
-            )
+            await interaction.response.edit_message(view=self)
             self.dashboard_message = interaction.message
 
     @ui.button(label="修改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
