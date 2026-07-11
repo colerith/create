@@ -103,6 +103,39 @@ async def record_attachment_update_publish_log(
         await db.commit()
 
 
+async def get_attachment_update_publish_logs_since(
+    timestamp: str,
+    guild_id: int | None = None,
+    limit: int = 200,
+):
+    """获取指定时间后通过 bot 发布的附件更新日志。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        if guild_id is None:
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM attachment_update_publish_log
+                WHERE timestamp >= ?
+                ORDER BY timestamp DESC, log_id DESC
+                LIMIT ?
+                """,
+                (timestamp, limit),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM attachment_update_publish_log
+                WHERE timestamp >= ? AND (guild_id = ? OR guild_id IS NULL)
+                ORDER BY timestamp DESC, log_id DESC
+                LIMIT ?
+                """,
+                (timestamp, guild_id, limit),
+            )
+        return await cursor.fetchall()
+
+
 async def log_file_trace(
     trace_id: str,
     user_id: int,

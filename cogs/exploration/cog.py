@@ -10,7 +10,7 @@ from discord import app_commands, ui
 from discord.ext import commands, tasks
 
 from config import EXPLORATION_TARGET_CHANNEL_IDS, ADMIN_USER_ID, TZ_SHANGHAI
-from .views import SearchPanelContainer, SearchResultContainer
+from .views import SearchPanelContainer, SearchResultContainer, UpdateSummaryContainer
 from ..core.db import get_panel_message_id, set_panel_message_id, remove_panel_record
 from ..protection import db as protection_db
 
@@ -203,6 +203,48 @@ class ExplorationCog(commands.Cog):
         threads_list.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
         return threads_list
 
+    async def get_todays_update_logs(self, guild: discord.Guild):
+        """获取今天发布过更新日志的作品记录。"""
+        today_start = datetime.now(TZ_SHANGHAI).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        return await protection_db.get_attachment_update_publish_logs_since(
+            today_start,
+            guild_id=guild.id,
+        )
+
+    async def refresh_channel_update_summary_panel(self, channel: discord.TextChannel, resend: bool = False):
+        """刷新日报下方的更新汇总面板。"""
+        rows = await self.get_todays_update_logs(channel.guild)
+        view = UpdateSummaryContainer(
+            rows,
+            title="更新汇总",
+            user=self.bot.user,
+            guild=channel.guild,
+        )
+        panel_type = "daily_update_summary"
+        message_id = await get_panel_message_id(channel.id, panel_type)
+
+        if message_id and not resend:
+            try:
+                target_msg = await channel.fetch_message(message_id)
+                await target_msg.edit(view=view)
+                return
+            except discord.NotFound:
+                await remove_panel_record(channel.id, panel_type)
+            except Exception as e:
+                print(f"编辑数据库记录的更新汇总面板({message_id})失败: {e}")
+
+        if resend and message_id:
+            try:
+                old_msg = await channel.fetch_message(message_id)
+                await old_msg.delete()
+            except discord.NotFound:
+                pass
+            finally:
+                await remove_panel_record(channel.id, panel_type)
+
+        new_msg = await channel.send(view=view)
+        await set_panel_message_id(channel.id, new_msg.id, panel_type)
+
     async def refresh_channel_daily_panel(self, channel: discord.TextChannel, resend: bool = False):
         """刷新频道日报面板。"""
         threads = await self.get_todays_threads(channel.guild)
@@ -216,6 +258,7 @@ class ExplorationCog(commands.Cog):
             try:
                 target_msg = await channel.fetch_message(message_id)
                 await target_msg.edit(view=view)
+                await self.refresh_channel_update_summary_panel(channel, resend=False)
                 return
             except discord.NotFound:
                 await remove_panel_record(channel.id, "daily_report")
@@ -230,6 +273,16 @@ class ExplorationCog(commands.Cog):
                 pass
             finally:
                 await remove_panel_record(channel.id, "daily_report")
+
+        summary_message_id = await get_panel_message_id(channel.id, "daily_update_summary")
+        if resend and summary_message_id:
+            try:
+                old_summary_msg = await channel.fetch_message(summary_message_id)
+                await old_summary_msg.delete()
+            except discord.NotFound:
+                pass
+            finally:
+                await remove_panel_record(channel.id, "daily_update_summary")
 
         if resend:
             try:
@@ -247,6 +300,7 @@ class ExplorationCog(commands.Cog):
 
         new_msg = await channel.send(view=view)
         await set_panel_message_id(channel.id, new_msg.id, "daily_report")
+        await self.refresh_channel_update_summary_panel(channel, resend=False)
 
     @tasks.loop(minutes=10)
     async def daily_task(self):

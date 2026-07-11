@@ -141,11 +141,32 @@ async def init_db():
         # --- 【新增】第8步：持久化面板记录表 ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS panel_records (
-                channel_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                panel_type TEXT NOT NULL DEFAULT 'daily_report',
                 message_id INTEGER NOT NULL,
-                panel_type TEXT NOT NULL DEFAULT 'daily_report'
+                PRIMARY KEY (channel_id, panel_type)
             )
         """)
+        cursor = await db.execute("PRAGMA table_info(panel_records)")
+        panel_columns = await cursor.fetchall()
+        channel_pk = next((col[5] for col in panel_columns if col[1] == "channel_id"), 0)
+        panel_type_pk = next((col[5] for col in panel_columns if col[1] == "panel_type"), 0)
+        if channel_pk and not panel_type_pk:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS panel_records_new (
+                    channel_id INTEGER NOT NULL,
+                    panel_type TEXT NOT NULL DEFAULT 'daily_report',
+                    message_id INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, panel_type)
+                )
+            """)
+            await db.execute("""
+                INSERT OR IGNORE INTO panel_records_new (channel_id, panel_type, message_id)
+                SELECT channel_id, COALESCE(panel_type, 'daily_report'), message_id
+                FROM panel_records
+            """)
+            await db.execute("DROP TABLE panel_records")
+            await db.execute("ALTER TABLE panel_records_new RENAME TO panel_records")
         # 为 panel_type 创建索引可以加快查询速度
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_panel_type ON panel_records (panel_type)"
@@ -182,8 +203,12 @@ async def set_panel_message_id(
     """设置或更新面板的消息ID"""
     async with get_db() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO panel_records (channel_id, message_id, panel_type) VALUES (?, ?, ?)",
-            (channel_id, message_id, panel_type),
+            """
+            INSERT INTO panel_records (channel_id, panel_type, message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(channel_id, panel_type) DO UPDATE SET message_id = excluded.message_id
+            """,
+            (channel_id, panel_type, message_id),
         )
         await db.commit()
 

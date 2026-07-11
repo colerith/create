@@ -230,6 +230,117 @@ class SearchResultContainer(ui.LayoutView):
             await interaction.response.edit_message(view=self)
 
 
+class UpdateSummaryContainer(ui.LayoutView):
+    """日报下方的当日附件更新汇总面板。"""
+
+    def __init__(self, rows, title: str, user, guild: discord.Guild | None = None):
+        super().__init__(timeout=None)
+        self.rows = list(rows)
+        self.title = title
+        self.user = user
+        self.guild = guild
+        self.per_page = 8
+        self.current_page = 0
+        self.total_pages = math.ceil(len(self.rows) / self.per_page) if self.rows else 1
+
+        self.btn_prev = ui.Button(emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id=f"update_prev_{id(self)}")
+        self.btn_prev.callback = self.on_prev
+
+        self.btn_next = ui.Button(emoji="➡️", style=discord.ButtonStyle.secondary, custom_id=f"update_next_{id(self)}")
+        self.btn_next.callback = self.on_next
+
+        self.btn_indicator = ui.Button(label=f"1/{self.total_pages}", disabled=True, style=discord.ButtonStyle.secondary)
+
+        self.update_container()
+
+    @staticmethod
+    def _clip(text, limit: int) -> str:
+        text = "未命名" if text is None else str(text).strip()
+        if not text:
+            text = "未命名"
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)] + "…"
+
+    def _channel_name(self, channel_id: int) -> str:
+        channel = self.guild.get_channel(channel_id) if self.guild else None
+        return channel.name if channel else f"频道 {channel_id}"
+
+    def update_container(self):
+        self.clear_items()
+
+        timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
+        icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
+        header_desc = (
+            f"### {self.title}\n今日共记录 **{len(self.rows)}** 条作品更新。"
+            if self.rows
+            else f"### {self.title}\n今天还没有发布更新日志的作品。"
+        )
+
+        elements = [
+            ui.Section(
+                ui.TextDisplay(content=header_desc),
+                ui.TextDisplay(content=f"-# 最后更新: {timestamp}"),
+                accessory=ui.Thumbnail(media=icon_url),
+            ),
+            ui.Separator(),
+        ]
+
+        start = self.current_page * self.per_page
+        current_rows = self.rows[start : start + self.per_page]
+
+        if not current_rows:
+            elements.append(ui.TextDisplay(content="*暂无更新记录*"))
+        else:
+            grouped = {}
+            for row in current_rows:
+                grouped.setdefault(row["channel_id"], []).append(row)
+
+            for channel_id, channel_rows in grouped.items():
+                lines = [f"**#{self._channel_name(channel_id)}**"]
+                for row in channel_rows:
+                    title = self._clip(row["title"], 48)
+                    log_title = self._clip(f"{title} 更新日志", 56)
+                    guild_id = row["guild_id"] or (self.guild.id if self.guild else None)
+                    jump_url = (
+                        f"https://discord.com/channels/{guild_id}/{row['channel_id']}/{row['update_message_id']}"
+                        if guild_id
+                        else None
+                    )
+                    jump_text = f"[跳转]({jump_url})" if jump_url else "跳转不可用"
+                    lines.append(
+                        f"- 作者: <@{row['owner_id']}> | 作品: **{title}** | 日志: **{log_title}** | {jump_text}"
+                    )
+                elements.append(ui.TextDisplay(content="\n".join(lines)))
+
+        self.btn_prev.disabled = self.current_page == 0
+        self.btn_next.disabled = self.current_page >= self.total_pages - 1
+        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
+
+        action_rows = []
+        if self.total_pages > 1:
+            action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+
+        container = ui.Container(
+            *elements,
+            *action_rows,
+            accent_colour=discord.Color.green(),
+        )
+        self.add_item(container)
+
+    async def on_prev(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_container()
+            await interaction.response.edit_message(view=self)
+
+    async def on_next(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_container()
+            await interaction.response.edit_message(view=self)
+
+
 class SearchPanelContainer(ui.LayoutView):
     """
     永久搜索面板 (Container版)
