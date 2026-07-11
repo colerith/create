@@ -103,9 +103,71 @@ class ProtectionLayoutView(ui.LayoutView):
     ):
         super().__init__(timeout=timeout)
         self._layout_items = []
+        self._layout_header_items = []
         self._layout_accent_colour = accent_colour or discord.Color.from_rgb(135, 206, 235)
         self._init_decorated_items()
         self._rebuild_layout_containers()
+
+    def set_message_content(
+        self,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+    ):
+        self._layout_header_items = self._build_header_items(content=content, embed=embed)
+        self._rebuild_layout_containers()
+        return self
+
+    def to_message_kwargs(
+        self,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        **kwargs,
+    ):
+        self.set_message_content(content=content, embed=embed)
+        kwargs["view"] = self
+        return kwargs
+
+    def _build_header_items(
+        self,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+    ):
+        parts = []
+        if content:
+            parts.append(str(content))
+
+        if embed:
+            embed_parts = []
+            if embed.title:
+                embed_parts.append(f"### {embed.title}")
+            if embed.description:
+                embed_parts.append(str(embed.description))
+            for field in embed.fields:
+                name = getattr(field, "name", None)
+                value = getattr(field, "value", None)
+                if name and value:
+                    embed_parts.append(f"**{name}**\n{value}")
+            footer_text = getattr(getattr(embed, "footer", None), "text", None)
+            if footer_text:
+                embed_parts.append(f"-# {footer_text}")
+            if embed_parts:
+                parts.append("\n\n".join(embed_parts))
+
+        header_items = []
+        for part in parts:
+            text = part.strip()
+            if not text:
+                continue
+            while len(text) > 4000:
+                header_items.append(ui.TextDisplay(content=text[:4000]))
+                text = text[4000:]
+            header_items.append(ui.TextDisplay(content=text))
+        if header_items:
+            header_items.append(ui.Separator())
+        return header_items
 
     def _init_decorated_items(self):
         for raw in getattr(self, "__view_children_items__", {}).values():
@@ -158,7 +220,7 @@ class ProtectionLayoutView(ui.LayoutView):
         return 1 + len(getattr(row, "children", []))
 
     def _rebuild_layout_containers(self):
-        rows = self._build_action_rows()
+        rows = [*self._layout_header_items, *self._build_action_rows()]
         super().clear_items()
         current_rows = []
         current_count = 1
@@ -1085,9 +1147,13 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
 
     # 发送消息（按钮初始是禁用的）
     if interaction.response.is_done():
-        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        msg = await interaction.followup.send(
+            **view.to_message_kwargs(embed=embed, ephemeral=True)
+        )
     else:
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            **view.to_message_kwargs(embed=embed, ephemeral=True)
+        )
         msg = await interaction.original_response()
 
     # 延时 5 秒
@@ -1164,10 +1230,10 @@ class DraftManageFilesSelectView(ProtectionLayoutView):
         for idx, option in enumerate(self.select.options):
             option.default = idx == self.selected_index
         entry = self.protection_view.file_entries[self.selected_index]
-        await interaction.response.edit_message(
-            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}",
-            view=self,
+        self.set_message_content(
+            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}"
         )
+        await interaction.response.edit_message(view=self)
 
     @ui.button(label="改名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
     async def rename_file(self, interaction: discord.Interaction, button: ui.Button):
@@ -1237,10 +1303,10 @@ class DraftManageFilesSelectView(ProtectionLayoutView):
             option.default = idx == self.selected_index
 
         try:
-            await interaction.message.edit(
-                content=f"当前选中：{build_file_line(self.protection_view.file_entries[self.selected_index], self.selected_index + 1)}",
-                view=self,
+            self.set_message_content(
+                content=f"当前选中：{build_file_line(self.protection_view.file_entries[self.selected_index], self.selected_index + 1)}"
             )
+            await interaction.message.edit(view=self)
         except Exception:
             pass
 
@@ -1276,13 +1342,13 @@ class DraftManageFilesSelectView(ProtectionLayoutView):
             )
 
         await self.protection_view.refresh_dashboard_message()
-        await interaction.response.edit_message(
+        self.set_message_content(
             content=(
                 f"✅ 已删除：{removed.get('filename', 'unknown')}\n"
                 f"当前选中：{build_file_line(self.protection_view.file_entries[self.selected_index], self.selected_index + 1)}"
-            ),
-            view=self,
+            )
         )
+        await interaction.response.edit_message(view=self)
 
 
 class DraftBatchFileView(ProtectionLayoutView):
@@ -1317,7 +1383,8 @@ class DraftBatchFileView(ProtectionLayoutView):
         self.page_index -= 1
         self._update_button_state()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
     @ui.button(label="批量编辑", style=discord.ButtonStyle.primary)
     async def btn_open(self, interaction: discord.Interaction, button: ui.Button):
@@ -1330,7 +1397,8 @@ class DraftBatchFileView(ProtectionLayoutView):
         self.page_index += 1
         self._update_button_state()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
 
 class DraftBulkFilePageModal(ui.Modal, title="批量改文件名"):
@@ -1399,7 +1467,8 @@ class PublishedBatchFileView(ProtectionLayoutView):
         self.page_index -= 1
         self._update_button_state()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
     @ui.button(label="批量编辑", style=discord.ButtonStyle.primary)
     async def btn_open(self, interaction: discord.Interaction, button: ui.Button):
@@ -1413,7 +1482,8 @@ class PublishedBatchFileView(ProtectionLayoutView):
         self.page_index += 1
         self._update_button_state()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
 
 class PublishedBulkFilePageModal(ui.Modal, title="批量改已发布文件名"):
@@ -1486,7 +1556,8 @@ class FileTargetSelect(ui.Select):
         self.owner_view.selected_file_index = int(self.values[0])
         self.owner_view.refresh_components()
         _, _, preview = self.owner_view.build_preview()
-        await interaction.response.edit_message(content=preview, view=self.owner_view)
+        self.owner_view.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self.owner_view)
 
 
 class FileTagSelect(ui.Select):
@@ -1541,7 +1612,8 @@ class BaseFileTagView(ProtectionLayoutView):
         await self.persist()
         self.refresh_components()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
     def refresh_components(self):
         self.clear_items()
@@ -1571,14 +1643,16 @@ class BaseFileTagView(ProtectionLayoutView):
         self.page_index -= 1
         self.refresh_components()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
     @ui.button(label="下一页", style=discord.ButtonStyle.secondary)
     async def btn_next(self, interaction: discord.Interaction, button: ui.Button):
         self.page_index += 1
         self.refresh_components()
         _, _, preview = self.build_preview()
-        await interaction.response.edit_message(content=preview, view=self)
+        self.set_message_content(content=preview)
+        await interaction.response.edit_message(view=self)
 
 
 class DraftTagBatchView(BaseFileTagView):
@@ -1677,8 +1751,7 @@ class UploadSessionControlView(ProtectionLayoutView):
     @ui.button(label="刷新状态", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def refresh_status(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(
-            embed=self._build_embed(),
-            view=self,
+            **self.to_message_kwargs(embed=self._build_embed())
         )
 
     @ui.button(label="复用已发布", style=discord.ButtonStyle.secondary, emoji="♻️")
@@ -1689,10 +1762,12 @@ class UploadSessionControlView(ProtectionLayoutView):
                 "❌ 你的附件库里还没有已发布内容可复用。",
                 ephemeral=True,
             )
+        view = UploadSessionReusePublishedView(self, rows)
         await interaction.response.send_message(
-            "请选择要导入到当前收集会话的已发布附件批次：",
-            view=UploadSessionReusePublishedView(self, rows),
-            ephemeral=True,
+            **view.to_message_kwargs(
+                content="请选择要导入到当前收集会话的已发布附件批次：",
+                ephemeral=True,
+            )
         )
 
     @ui.button(label="上传完毕", style=discord.ButtonStyle.success, emoji="✅")
@@ -1788,8 +1863,7 @@ class UploadSessionReusePublishedView(ProtectionLayoutView):
         await interaction.response.defer(ephemeral=True)
         try:
             await interaction.edit_original_response(
-                embed=self.session_view._build_embed(),
-                view=self.session_view,
+                **self.session_view.to_message_kwargs(embed=self.session_view._build_embed())
             )
         except Exception:
             pass
@@ -2027,9 +2101,7 @@ class ProtectionDraftView(ProtectionLayoutView):
 
         view = UploadSessionControlView(cog, interaction.user.id, interaction.channel.id)
         await interaction.response.send_message(
-            embed=view._build_embed(),
-            view=view,
-            ephemeral=True,
+            **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
 
     def sync_custom_names_from_entries(self):
@@ -2102,13 +2174,13 @@ class ProtectionDraftView(ProtectionLayoutView):
         if interaction.response.is_done():
             try:
                 await interaction.edit_original_response(
-                    content=None, embed=embed, view=self
+                    **self.to_message_kwargs(embed=embed)
                 )
             except:
                 await self.refresh_dashboard_message()
         else:
             await interaction.response.edit_message(
-                content=None, embed=embed, view=self
+                **self.to_message_kwargs(embed=embed)
             )
             self.dashboard_message = interaction.message
 
@@ -2126,10 +2198,12 @@ class ProtectionDraftView(ProtectionLayoutView):
 
     @ui.button(label="单文件操作", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
     async def btn_rename_files(self, i: discord.Interaction, b: ui.Button):
+        view = DraftManageFilesSelectView(self)
         await i.response.send_message(
-            "请选择文件并执行操作（改名/替换/删除）：",
-            view=DraftManageFilesSelectView(self),
-            ephemeral=True,
+            **view.to_message_kwargs(
+                content="请选择文件并执行操作（改名/替换/删除）：",
+                ephemeral=True,
+            )
         )
 
     @ui.button(
@@ -2138,13 +2212,17 @@ class ProtectionDraftView(ProtectionLayoutView):
     async def btn_batch_edit_files(self, i: discord.Interaction, b: ui.Button):
         view = DraftBatchFileView(self)
         _, _, preview = view.build_preview()
-        await i.response.send_message(preview, view=view, ephemeral=True)
+        await i.response.send_message(
+            **view.to_message_kwargs(content=preview, ephemeral=True)
+        )
 
     @ui.button(label="设置标签", style=discord.ButtonStyle.secondary, row=1, emoji="🏷️")
     async def btn_set_tags(self, i: discord.Interaction, b: ui.Button):
         view = DraftTagBatchView(self)
         _, _, preview = view.build_preview()
-        await i.response.send_message(preview, view=view, ephemeral=True)
+        await i.response.send_message(
+            **view.to_message_kwargs(content=preview, ephemeral=True)
+        )
 
     @ui.button(label="查看文件", style=discord.ButtonStyle.secondary, row=0, emoji="📦")
     async def btn_view_files(self, i: discord.Interaction, b: ui.Button):
@@ -2163,10 +2241,12 @@ class ProtectionDraftView(ProtectionLayoutView):
                 "❌ 你的附件库里还没有已发布内容可复用。",
                 ephemeral=True,
             )
+        view = DraftReusePublishedView(self, rows)
         await i.response.send_message(
-            "请选择要导入到当前草稿的已发布附件批次：",
-            view=DraftReusePublishedView(self, rows),
-            ephemeral=True,
+            **view.to_message_kwargs(
+                content="请选择要导入到当前草稿的已发布附件批次：",
+                ephemeral=True,
+            )
         )
 
     @ui.button(label="追加附件", style=discord.ButtonStyle.primary, row=1, emoji="➕")
@@ -2485,10 +2565,10 @@ class ManageFilesSelectView(ProtectionLayoutView):
         for idx, option in enumerate(self.select.options):
             option.default = idx == self.selected_index
         entry = self.file_data[self.selected_index]
-        await interaction.response.edit_message(
-            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}",
-            view=self,
+        self.set_message_content(
+            content=f"当前选中：{build_file_line(entry, self.selected_index + 1)}"
         )
+        await interaction.response.edit_message(view=self)
 
     @ui.button(label="改名", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
     async def rename_file(self, interaction: discord.Interaction, button: ui.Button):
@@ -2583,10 +2663,10 @@ class ManageFilesSelectView(ProtectionLayoutView):
             option.default = idx == self.selected_index
 
         try:
-            await interaction.message.edit(
-                content=f"当前选中：{build_file_line(self.file_data[self.selected_index], self.selected_index + 1)}",
-                view=self,
+            self.set_message_content(
+                content=f"当前选中：{build_file_line(self.file_data[self.selected_index], self.selected_index + 1)}"
             )
+            await interaction.message.edit(view=self)
         except Exception:
             pass
 
@@ -2629,13 +2709,13 @@ class ManageFilesSelectView(ProtectionLayoutView):
                 )
             )
 
-        await interaction.response.edit_message(
+        self.set_message_content(
             content=(
                 f"✅ 已删除：{removed.get('filename', 'unknown')}\n"
                 f"当前选中：{build_file_line(self.file_data[self.selected_index], self.selected_index + 1)}"
-            ),
-            view=self,
+            )
         )
+        await interaction.response.edit_message(view=self)
 
 
 class EditUnlockModeView(ProtectionLayoutView):
@@ -2751,7 +2831,7 @@ class PostManagementView(ProtectionLayoutView):
             current_note,
             posts_rows=self.posts_rows,
         )
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(**view.to_message_kwargs(embed=embed))
 
     # 第一排：内容修改
     @ui.button(label="改标题", style=discord.ButtonStyle.secondary, row=0, emoji="🏷️")
@@ -2768,16 +2848,18 @@ class PostManagementView(ProtectionLayoutView):
 
     @ui.button(label="单文件操作", style=discord.ButtonStyle.secondary, row=0, emoji="✏️")
     async def rename_files(self, interaction: discord.Interaction, button: ui.Button):
+        view = ManageFilesSelectView(
+            self.bot,
+            interaction.user.id,
+            self.message_id,
+            self.file_data,
+            self.current_title,
+        )
         await interaction.response.send_message(
-            "请选择文件并执行操作（改名/替换/删除）：",
-            view=ManageFilesSelectView(
-                self.bot,
-                interaction.user.id,
-                self.message_id,
-                self.file_data,
-                self.current_title,
-            ),
-            ephemeral=True,
+            **view.to_message_kwargs(
+                content="请选择文件并执行操作（改名/替换/删除）：",
+                ephemeral=True,
+            )
         )
 
     @ui.button(
@@ -2788,13 +2870,17 @@ class PostManagementView(ProtectionLayoutView):
     ):
         view = PublishedBatchFileView(self.message_id, self.file_data)
         _, _, preview = view.build_preview()
-        await interaction.response.send_message(preview, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            **view.to_message_kwargs(content=preview, ephemeral=True)
+        )
 
     @ui.button(label="设置标签", style=discord.ButtonStyle.secondary, row=1, emoji="🏷️")
     async def set_tags(self, interaction: discord.Interaction, button: ui.Button):
         view = PublishedTagBatchView(self.message_id, self.file_data)
         _, _, preview = view.build_preview()
-        await interaction.response.send_message(preview, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            **view.to_message_kwargs(content=preview, ephemeral=True)
+        )
 
     @ui.button(label="追加附件", style=discord.ButtonStyle.primary, row=1, emoji="➕")
     async def append_files(self, interaction: discord.Interaction, button: ui.Button):
@@ -2914,18 +3000,15 @@ class PostManagementView(ProtectionLayoutView):
 
         view = UploadSessionControlView(cog, interaction.user.id, interaction.channel.id)
         await interaction.response.send_message(
-            embed=view._build_embed(),
-            view=view,
-            ephemeral=True,
+            **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
 
     # 第二排：逻辑修改与删除
     @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=2)
     async def change_mode(self, interaction: discord.Interaction, button: ui.Button):
+        view = EditUnlockModeView(self.message_id)
         await interaction.response.send_message(
-            "请选择新的验证模式：",
-            view=EditUnlockModeView(self.message_id),
-            ephemeral=True,
+            **view.to_message_kwargs(content="请选择新的验证模式：", ephemeral=True)
         )
 
     @ui.button(label="🗑️ 删除帖子", style=discord.ButtonStyle.danger, row=2)
@@ -3000,7 +3083,7 @@ class PostSelectionView(ProtectionLayoutView):
             posts_rows=self.posts_rows,
         )
 
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(**view.to_message_kwargs(embed=embed))
 
 
 class PostListView(ProtectionLayoutView):
@@ -3059,7 +3142,7 @@ class PostListView(ProtectionLayoutView):
             inline=False,
         )
         embed.set_footer(text="请点击下方按钮验证条件并下载")
-        await interaction.response.edit_message(embed=embed, view=self)
+        await interaction.response.edit_message(**self.to_message_kwargs(embed=embed))
 
     @ui.button(
         label="验证并获取",
@@ -3140,9 +3223,7 @@ class BumpButtonView(ProtectionLayoutView):
         )
 
         return {
-            "content": message_content,
-            "embed": None,
-            "view": self,  # 直接返回当前实例
+            **self.to_message_kwargs(content=message_content),
         }
 
     @discord.ui.button(
@@ -3177,5 +3258,5 @@ class BumpButtonView(ProtectionLayoutView):
         )
 
         await interaction.response.send_message(
-            embed=result_embed, view=view, ephemeral=True
+            **view.to_message_kwargs(embed=result_embed, ephemeral=True)
         )

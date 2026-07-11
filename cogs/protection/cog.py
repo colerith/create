@@ -129,12 +129,15 @@ class ProtectionCog(commands.Cog):
         if message.author.id != self.bot.user.id or not message.components:
             return False
 
-        try:
-            first_child = message.components[0].children[0]
-        except (AttributeError, IndexError):
-            return False
+        def has_bump_button(component) -> bool:
+            if getattr(component, "custom_id", None) == "bump_get_attachments":
+                return True
+            return any(
+                has_bump_button(child)
+                for child in getattr(component, "children", []) or []
+            )
 
-        return getattr(first_child, "custom_id", None) == "bump_get_attachments"
+        return any(has_bump_button(component) for component in message.components)
 
     def _should_repost_stale_bump(
         self, bump_message: discord.Message | None
@@ -422,7 +425,7 @@ class ProtectionCog(commands.Cog):
             draft_defaults=reusable_metadata,
         )
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await interaction.response.edit_message(**view.to_message_kwargs(embed=embed))
         await view.update_dashboard(interaction)
 
     # --- 管理员命令 ---
@@ -603,7 +606,9 @@ class ProtectionCog(commands.Cog):
             description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个下载。",
             color=0x87CEEB,
         )
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            **view.to_message_kwargs(embed=embed, ephemeral=True)
+        )
 
     # --- 贴主命令 ---
     @maker_group.command(name="管理附件", description="管理我在此讨论串中发布的附件")
@@ -624,9 +629,10 @@ class ProtectionCog(commands.Cog):
         posts = [dict(row) for row in rows]
         view = PostSelectionView(self.bot, posts)
         await interaction.response.send_message(
-            f"你在此频道中发布了 {len(posts)} 个受保护的附件，请选择进行管理：",
-            view=view,
-            ephemeral=True,
+            **view.to_message_kwargs(
+                content=f"你在此频道中发布了 {len(posts)} 个受保护的附件，请选择进行管理：",
+                ephemeral=True,
+            )
         )
 
     async def convert_to_protected(
@@ -655,7 +661,9 @@ class ProtectionCog(commands.Cog):
             default_log=default_log,
         )
         embed = discord.Embed(title="🚀 正在启动保护向导...", color=0x87CEEB)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(
+            **view.to_message_kwargs(embed=embed, ephemeral=True)
+        )
         await view.update_dashboard(interaction)
 
     @maker_group.command(
@@ -691,9 +699,7 @@ class ProtectionCog(commands.Cog):
             self, interaction.user.id, interaction.channel.id
         )
         await interaction.response.send_message(
-            embed=view._build_embed(),
-            view=view,
-            ephemeral=True,
+            **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
 
     @maker_group.command(
