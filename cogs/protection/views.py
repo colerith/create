@@ -45,6 +45,7 @@ from .modals import (
 
 
 FILE_EDIT_PAGE_SIZE = 15
+MAX_COMPONENTS_PER_CONTAINER = 40
 UPLOAD_SESSION_TIMEOUT_SECONDS = 300
 IMAGE_FILE_EXTENSIONS = {
     ".png",
@@ -70,6 +71,117 @@ FILE_TAG_OPTIONS = [
     "世界书",
     "其他",
 ]
+
+
+class _LayoutItemCallback:
+    def __init__(self, callback, parent, item):
+        self.callback = callback
+        self.parent = parent
+        self.item = item
+
+    def __call__(self, interaction):
+        return self.callback(self.parent, interaction, self.item)
+
+
+class ProtectionLayoutView(ui.LayoutView):
+    """LayoutView that keeps legacy controls inside Components v2 containers."""
+
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        children = {}
+        for base in reversed(cls.__mro__):
+            for name, member in base.__dict__.items():
+                if hasattr(member, "__discord_ui_model_type__"):
+                    children[name] = member
+        cls.__view_children_items__ = children
+
+    def __init__(
+        self,
+        *,
+        timeout: float | None = 180.0,
+        accent_colour: discord.Color | int | None = None,
+    ):
+        super().__init__(timeout=timeout)
+        self._layout_items = []
+        self._layout_accent_colour = accent_colour or discord.Color.from_rgb(135, 206, 235)
+        self._init_decorated_items()
+        self._rebuild_layout_containers()
+
+    def _init_decorated_items(self):
+        for raw in getattr(self, "__view_children_items__", {}).values():
+            item = raw.__discord_ui_model_type__(**raw.__discord_ui_model_kwargs__)
+            item.callback = _LayoutItemCallback(raw, self, item)
+            if isinstance(item, ui.Select):
+                item.options = [option.copy() for option in item.options]
+            setattr(self, raw.__name__, item)
+            self._layout_items.append(item)
+
+    def add_item(self, item):
+        if isinstance(item, ui.Container):
+            return super().add_item(item)
+        self._layout_items.append(item)
+        self._rebuild_layout_containers()
+        return self
+
+    def clear_items(self):
+        self._layout_items = []
+        return super().clear_items()
+
+    def _build_action_rows(self):
+        rows = []
+        explicit_rows = {}
+        implicit_buttons = []
+
+        for item in self._layout_items:
+            if isinstance(item, ui.ActionRow):
+                rows.append(item)
+            elif isinstance(item, ui.Select):
+                rows.append(ui.ActionRow(item))
+            else:
+                row_index = getattr(item, "row", None)
+                if row_index is None:
+                    implicit_buttons.append(item)
+                else:
+                    explicit_rows.setdefault(row_index, []).append(item)
+
+        for row_index in sorted(explicit_rows):
+            buttons = explicit_rows[row_index]
+            for start in range(0, len(buttons), 5):
+                rows.append(ui.ActionRow(*buttons[start : start + 5]))
+
+        for start in range(0, len(implicit_buttons), 5):
+            rows.append(ui.ActionRow(*implicit_buttons[start : start + 5]))
+
+        return rows
+
+    def _row_component_count(self, row):
+        return 1 + len(getattr(row, "children", []))
+
+    def _rebuild_layout_containers(self):
+        rows = self._build_action_rows()
+        super().clear_items()
+        current_rows = []
+        current_count = 1
+
+        def flush():
+            if current_rows:
+                super(ProtectionLayoutView, self).add_item(
+                    ui.Container(
+                        *current_rows,
+                        accent_colour=self._layout_accent_colour,
+                    )
+                )
+
+        for row in rows:
+            row_count = self._row_component_count(row)
+            if current_rows and current_count + row_count > MAX_COMPONENTS_PER_CONTAINER:
+                flush()
+                current_rows = []
+                current_count = 1
+            current_rows.append(row)
+            current_count += row_count
+
+        flush()
 
 
 class CachedAttachment:
@@ -924,7 +1036,7 @@ async def check_rate_limit_and_report(
 
 
 # --- 延迟下载视图 (核心修改区域) ---
-class AuthorNoteView(ui.View):
+class AuthorNoteView(ProtectionLayoutView):
     def __init__(self, bot, row):
         super().__init__(timeout=300)
         self.bot = bot
@@ -982,9 +1094,10 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
     await asyncio.sleep(5)
 
     # 更新按钮状态
-    view.children[0].disabled = False
-    view.children[0].label = "✅ 我已阅读，获取附件"
-    view.children[0].style = discord.ButtonStyle.success
+    view.btn_confirm.disabled = False
+    view.btn_confirm.label = "✅ 我已阅读，获取附件"
+    view.btn_confirm.style = discord.ButtonStyle.success
+    view._rebuild_layout_containers()
     try:
         await msg.edit(view=view)
     except:
@@ -992,7 +1105,7 @@ async def start_download_flow(interaction: discord.Interaction, bot, row):
 
 
 # --- 自定义文件名选择视图 ---
-class FileSelectView(ui.View):
+class FileSelectView(ProtectionLayoutView):
     def __init__(self, protection_view):
         super().__init__(timeout=60)
         self.protection_view = protection_view
@@ -1027,7 +1140,7 @@ class FileSelectView(ui.View):
         )
 
 
-class DraftManageFilesSelectView(ui.View):
+class DraftManageFilesSelectView(ProtectionLayoutView):
     def __init__(self, protection_view):
         super().__init__(timeout=180)
         self.protection_view = protection_view
@@ -1172,7 +1285,7 @@ class DraftManageFilesSelectView(ui.View):
         )
 
 
-class DraftBatchFileView(ui.View):
+class DraftBatchFileView(ProtectionLayoutView):
     def __init__(self, protection_view, page_index=0):
         super().__init__(timeout=120)
         self.protection_view = protection_view
@@ -1258,7 +1371,7 @@ class DraftBulkFilePageModal(ui.Modal, title="批量改文件名"):
         )
 
 
-class PublishedBatchFileView(ui.View):
+class PublishedBatchFileView(ProtectionLayoutView):
     def __init__(self, message_id, file_data, page_index=0):
         super().__init__(timeout=120)
         self.message_id = message_id
@@ -1407,7 +1520,7 @@ class FileTagSelect(ui.Select):
         )
 
 
-class BaseFileTagView(ui.View):
+class BaseFileTagView(ProtectionLayoutView):
     def __init__(self, page_index=0, timeout=120):
         super().__init__(timeout=timeout)
         self.page_index = page_index
@@ -1509,7 +1622,7 @@ class PublishedTagBatchView(BaseFileTagView):
             await db.commit()
 
 
-class UploadSessionControlView(ui.View):
+class UploadSessionControlView(ProtectionLayoutView):
     def __init__(self, cog, user_id, channel_id):
         super().__init__(timeout=UPLOAD_SESSION_TIMEOUT_SECONDS)
         self.cog = cog
@@ -1603,7 +1716,7 @@ class UploadSessionControlView(ui.View):
 
 
 # --- 草稿/发布视图 ---
-class UploadSessionReusePublishedView(ui.View):
+class UploadSessionReusePublishedView(ProtectionLayoutView):
     def __init__(self, session_view, posts_rows):
         super().__init__(timeout=120)
         self.session_view = session_view
@@ -1686,7 +1799,7 @@ class UploadSessionReusePublishedView(ui.View):
         )
 
 
-class DraftReusePublishedView(ui.View):
+class DraftReusePublishedView(ProtectionLayoutView):
     def __init__(self, protection_view, posts_rows):
         super().__init__(timeout=120)
         self.protection_view = protection_view
@@ -1753,7 +1866,7 @@ class DraftReusePublishedView(ui.View):
         )
 
 
-class ProtectionDraftView(ui.View):
+class ProtectionDraftView(ProtectionLayoutView):
     def __init__(
         self,
         bot,
@@ -2342,7 +2455,7 @@ class EditProtectionPasswordModal(ui.Modal, title="设置新口令"):
 
 
 # --- 管理视图组件 ---
-class ManageFilesSelectView(ui.View):
+class ManageFilesSelectView(ProtectionLayoutView):
     def __init__(self, bot, owner_id, message_id, file_data, post_title):
         super().__init__(timeout=180)
         self.bot = bot
@@ -2525,7 +2638,7 @@ class ManageFilesSelectView(ui.View):
         )
 
 
-class EditUnlockModeView(ui.View):
+class EditUnlockModeView(ProtectionLayoutView):
     def __init__(self, message_id):
         super().__init__(timeout=60)
         self.message_id = message_id
@@ -2568,7 +2681,7 @@ class EditUnlockModeView(ui.View):
         await self.update_mode(i, "like_comment_password", True)
 
 
-class PostManagementView(ui.View):
+class PostManagementView(ProtectionLayoutView):
     def __init__(
         self,
         bot,
@@ -2836,7 +2949,7 @@ class PostManagementView(ui.View):
         )
 
 
-class PostSelectionView(ui.View):
+class PostSelectionView(ProtectionLayoutView):
     def __init__(self, bot, posts_rows):
         super().__init__(timeout=60)
         self.bot = bot
@@ -2890,7 +3003,7 @@ class PostSelectionView(ui.View):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
-class PostListView(ui.View):
+class PostListView(ProtectionLayoutView):
     def __init__(self, bot, posts_rows):
         super().__init__(timeout=600)
         self.bot = bot
@@ -3001,7 +3114,7 @@ class PostListView(ui.View):
             await start_download_flow(interaction, self.bot, row)
 
 
-class BumpButtonView(discord.ui.View):
+class BumpButtonView(ProtectionLayoutView):
     def __init__(self, bot, top_url: str | None = None):
         super().__init__(timeout=None)
         self.bot = bot
