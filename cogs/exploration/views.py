@@ -746,30 +746,79 @@ class MyWorksContainer(PagedRecordContainer):
         super().__init__(rows, title, user, guild, bot, timeout=timeout)
         self.update_container()
 
-    def _row_lines(self, current_rows):
-        if not current_rows:
-            return ["*还没有找到你发布过的作品。*"]
-        lines = []
-        for idx, row in enumerate(current_rows, start=self.current_page * self.per_page + 1):
-            title = self._clip(row["title"], 64)
-            post_url = self._jump_url(row["channel_id"], row["message_id"])
-            channel = self.guild.get_channel(row["channel_id"]) if self.guild else None
-            parent = getattr(channel, "parent", None)
-            channel_name = parent.name if parent else (channel.name if channel else f"频道 {row['channel_id']}")
-            tags = row.get("tags") if isinstance(row, dict) else None
-            if not tags and hasattr(row, "keys") and "tags" in row.keys():
-                tags = row["tags"]
-            tags_text = self._clip(tags or "无标签", 60)
-            link = f"[跳转]({post_url})" if post_url else "链接不可用"
-            lines.append(f"**{idx}. {title}**\n-# 分区: {channel_name} · 标签: {tags_text} · {link}")
-        return lines
-
     def update_container(self):
-        super().update_container()
-        container = self.children[0]
-        action_rows = [item for item in container.children if isinstance(item, ui.ActionRow)]
-        if action_rows and self.btn_push_channel not in action_rows[0].children:
-            action_rows[0].add_item(self.btn_push_channel)
+        self.clear_items()
+
+        timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
+        icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
+        filter_text = "全部分区" if not self.selected_channel_ids else "、".join(self.selected_channel_ids)
+        self.per_page = 6
+        self.total_pages = math.ceil(len(self.rows) / self.per_page) if self.rows else 1
+        if self.current_page >= self.total_pages:
+            self.current_page = max(0, self.total_pages - 1)
+
+        self.add_item(
+            ui.Container(
+                ui.Section(
+                    ui.TextDisplay(content=f"### 📚 我的作品小书架\n这里按帖子汇总，共找到 **{len(self.rows)}** 个本服务器作品帖。"),
+                    ui.TextDisplay(content=f"-# 筛选: {filter_text} · 最后更新: {timestamp}"),
+                    accessory=ui.Thumbnail(media=icon_url),
+                ),
+                ui.Separator(),
+                accent_colour=self.accent_colour,
+            )
+        )
+
+        start = self.current_page * self.per_page
+        current_rows = self.rows[start : start + self.per_page]
+        if not current_rows:
+            self.add_item(
+                ui.Container(
+                    ui.TextDisplay(content="### 🌱 这里还空着\n当前筛选下还没有找到你发布过的帖子。"),
+                    accent_colour=discord.Color.from_rgb(210, 245, 225),
+                )
+            )
+        else:
+            content_items = []
+            for idx, row in enumerate(current_rows, start=start + 1):
+                post_name = self._clip(row.get("post_name"), 42)
+                tags = self._clip(row.get("tags") or "无标签", 44)
+                category = self._clip(row.get("category") or "其他", 16)
+                forum = self._clip(row.get("forum_name") or "未知分区", 24)
+                like_count = int(row.get("like_count") or 0)
+                comment_count = int(row.get("comment_count") or 0)
+                attachment_count = int(row.get("attachment_count") or 0)
+                jump_url = self._jump_url(row.get("channel_id"), row.get("latest_message_id"))
+                content_items.append(
+                    ui.Section(
+                        ui.TextDisplay(content=f"**{idx}. {post_name}**"),
+                        ui.TextDisplay(
+                            content=(
+                                f"-# 分区: {category} · 频道: {forum}\n"
+                                f"-# 标签: {tags}\n"
+                                f"-# ♡ {like_count} · 评论 {comment_count} · 附件 {attachment_count}"
+                            )
+                        ),
+                        accessory=ui.Button(label="跳转", url=jump_url, style=discord.ButtonStyle.link)
+                        if jump_url
+                        else ui.Button(label="无链接", disabled=True),
+                    )
+                )
+            self.add_item(
+                ui.Container(
+                    *content_items,
+                    accent_colour=discord.Color.from_rgb(218, 247, 232),
+                )
+            )
+
+        self.btn_prev.disabled = self.current_page == 0
+        self.btn_next.disabled = self.current_page >= self.total_pages - 1
+        self.btn_indicator.label = f"{self.current_page + 1} / {self.total_pages}"
+
+        action_rows = [ui.ActionRow(self.btn_push_dm, self.btn_delete_dm, self.btn_push_channel)]
+        if self.total_pages > 1:
+            action_rows.append(ui.ActionRow(self.btn_prev, self.btn_indicator, self.btn_next))
+        self.add_item(ui.Container(*action_rows, accent_colour=discord.Color.from_rgb(245, 245, 245)))
 
     async def on_push_channel(self, interaction: discord.Interaction):
         await interaction.response.send_modal(MyWorksChannelPushModal(self.bot, self.user.id, self.selected_channel_ids))
@@ -790,22 +839,27 @@ class MyWorksFilterView(ui.View):
     def __init__(self, bot: discord.Client):
         super().__init__(timeout=180)
         self.bot = bot
-        self.channel_select = ui.ChannelSelect(
-            placeholder="[可选] 选择作品分区...",
-            channel_types=[discord.ChannelType.forum, discord.ChannelType.text],
+        options = [discord.SelectOption(label="全部", value="__all__", description="显示全部作品帖")]
+        options.extend(
+            discord.SelectOption(label=keyword, value=keyword, description=f"只看 {keyword} 分区")
+            for keyword in RECOMMEND_TARGET_KEYWORDS
+        )
+        self.category_select = ui.Select(
+            placeholder="选择作品分区筛选...",
+            options=options,
             min_values=0,
-            max_values=25,
+            max_values=len(options),
             row=0,
         )
-        self.add_item(self.channel_select)
+        self.add_item(self.category_select)
 
     @ui.button(label="查看我的作品", style=discord.ButtonStyle.primary, row=1, emoji="📚")
     async def confirm(self, interaction: discord.Interaction, button: ui.Button):
         cog = self.bot.get_cog("ExplorationCog")
         if not cog:
             return await interaction.response.send_message("探索模块尚未就绪。", ephemeral=True)
-        selected_ids = [ch.id for ch in self.channel_select.values]
-        await cog.send_my_works_panel(interaction, selected_channel_ids=selected_ids)
+        selected = [value for value in self.category_select.values if value != "__all__"]
+        await cog.send_my_works_panel(interaction, selected_channel_ids=selected)
 
 
 class MyWorksChannelPushModal(ui.Modal, title="推送我的作品到频道"):

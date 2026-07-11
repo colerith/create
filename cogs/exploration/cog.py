@@ -10,7 +10,7 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands, tasks
 
-from config import EXPLORATION_TARGET_CHANNEL_IDS, ADMIN_USER_ID, TZ_SHANGHAI
+from config import EXPLORATION_TARGET_CHANNEL_IDS, ADMIN_USER_ID, RECOMMEND_TARGET_KEYWORDS, TZ_SHANGHAI
 from . import db as exploration_db
 from .views import (
     DownloadLibraryContainer,
@@ -222,23 +222,27 @@ class ExplorationCog(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException, discord.InvalidData):
             return None
 
-    async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_channel_ids: list[int] | None = None):
-        selected = set(selected_channel_ids or [])
+    async def _decorate_work_rows(self, guild: discord.Guild, rows, selected_keywords: list[str] | None = None):
+        selected = set(selected_keywords or [])
         decorated = []
         for row in rows:
             data = self._row_to_dict(row)
             channel = await self._resolve_item_channel_deep(guild, data.get("channel_id"))
+            if channel is None:
+                continue
             parent = getattr(channel, "parent", None)
-            if selected:
-                channel_matches = data.get("channel_id") in selected
-                parent_matches = getattr(parent, "id", None) in selected
-                if not channel_matches and not parent_matches:
-                    continue
 
             tags = []
             if isinstance(channel, discord.Thread):
-                tags = [tag.name for tag in getattr(channel, "applied_tags", [])[:4]]
+                tags = [tag.name for tag in getattr(channel, "applied_tags", [])[:6]]
             data["tags"] = " ".join(tags) if tags else "无标签"
+            data["post_name"] = getattr(channel, "name", None) or f"帖子 {data.get('channel_id')}"
+            data["forum_name"] = getattr(parent, "name", None) or data["post_name"]
+            haystack = " ".join([data["post_name"], data["forum_name"], data["tags"]])
+            data["category"] = next((keyword for keyword in RECOMMEND_TARGET_KEYWORDS if keyword in haystack), "其他")
+
+            if selected and data["category"] not in selected:
+                continue
             decorated.append(data)
         return decorated
 
@@ -290,12 +294,12 @@ class ExplorationCog(commands.Cog):
         self,
         user: discord.User | discord.Member,
         guild: discord.Guild,
-        selected_channel_ids: list[int] | None = None,
+        selected_channel_ids: list[str] | None = None,
         timeout: int | None = 300,
     ):
         rows = await protection_db.get_user_published_items(user.id)
         decorated = await self._decorate_work_rows(guild, rows, selected_channel_ids)
-        suffix = "（已筛选）" if selected_channel_ids else ""
+        suffix = f"（{'/'.join(selected_channel_ids)}）" if selected_channel_ids else ""
         return MyWorksContainer(
             decorated,
             title=f"📚 我的作品{suffix}",
@@ -311,7 +315,7 @@ class ExplorationCog(commands.Cog):
         view = await self._build_download_library_view(interaction.user, interaction.guild)
         await interaction.followup.send(view=view, ephemeral=True)
 
-    async def send_my_works_panel(self, interaction: discord.Interaction, selected_channel_ids: list[int] | None = None):
+    async def send_my_works_panel(self, interaction: discord.Interaction, selected_channel_ids: list[str] | None = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
         view = await self._build_my_works_view(interaction.user, interaction.guild, selected_channel_ids)
         await interaction.followup.send(view=view, ephemeral=True)
@@ -335,7 +339,7 @@ class ExplorationCog(commands.Cog):
         interaction: discord.Interaction,
         panel_type: str,
         user_id: int,
-        selected_channel_ids: list[int] | None = None,
+        selected_channel_ids: list[str] | None = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if interaction.user.id != user_id:
@@ -399,7 +403,7 @@ class ExplorationCog(commands.Cog):
         interaction: discord.Interaction,
         user_id: int,
         channel_input: str,
-        selected_channel_ids: list[int] | None = None,
+        selected_channel_ids: list[str] | None = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if interaction.user.id != user_id:

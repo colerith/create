@@ -371,24 +371,38 @@ async def get_user_library_items(user_id: int, limit: int = 100):
 
 
 async def get_user_published_items(user_id: int, limit: int = 200):
-    """获取用户发布过的保护作品。"""
+    """获取用户发布过保护附件的帖子汇总。"""
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
             SELECT
-                message_id,
-                channel_id,
-                owner_id,
-                title,
-                created_at,
-                update_log
+                pi.channel_id,
+                pi.owner_id,
+                COUNT(*) AS attachment_count,
+                MAX(pi.message_id) AS latest_message_id,
+                MIN(pi.created_at) AS first_created_at,
+                MAX(pi.created_at) AS latest_created_at,
+                (
+                    SELECT COUNT(*)
+                    FROM user_likes ul
+                    JOIN protected_items p2 ON p2.message_id = ul.message_id
+                    WHERE p2.owner_id = ? AND p2.channel_id = pi.channel_id
+                ) AS like_count,
+                (
+                    SELECT COUNT(*)
+                    FROM user_comments uc
+                    JOIN protected_items p3 ON p3.message_id = uc.message_id
+                    WHERE p3.owner_id = ? AND p3.channel_id = pi.channel_id
+                ) AS comment_count
             FROM protected_items
-            WHERE owner_id = ?
-            ORDER BY created_at DESC
+            pi
+            WHERE pi.owner_id = ?
+            GROUP BY pi.channel_id, pi.owner_id
+            ORDER BY latest_created_at DESC
             LIMIT ?
             """,
-            (user_id, limit),
+            (user_id, user_id, user_id, limit),
         )
         return await cursor.fetchall()
 
