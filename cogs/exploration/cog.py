@@ -204,9 +204,11 @@ class ExplorationCog(commands.Cog):
         self.bot = bot
         self.bot.add_view(SearchPanelContainer(self.bot))
         self.daily_task.start()
+        self.pushed_panel_refresh_task.start()
 
     async def cog_unload(self):
         self.daily_task.cancel()
+        self.pushed_panel_refresh_task.cancel()
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == ADMIN_USER_ID or interaction.user.guild_permissions.administrator

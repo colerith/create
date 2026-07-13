@@ -29,9 +29,19 @@ async def init_statistics_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bumped_threads (
                 thread_id INTEGER PRIMARY KEY,
-                last_bumped_at TEXT NOT NULL
+                last_bumped_at TEXT NOT NULL,
+                bump_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+        try:
+            await db.execute(
+                "ALTER TABLE bumped_threads ADD COLUMN bump_count INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        await db.execute(
+            "UPDATE bumped_threads SET bump_count = 1 WHERE bump_count = 0"
+        )
         # 3. 论坛帖子缓存表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS forum_thread_cache (
@@ -140,7 +150,13 @@ async def log_thread_bump(thread_id: int):
     async with get_db() as db:
         now_iso = datetime.now(TZ_SHANGHAI).isoformat()
         await db.execute(
-            "INSERT OR REPLACE INTO bumped_threads (thread_id, last_bumped_at) VALUES (?, ?)",
+            """
+            INSERT INTO bumped_threads (thread_id, last_bumped_at, bump_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                last_bumped_at = excluded.last_bumped_at,
+                bump_count = bumped_threads.bump_count + 1
+            """,
             (thread_id, now_iso),
         )
         await db.commit()
@@ -453,3 +469,11 @@ async def get_recently_bumped_threads(days: int = 7) -> set:
         )
         rows = await cursor.fetchall()
         return {row[0] for row in rows}
+
+
+async def get_thread_bump_counts() -> dict[int, int]:
+    """获取所有已记录帖子的累计顶帖次数。"""
+    async with get_db() as db:
+        cursor = await db.execute("SELECT thread_id, bump_count FROM bumped_threads")
+        rows = await cursor.fetchall()
+        return {row[0]: row[1] for row in rows}

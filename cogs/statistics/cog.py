@@ -733,7 +733,9 @@ class StatisticsCog(commands.Cog):
             return
 
         recently_bumped_ids = await statistics_db.get_recently_bumped_threads(days=7)
+        bump_counts = await statistics_db.get_thread_bump_counts()
         three_days_ago_utc = datetime.now(timezone.utc) - timedelta(days=3)
+        thirty_days_ago_utc = datetime.now(timezone.utc) - timedelta(days=30)
         scanned_forums = 0
         candidate_threads = 0
         planned_threads = 0
@@ -746,6 +748,16 @@ class StatisticsCog(commands.Cog):
             try:
                 for thread in forum.threads:
                     if thread.id in recently_bumped_ids or thread.archived:
+                        continue
+
+                    is_pinned_thread = bool(getattr(thread.flags, "pinned", False))
+                    created_at = thread.created_at
+                    if (
+                        not is_pinned_thread
+                        and created_at
+                        and created_at < thirty_days_ago_utc
+                        and bump_counts.get(thread.id, 0) >= 2
+                    ):
                         continue
 
                     last_msg_time = None
