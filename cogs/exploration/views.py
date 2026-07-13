@@ -289,6 +289,12 @@ class DailyReportContainer(ui.LayoutView):
             "tags": " ".join(tags) if tags else "无标签",
         }
 
+    def _author_label(self, owner_id: int | None) -> str:
+        if not owner_id:
+            return "未知作者"
+        member = self.guild.get_member(owner_id) if self.guild else None
+        return f"@{member.display_name}" if member else f"@用户{owner_id}"
+
     def _build_threads_container(self):
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")
         icon_url = self.user.display_avatar.url if self.user else "https://cdn.discordapp.com/embed/avatars/0.png"
@@ -369,11 +375,12 @@ class DailyReportContainer(ui.LayoutView):
                     else None
                 )
                 jump_text = f"[跳转]({jump_url})" if jump_url else "跳转不可用"
+                author = self._author_label(row["owner_id"])
                 elements.append(
                     ui.TextDisplay(
                         content=(
                             f"**{title}**\n"
-                            f"-# 作者: <@{row['owner_id']}> · 分区: {forum}\n"
+                            f"-# 作者: {author} · 分区: {forum}\n"
                             f"-# 标签: {tags} · {jump_text}"
                         )
                     )
