@@ -56,7 +56,10 @@ class RecommendCog(commands.Cog):
         if target_msg:
             # 如果成功获取到消息，则编辑它
             try:
-                await target_msg.edit(view=new_view)
+                await target_msg.edit(
+                    view=new_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 print(f"✅ [Recommend] Successfully edited panel {target_msg.id}.")
             except Exception as e:
                 print(f"❌ [Recommend] Failed to edit panel {target_msg.id}: {e}. Will send a new one.")
@@ -66,7 +69,10 @@ class RecommendCog(commands.Cog):
         if not target_msg:
             # 如果没有找到旧消息，或者编辑失败，则发送一个新的
             try:
-                new_msg = await channel.send(view=new_view)
+                new_msg = await channel.send(
+                    view=new_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 print(f"✅ [Recommend] Sent a new panel {new_msg.id} to '{channel.name}'.")
                 # 将新消息的ID存入数据库
                 await db.set_panel_message(channel.id, new_msg.id)

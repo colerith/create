@@ -442,12 +442,18 @@ class ExplorationCog(commands.Cog):
         await set_panel_message_id(channel.id, search_msg.id, "search_panel")
         await asyncio.sleep(1)
 
-        daily_msg = await channel.send(view=await self._build_daily_report_view(channel))
+        daily_msg = await channel.send(
+            view=await self._build_daily_report_view(channel),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         await set_panel_message_id(channel.id, daily_msg.id, "daily_report")
         await asyncio.sleep(1)
 
         if include_recommend:
-            recommend_msg = await channel.send(view=await self._build_daily_recommend_view(channel))
+            recommend_msg = await channel.send(
+                view=await self._build_daily_recommend_view(channel),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             await recommend_db.set_panel_message(channel.id, recommend_msg.id)
 
     async def _fetch_push_user_and_guild(self, user_id: int, guild_id: int):
@@ -612,7 +618,10 @@ class ExplorationCog(commands.Cog):
         if message_id and not resend:
             try:
                 target_msg = await channel.fetch_message(message_id)
-                await target_msg.edit(view=view)
+                await target_msg.edit(
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 return
             except discord.NotFound:
                 await remove_panel_record(channel.id, "daily_report")
@@ -642,7 +651,10 @@ class ExplorationCog(commands.Cog):
             except Exception:
                 pass
 
-        new_msg = await channel.send(view=view)
+        new_msg = await channel.send(
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         await set_panel_message_id(channel.id, new_msg.id, "daily_report")
 
     @tasks.loop(minutes=10)

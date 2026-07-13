@@ -292,8 +292,7 @@ class DailyReportContainer(ui.LayoutView):
     def _author_label(self, owner_id: int | None) -> str:
         if not owner_id:
             return "未知作者"
-        member = self.guild.get_member(owner_id) if self.guild else None
-        return f"@{member.display_name}" if member else f"@用户{owner_id}"
+        return f"<@{owner_id}>"
 
     def _build_threads_container(self):
         timestamp = datetime.now(TZ_SHANGHAI).strftime("%H:%M")

@@ -52,7 +52,7 @@ async def fetch_thread_details(thread: discord.Thread) -> dict:
     return {
         "title": thread.name,
         "author_name": owner.display_name if owner else "未知作者",
-        "author_mention": f"@{owner.display_name}" if owner else "未知作者",
+        "author_mention": owner.mention if owner else "未知作者",
         "author_avatar": owner.display_avatar.url if owner else None,
         "intro": intro,
         "category": thread.parent.name if thread.parent else "未知分区",
