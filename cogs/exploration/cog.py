@@ -26,6 +26,7 @@ from .views import (
     MyWorksContainer,
     SearchPanelContainer,
     SearchResultContainer,
+    collect_forum_threads,
 )
 from ..core.db import get_panel_message_id, set_panel_message_id, remove_panel_record
 from ..protection import db as protection_db
@@ -234,7 +235,7 @@ class ExplorationCog(commands.Cog):
         for forum in guild.forums:
             if not forum.permissions_for(guild.me).read_messages:
                 continue
-            for thread in forum.threads:
+            for thread in await collect_forum_threads([forum], include_archived=True):
                 if thread.owner_id != user_id:
                     continue
                 tags = [tag.name for tag in getattr(thread, "applied_tags", [])]

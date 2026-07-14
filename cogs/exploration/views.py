@@ -12,6 +12,35 @@ from config import RECOMMEND_TARGET_KEYWORDS, TZ_SHANGHAI
 # Part 1. 核心搜索执行逻辑
 # ==========================================
 
+async def collect_forum_threads(
+    forums: list[discord.ForumChannel],
+    *,
+    include_archived: bool = True,
+) -> list[discord.Thread]:
+    """Collect active forum threads and, when possible, public archived threads."""
+    threads_by_id: dict[int, discord.Thread] = {}
+
+    for forum in forums:
+        for thread in forum.threads:
+            threads_by_id[thread.id] = thread
+
+        if not include_archived or not hasattr(forum, "archived_threads"):
+            continue
+
+        try:
+            async for thread in forum.archived_threads(limit=None):
+                threads_by_id[thread.id] = thread
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+        except TypeError:
+            try:
+                async for thread in forum.archived_threads():
+                    threads_by_id[thread.id] = thread
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+    return list(threads_by_id.values())
+
 async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
     # 立即响应，避免超时
     await interaction.response.send_message(
@@ -30,8 +59,8 @@ async def execute_search(interaction: discord.Interaction, search_type: str, que
         # 默认搜索所有论坛
         target_forums = [ch for ch in interaction.guild.forums if isinstance(ch, discord.ForumChannel)]
 
-    # 2. 收集所有帖子
-    all_threads = [t for forum in target_forums for t in forum.threads]
+    # 2. 收集所有帖子（活跃 + 已归档公开帖子）
+    all_threads = await collect_forum_threads(target_forums, include_archived=True)
 
     if not all_threads:
         return await interaction.edit_original_response(content="呜呜，当前范围内没有帖子可以搜捏...")
