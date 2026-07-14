@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import traceback
 from datetime import datetime
 
 import discord
@@ -661,12 +662,31 @@ class ExplorationCog(commands.Cog):
     async def daily_task(self):
         """自动刷新日报面板。"""
         for channel_id in EXPLORATION_TARGET_CHANNEL_IDS:
-            if channel := self.bot.get_channel(channel_id):
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                try:
+                    channel = await self.bot.fetch_channel(channel_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                    print(f"刷新日报面板失败: 无法访问频道 {channel_id} - {e}")
+                    continue
+
+            if not isinstance(channel, discord.TextChannel):
+                continue
+
+            try:
                 await self.refresh_channel_daily_panel(channel, resend=False)
+            except Exception as e:
+                print(f"刷新日报面板失败: 频道 {channel_id} - {e}")
+                traceback.print_exc()
 
     @daily_task.before_loop
     async def before_daily_task(self):
         await self.bot.wait_until_ready()
+
+    @daily_task.error
+    async def daily_task_error(self, error):
+        print(f"日报刷新循环异常退出: {error}")
+        traceback.print_exception(type(error), error, error.__traceback__)
 
     @tasks.loop(minutes=30)
     async def pushed_panel_refresh_task(self):
@@ -721,6 +741,11 @@ class ExplorationCog(commands.Cog):
     @pushed_panel_refresh_task.before_loop
     async def before_pushed_panel_refresh_task(self):
         await self.bot.wait_until_ready()
+
+    @pushed_panel_refresh_task.error
+    async def pushed_panel_refresh_task_error(self, error):
+        print(f"探索推送面板刷新循环异常退出: {error}")
+        traceback.print_exception(type(error), error, error.__traceback__)
 
     @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道日报面板")
     @app_commands.default_permissions(administrator=True)
