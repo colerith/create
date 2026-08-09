@@ -1,8 +1,19 @@
 # cogs/core/db.py
 
+from contextlib import asynccontextmanager
+
 import aiosqlite
 
 DB_NAME = "chimidan.db"
+DB_TIMEOUT_SECONDS = 30
+DB_BUSY_TIMEOUT_MS = DB_TIMEOUT_SECONDS * 1000
+
+
+async def _configure_connection(db: aiosqlite.Connection, *, enable_wal: bool = False):
+    await db.execute(f"PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}")
+    if enable_wal:
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.execute("PRAGMA synchronous = NORMAL")
 
 
 async def init_db():
@@ -11,7 +22,8 @@ async def init_db():
     在机器人 on_ready 事件中调用此函数一次即可。
     """
     print("🔄 正在检查并初始化数据库...")
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(DB_NAME, timeout=DB_TIMEOUT_SECONDS) as db:
+        await _configure_connection(db, enable_wal=True)
         # 1. 保护贴主表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS protected_items (
@@ -199,9 +211,12 @@ async def init_db():
     print("✅ 数据库初始化完成，所有表结构已就绪。")
 
 
-def get_db():
+@asynccontextmanager
+async def get_db():
     """获取数据库连接对象"""
-    return aiosqlite.connect(DB_NAME)
+    async with aiosqlite.connect(DB_NAME, timeout=DB_TIMEOUT_SECONDS) as db:
+        await _configure_connection(db)
+        yield db
 
 
 # === 面板记录辅助函数 ===
