@@ -5,6 +5,7 @@ from discord import ui
 import os
 import json
 import asyncio
+import io
 from .utils import check_requirements_common
 
 
@@ -84,6 +85,12 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
         max_length=4000,
         required=False,
     )
+    attachment_input = ui.FileUpload(
+        custom_id="draft_update_log_attachments",
+        required=False,
+        min_values=0,
+        max_values=10,
+    )
 
     def __init__(self, view):
         super().__init__()
@@ -93,10 +100,51 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
         )
 
     async def on_submit(self, i: discord.Interaction):
-        self.view_ref.draft_update_log = i.data["components"][0]["components"][0][
-            "value"
-        ]
+        update_log = self.update_log_input.value.strip()
+        uploaded_attachments = list(self.attachment_input.values)
+
+        if uploaded_attachments:
+            await i.response.defer()
+            cached_attachments = []
+            try:
+                for attachment in uploaded_attachments:
+                    cached_attachments.append(
+                        DraftUpdateLogAttachment(
+                            filename=attachment.filename,
+                            data=await attachment.read(),
+                            description=getattr(attachment, "description", None),
+                            spoiler=attachment.is_spoiler(),
+                        )
+                    )
+            except Exception as exc:
+                return await i.followup.send(
+                    f"读取更新日志附件失败：{exc}", ephemeral=True
+                )
+            self.view_ref.draft_update_attachments = cached_attachments
+        elif not update_log:
+            # 文本与本次上传均为空时，视为关闭整条更新日志。
+            self.view_ref.draft_update_attachments = []
+
+        self.view_ref.draft_update_log = update_log or None
         await self.view_ref.update_dashboard(i)
+
+
+class DraftUpdateLogAttachment:
+    """缓存 modal 上传的文件，供稍后的正式发布复用。"""
+
+    def __init__(self, filename, data, description=None, spoiler=False):
+        self.filename = filename
+        self.data = data
+        self.description = description
+        self.spoiler = spoiler
+
+    def to_file(self):
+        return discord.File(
+            io.BytesIO(self.data),
+            filename=self.filename,
+            description=self.description,
+            spoiler=self.spoiler,
+        )
 
 
 class DraftPasswordModal(ui.Modal, title="设置口令"):

@@ -2041,6 +2041,7 @@ class ProtectionDraftView(ProtectionLayoutView):
         self.draft_title = f"{user.display_name} 的保护附件"
         self.draft_log = default_log
         self.draft_update_log = None
+        self.draft_update_attachments = []
         self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
@@ -2252,7 +2253,12 @@ class ProtectionDraftView(ProtectionLayoutView):
             else "留空为关闭"
         )
         note_text = self._short_text(self.draft_log, empty_text="已关闭")
-        update_log_text = self._short_text(self.draft_update_log, empty_text="已关闭")
+        update_attachment_count = len(self.draft_update_attachments)
+        update_log_text = self._short_text(self.draft_update_log, empty_text="仅附件")
+        if update_attachment_count:
+            update_log_text += f" / {update_attachment_count} 个附件"
+        elif not self.draft_update_log:
+            update_log_text = "已关闭"
         mention_text = "已开启，发布更新时会提醒贴内用户" if self.mention_users else "已关闭"
 
         return [
@@ -2310,11 +2316,20 @@ class ProtectionDraftView(ProtectionLayoutView):
             if self.draft_update_log and len(self.draft_update_log) > 50
             else self.draft_update_log
         )
+        update_attachment_count = len(self.draft_update_attachments)
+        if self.draft_update_log:
+            update_log_status = f"✅ {update_log_preview}"
+            if update_attachment_count:
+                update_log_status += f" / {update_attachment_count} 个附件"
+        elif update_attachment_count:
+            update_log_status = f"✅ 仅附件 / {update_attachment_count} 个"
+        else:
+            update_log_status = "⚪ 未设置"
         status_desc = (
             f"📦 **已传文件**: {file_status}\n"
             f"🏷️ **当前标题**: {self.draft_title}\n"
             f"📝 **作者提示**: {'✅ ' + log_preview if self.draft_log else '⚪ 未设置'}\n"
-            f"🗒️ **更新日志**: {'✅ ' + update_log_preview if self.draft_update_log else '⚪ 未设置'}\n"
+            f"🗒️ **更新日志**: {update_log_status}\n"
             f"📣 **艾特贴内用户**: {'✅ 开启' if self.mention_users else '⚪ 关闭'}\n"
         )
         mode_map = {
@@ -2536,38 +2551,62 @@ class ProtectionDraftView(ProtectionLayoutView):
             pass
 
         # 发布更新通知（若配置）
-        if self.mention_users or self.draft_update_log:
+        has_update_log = bool(
+            self.draft_update_log or self.draft_update_attachments
+        )
+        update_publish_error = None
+        if self.mention_users or has_update_log:
             mention_text = "@everyone" if self.mention_users else ""
 
             if mention_text:
                 await interaction.channel.send(f"📣 **更新通知** {mention_text}")
 
-            if self.draft_update_log:
+            if has_update_log:
                 update_header = f"🗒️ **{self.draft_title} 更新日志**"
-                update_msg = await interaction.channel.send(
-                    f"{update_header}\n{self.draft_update_log}"
-                )
-                await protection_db.record_attachment_update_publish_log(
-                    owner_id=self.user.id,
-                    guild_id=getattr(interaction.guild, "id", None),
-                    channel_id=interaction.channel.id,
-                    protected_message_id=final_msg.id,
-                    update_message_id=update_msg.id,
-                    title=self.draft_title,
-                    update_log=self.draft_update_log,
-                    timestamp=datetime.now(TZ_SHANGHAI).isoformat(),
-                    mention_users=self.mention_users,
-                )
+                update_content = update_header
+                if self.draft_update_log:
+                    update_content += f"\n{self.draft_update_log}"
+                update_files = [
+                    attachment.to_file()
+                    for attachment in self.draft_update_attachments
+                ]
                 try:
-                    await update_msg.pin(reason="附件更新日志标注")
-                except:
-                    await interaction.followup.send(
-                        "提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True
+                    update_msg = await interaction.channel.send(
+                        update_content,
+                        files=update_files,
                     )
+                except Exception as exc:
+                    update_publish_error = exc
+                    update_msg = None
 
-        await interaction.followup.send(
-            "✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True
-        )
+                if update_msg is None:
+                    await interaction.followup.send(
+                        f"⚠️ 保护附件已发布，但更新日志或其附件发送失败：{update_publish_error}",
+                        ephemeral=True,
+                    )
+                else:
+                    await protection_db.record_attachment_update_publish_log(
+                        owner_id=self.user.id,
+                        guild_id=getattr(interaction.guild, "id", None),
+                        channel_id=interaction.channel.id,
+                        protected_message_id=final_msg.id,
+                        update_message_id=update_msg.id,
+                        title=self.draft_title,
+                        update_log=self.draft_update_log or "",
+                        timestamp=datetime.now(TZ_SHANGHAI).isoformat(),
+                        mention_users=self.mention_users,
+                    )
+                    try:
+                        await update_msg.pin(reason="附件更新日志标注")
+                    except:
+                        await interaction.followup.send(
+                            "提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True
+                        )
+
+        if update_publish_error is None:
+            await interaction.followup.send(
+                "✅ 发布成功！已移除直接获取按钮，引导用户使用命令。", ephemeral=True
+            )
 
 
 # --- 帖子列表视图 ---
