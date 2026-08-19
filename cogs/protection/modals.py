@@ -85,11 +85,15 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
         max_length=4000,
         required=False,
     )
-    attachment_input = ui.FileUpload(
-        custom_id="draft_update_log_attachments",
-        required=False,
-        min_values=0,
-        max_values=10,
+    attachment_input = ui.Label(
+        text="更新日志附件",
+        description="可选，最多上传 10 个文件；新上传的文件会替换草稿中已有的更新日志附件。",
+        component=ui.FileUpload(
+            custom_id="draft_update_log_attachments",
+            required=False,
+            min_values=0,
+            max_values=10,
+        ),
     )
 
     def __init__(self, view):
@@ -101,7 +105,7 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
 
     async def on_submit(self, i: discord.Interaction):
         update_log = self.update_log_input.value.strip()
-        uploaded_attachments = list(self.attachment_input.values)
+        uploaded_attachments = list(self.attachment_input.component.values)
 
         if uploaded_attachments:
             await i.response.defer()
