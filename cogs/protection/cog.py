@@ -706,7 +706,7 @@ class ProtectionCog(commands.Cog):
     )
     @app_commands.describe(开关="'on'开启, 'off'关闭")
     async def auto_bump(self, interaction: discord.Interaction, 开关: str):
-        if not self._can_manage_bump(interaction):
+        if not await self._can_manage_bump(interaction):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
@@ -722,7 +722,7 @@ class ProtectionCog(commands.Cog):
 
         await interaction.response.send_message("请明确指示 `on` 或 `off`。", ephemeral=True)
 
-    def _can_manage_bump(
+    async def _can_manage_bump(
         self,
         interaction: discord.Interaction,
         message: discord.Message | None = None,
@@ -732,11 +732,18 @@ class ProtectionCog(commands.Cog):
             isinstance(interaction.channel, discord.Thread)
             and interaction.channel.owner_id == interaction.user.id
         )
-        is_text_owner = bool(
-            message
-            and isinstance(message.channel, discord.TextChannel)
-            and message.author.id == interaction.user.id
-        )
+        is_text_owner = False
+        if isinstance(interaction.channel, discord.TextChannel):
+            # 普通文字频道没有“频道贴主”。右键自己的普通消息仍兼容旧行为；
+            # 右键 Bot 发布的保护面板时，则按数据库中的附件所有者判断。
+            is_own_message = bool(
+                message and message.author.id == interaction.user.id
+            )
+            owns_protected_item = await protection_db.user_has_items_in_channel(
+                interaction.user.id,
+                interaction.channel.id,
+            )
+            is_text_owner = bool(is_own_message or owns_protected_item)
         return bool(is_admin or is_thread_owner or is_text_owner)
 
     async def _disable_auto_bump(
@@ -783,8 +790,24 @@ class ProtectionCog(commands.Cog):
         rows = await protection_db.get_items_in_channel(channel.id, limit=1)
         if not rows:
             return False, "❌ 本频道没有任何受保护的附件记录，无法刷新置底。"
-        await self._execute_bump_once(channel)
-        return True, "🔄 已执行一次置底刷新。"
+        if self._is_thread_archived(channel):
+            return False, "❌ 当前帖子已归档，无法刷新置底。"
+
+        _, nearby_bump_message = await self._scan_bump_messages(channel)
+        tracked_bump_message = await self._get_tracked_bump_message(
+            channel, nearby_bump_message
+        )
+        if tracked_bump_message:
+            deleted = await self._safe_delete_message(tracked_bump_message)
+            if not deleted:
+                refreshed = await self._refresh_bump_message(tracked_bump_message)
+                if refreshed:
+                    return True, "🔄 旧置底按钮无法重发，已原位刷新。"
+                return False, "❌ 无法删除或刷新旧置底按钮，请检查 Bot 的消息管理权限。"
+            await protection_db.remove_sticky_message(channel.id)
+
+        await self._send_bump_message(channel)
+        return True, "🔄 已重新发送置底按钮到当前频道底部。"
 
     def _resolve_bump_target_channel(
         self, message: discord.Message
@@ -796,7 +819,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_enable_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction, message):
+        if not await self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
@@ -811,7 +834,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_disable_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction, message):
+        if not await self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )
@@ -826,7 +849,7 @@ class ProtectionCog(commands.Cog):
     async def ctx_refresh_bump(
         self, interaction: discord.Interaction, message: discord.Message
     ):
-        if not self._can_manage_bump(interaction, message):
+        if not await self._can_manage_bump(interaction, message):
             return await interaction.response.send_message(
                 "❌ 只有 **管理员** 或 **贴主** 才能使用。", ephemeral=True
             )

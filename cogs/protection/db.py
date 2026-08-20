@@ -279,6 +279,21 @@ async def get_user_items_in_channel(user_id: int, channel_id: int):
         return await cursor.fetchall()
 
 
+async def user_has_items_in_channel(user_id: int, channel_id: int) -> bool:
+    """快速判断用户是否是普通文字频道中的保护附件贴主。"""
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM protected_items
+            WHERE channel_id = ? AND owner_id = ?
+            LIMIT 1
+            """,
+            (channel_id, user_id),
+        )
+        return await cursor.fetchone() is not None
+
+
 async def get_sticky_message_id(channel_id: int):
     """获取置底消息ID。"""
     async with get_db() as db:
