@@ -40,6 +40,7 @@ from .modals import (
     RenameFileModal,
     PasswordUnlockModal,
     DraftUpdateLogModal,
+    DraftUpdateLogAttachment,
     normalize_file_tag,
 )
 
@@ -836,10 +837,10 @@ def get_reusable_attachments_from_rows(posts_rows, message_id: str | int):
     return row, [ReusableStoredAttachment(item) for item in storage_items]
 
 
-def build_reusable_metadata_from_row(row):
+async def build_reusable_metadata_from_row(bot, row):
     if not row:
         return {}
-    return {
+    metadata = {
         "draft_title": row["title"],
         "draft_log": row["log"],
         "draft_update_log": row["update_log"],
@@ -847,6 +848,33 @@ def build_reusable_metadata_from_row(row):
         "mention_users": bool(row["mention_users"]),
         "draft_password": row["password"],
     }
+
+    # 更新附件本体仍保存在原 Discord 更新消息中。复用时读取为草稿缓存，
+    # 从而兼容本功能上线前已经发布且数据库没有附件 JSON 的旧记录。
+    metadata["draft_update_attachments"] = []
+    update_record = await protection_db.get_latest_attachment_update_publish_log(
+        row["message_id"]
+    )
+    if not update_record:
+        return metadata
+
+    try:
+        channel = bot.get_channel(update_record["channel_id"])
+        if channel is None:
+            channel = await bot.fetch_channel(update_record["channel_id"])
+        update_message = await channel.fetch_message(update_record["update_message_id"])
+        for attachment in update_message.attachments[:10]:
+            metadata["draft_update_attachments"].append(
+                DraftUpdateLogAttachment(
+                    filename=attachment.filename,
+                    data=await attachment.read(),
+                    description=getattr(attachment, "description", None),
+                    spoiler=attachment.is_spoiler(),
+                )
+            )
+    except Exception as exc:
+        metadata["update_attachment_reuse_warning"] = str(exc)
+    return metadata
 
 
 def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
@@ -1941,17 +1969,32 @@ class UploadSessionReusePublishedView(ProtectionLayoutView):
                 ephemeral=True,
             )
 
-        session.setdefault("reusable_attachments", []).extend(reusable_attachments)
-        session["reusable_metadata"] = build_reusable_metadata_from_row(row)
         await interaction.response.defer(ephemeral=True)
+        reusable_metadata = await build_reusable_metadata_from_row(
+            interaction.client, row
+        )
+        session.setdefault("reusable_attachments", []).extend(reusable_attachments)
+        session["reusable_metadata"] = reusable_metadata
+        update_attachment_count = len(
+            reusable_metadata.get("draft_update_attachments", [])
+        )
+        warning = reusable_metadata.get("update_attachment_reuse_warning")
         try:
             await interaction.edit_original_response(
                 **self.session_view.to_message_kwargs(embed=self.session_view._build_embed())
             )
         except Exception:
             pass
+        result_text = (
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前收集会话，"
+            f"并同步了标题、作者提示、更新日志与获取条件配置。"
+        )
+        if update_attachment_count:
+            result_text += f"\n🗒️ 同时复用了 **{update_attachment_count}** 个更新日志附件。"
+        if warning:
+            result_text += "\n⚠️ 原更新日志消息或附件已不可访问，更新日志附件未能复用。"
         await interaction.followup.send(
-            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前收集会话，并同步了标题、作者提示、更新日志与获取条件配置。",
+            result_text,
             ephemeral=True,
         )
 
@@ -2013,12 +2056,27 @@ class DraftReusePublishedView(ProtectionLayoutView):
                 ephemeral=True,
             )
 
-        self.protection_view.append_attachments(reusable_attachments)
-        self.protection_view.apply_draft_defaults(build_reusable_metadata_from_row(row))
         await interaction.response.defer(ephemeral=True)
+        reusable_metadata = await build_reusable_metadata_from_row(
+            interaction.client, row
+        )
+        self.protection_view.append_attachments(reusable_attachments)
+        self.protection_view.apply_draft_defaults(reusable_metadata)
+        update_attachment_count = len(
+            reusable_metadata.get("draft_update_attachments", [])
+        )
+        warning = reusable_metadata.get("update_attachment_reuse_warning")
         await self.protection_view.refresh_dashboard_message()
+        result_text = (
+            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前草稿，"
+            f"并同步了标题、作者提示、更新日志与获取条件配置。"
+        )
+        if update_attachment_count:
+            result_text += f"\n🗒️ 同时复用了 **{update_attachment_count}** 个更新日志附件。"
+        if warning:
+            result_text += "\n⚠️ 原更新日志消息或附件已不可访问，更新日志附件未能复用。"
         await interaction.followup.send(
-            f"✅ 已导入 **{len(reusable_attachments)}** 个已发布附件到当前草稿，并同步了标题、作者提示、更新日志与获取条件配置。",
+            result_text,
             ephemeral=True,
         )
 
@@ -2065,6 +2123,10 @@ class ProtectionDraftView(ProtectionLayoutView):
             self.draft_log = draft_defaults.get("draft_log")
         if "draft_update_log" in draft_defaults:
             self.draft_update_log = draft_defaults.get("draft_update_log")
+        if "draft_update_attachments" in draft_defaults:
+            self.draft_update_attachments = list(
+                draft_defaults.get("draft_update_attachments") or []
+            )
         if draft_defaults.get("draft_mode"):
             self.draft_mode = draft_defaults["draft_mode"]
         if "mention_users" in draft_defaults:

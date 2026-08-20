@@ -136,6 +136,23 @@ async def get_attachment_update_publish_logs_since(
         return await cursor.fetchall()
 
 
+async def get_latest_attachment_update_publish_log(protected_message_id: int):
+    """获取某条保护附件最近一次由 Bot 发布的更新日志消息。"""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM attachment_update_publish_log
+            WHERE protected_message_id = ?
+            ORDER BY timestamp DESC, log_id DESC
+            LIMIT 1
+            """,
+            (protected_message_id,),
+        )
+        return await cursor.fetchone()
+
+
 async def log_file_trace(
     trace_id: str,
     user_id: int,
