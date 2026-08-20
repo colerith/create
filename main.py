@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 import aiohttp
 
-from cogs.core.db import init_db
+from cogs.core.db import close_db, init_db
 from cogs.protection.views import BumpButtonView
 
 load_dotenv()
@@ -57,9 +57,10 @@ class ChimidanBot(commands.Bot):
             print("⚠️ 警告：Bot 内存中没有命令！请检查 cogs 里的代码是否正确编写。")
 
     async def close(self):
-        await super().close()
         if self.http_session:
             await self.http_session.close()
+        await close_db()
+        await super().close()
 
 bot = ChimidanBot()
 

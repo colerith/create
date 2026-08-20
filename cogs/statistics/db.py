@@ -88,6 +88,12 @@ async def init_statistics_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_reward_scan ON forum_thread_cache (forum_channel_id, likes, is_archived)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_active_likes ON forum_thread_cache (forum_channel_id, is_archived, likes DESC, last_synced_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_forum_thread_cache_global_likes ON forum_thread_cache (is_archived, likes DESC, last_synced_at DESC)"
+        )
         # 4. 帖子里程碑状态表
         await db.execute("""
             CREATE TABLE IF NOT EXISTS thread_milestone_state (
@@ -110,6 +116,9 @@ async def init_statistics_db():
             )
         except Exception:
             pass
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bumped_threads_last_bumped ON bumped_threads (last_bumped_at)"
+        )
         await db.commit()
     print("✅ [StatisticsCog] 数据库表结构检查完毕。")
 
