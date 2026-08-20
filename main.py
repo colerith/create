@@ -16,7 +16,7 @@ if not TOKEN:
     print("错误：在 .env 文件中找不到 DISCORD_TOKEN。")
     exit()
 
-TEST_GUILD_ID = [1397629012292931726, 1384945301780955246, 1413953986519760908]
+TEST_GUILD_IDS = [1397629012292931726, 1384945301780955246, 1413953986519760908]
 COG_EXTENSIONS = (
     "cogs.backup",
     "cogs.protection",
@@ -56,6 +56,26 @@ class ChimidanBot(commands.Bot):
         if len(commands_list) == 0:
             print("⚠️ 警告：Bot 内存中没有命令！请检查 cogs 里的代码是否正确编写。")
 
+        # ContextMenu 与斜杠命令都必须同步到 Discord 才会出现在客户端。
+        # 全局同步保证所有服务器、论坛帖子和普通文字频道都能收到同一套命令。
+        try:
+            synced_global = await self.tree.sync()
+            print(f"🌐 全局应用命令同步完成，共 {len(synced_global)} 个。")
+        except Exception as exc:
+            print(f"❌ 全局应用命令同步失败: {exc}")
+
+        # 测试服务器额外做 guild 同步，避免等待全局命令传播。
+        for guild_id in TEST_GUILD_IDS:
+            guild = discord.Object(id=guild_id)
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced_guild = await self.tree.sync(guild=guild)
+                print(
+                    f"🧪 测试服务器 {guild_id} 应用命令同步完成，共 {len(synced_guild)} 个。"
+                )
+            except Exception as exc:
+                print(f"⚠️ 测试服务器 {guild_id} 应用命令同步失败: {exc}")
+
     async def close(self):
         if self.http_session:
             await self.http_session.close()
@@ -69,18 +89,7 @@ async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
 
-    if bot.guilds:
-        target_guild = bot.guilds[0]
-        print(f"🚑 [紧急修复] 正在尝试强制同步命令到服务器: {target_guild.name} (ID: {target_guild.id})...")
-        try:
-            bot.tree.clear_commands(guild=target_guild)
-            bot.tree.copy_global_to(guild=target_guild)
-            synced = await bot.tree.sync(guild=target_guild)
-            print(f"✅ [恢复成功] 已成功向 {target_guild.name} 注册了 {len(synced)} 个命令！")
-        except Exception as e:
-            print(f"❌ [恢复失败] 同步出错: {e}")
-    else:
-        print("❌ Bot 还没有加入任何服务器，无法执行同步。")
+    print(f"🌐 Bot 当前已加入 {len(bot.guilds)} 个服务器，应用命令已在启动阶段同步。")
 
 
 @bot.command(name="forcesync")
