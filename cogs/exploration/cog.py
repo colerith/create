@@ -205,12 +205,16 @@ class ExplorationCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.bot.add_view(SearchPanelContainer(self.bot))
+        self._archived_index_before = {}
+        self._archived_index_complete = set()
         self.daily_task.start()
         self.pushed_panel_refresh_task.start()
+        self.archived_search_index_task.start()
 
     async def cog_unload(self):
         self.daily_task.cancel()
         self.pushed_panel_refresh_task.cancel()
+        self.archived_search_index_task.cancel()
 
     def _is_admin(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == ADMIN_USER_ID or interaction.user.guild_permissions.administrator
@@ -662,6 +666,9 @@ class ExplorationCog(commands.Cog):
     @tasks.loop(minutes=10)
     async def daily_task(self):
         """自动刷新日报面板。"""
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         for channel_id in EXPLORATION_TARGET_CHANNEL_IDS:
             channel = self.bot.get_channel(channel_id)
             if not channel:
@@ -692,6 +699,9 @@ class ExplorationCog(commands.Cog):
     @tasks.loop(minutes=30)
     async def pushed_panel_refresh_task(self):
         """定期编辑刷新用户推送出去的探索面板。"""
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         rows = await exploration_db.get_all_panel_pushes()
         for row in rows[:8]:
             try:
@@ -746,6 +756,62 @@ class ExplorationCog(commands.Cog):
     @pushed_panel_refresh_task.error
     async def pushed_panel_refresh_task_error(self, error):
         print(f"探索推送面板刷新循环异常退出: {error}")
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+    @tasks.loop(minutes=30)
+    async def archived_search_index_task(self):
+        """低速回填旧归档帖的首楼正文，供搜索使用。"""
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
+        statistics_cog = self.bot.get_cog("StatisticsCog")
+        if not statistics_cog:
+            return
+
+        remaining_budget = 25
+        for guild in self.bot.guilds:
+            for forum in guild.forums:
+                if remaining_budget <= 0:
+                    return
+                if forum.id in self._archived_index_complete:
+                    continue
+
+                cached_rows = await statistics_db.get_cached_threads_for_forums([forum.id])
+                cached_content = {
+                    int(row["thread_id"]): row.get("starter_content")
+                    for row in cached_rows
+                }
+                before = self._archived_index_before.get(forum.id)
+                yielded = 0
+                try:
+                    async for thread in forum.archived_threads(limit=25, before=before):
+                        yielded += 1
+                        self._archived_index_before[forum.id] = (
+                            thread.archive_timestamp or thread.created_at
+                        )
+                        if cached_content.get(thread.id) is not None:
+                            continue
+                        snapshot = await statistics_cog._build_thread_snapshot(thread)
+                        await statistics_db.upsert_forum_thread_snapshot(snapshot)
+                        remaining_budget -= 1
+                        await asyncio.sleep(0.25)
+                        if remaining_budget <= 0:
+                            return
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    print(f"归档搜索索引回填失败 {forum.id}: {exc}")
+                    continue
+
+                if yielded == 0:
+                    self._archived_index_complete.add(forum.id)
+
+    @archived_search_index_task.before_loop
+    async def before_archived_search_index_task(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(120)
+
+    @archived_search_index_task.error
+    async def archived_search_index_task_error(self, error):
+        print(f"归档搜索索引回填循环异常退出: {error}")
         traceback.print_exception(type(error), error, error.__traceback__)
 
     @app_commands.command(name="更新日报面板", description="[管理] 强制刷新并重发本频道日报面板")

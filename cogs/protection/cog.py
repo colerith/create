@@ -170,6 +170,9 @@ class ProtectionCog(commands.Cog):
                 current, "status", None
             ) == 429:
                 self._cool_down_bump_api()
+                scheduler = getattr(self.bot, "discord_request_scheduler", None)
+                if scheduler:
+                    scheduler.report_rate_limit(current)
                 print(
                     f"⚠️ [Discord API] {source} 触发全局 429，"
                     "置底与附件请求已共同冷却 15 分钟。"
@@ -987,6 +990,9 @@ class ProtectionCog(commands.Cog):
             print(f"- [置底任务] {channel.name} 首次执行中发生错误: {e}")
 
     async def _bump_loop(self, channel: discord.TextChannel | discord.Thread):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         try:
             # 把恢复的任务均匀摊开到一个检查周期，避免重启时产生洪峰。
             await asyncio.sleep(5 + random.uniform(0, 300))

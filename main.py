@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import aiohttp
 
 from cogs.core.db import close_db, init_db
+from cogs.core.rate_limit import DiscordRequestScheduler, install_discord_http_scheduler
 from cogs.protection.views import BumpButtonView
 
 load_dotenv()
@@ -33,8 +34,11 @@ class ChimidanBot(commands.Bot):
         intents.members = True
         super().__init__(command_prefix="!", intents=intents, help_command=None)
         self.http_session: aiohttp.ClientSession = None
+        self.discord_request_scheduler = DiscordRequestScheduler(requests_per_second=12)
 
     async def setup_hook(self):
+        self.discord_request_scheduler.start()
+        install_discord_http_scheduler(self, self.discord_request_scheduler)
         self.http_session = aiohttp.ClientSession()
         self.add_view(BumpButtonView(self))
         print("🔧 持久化视图 [BumpButtonView] 已注册。")
@@ -81,10 +85,33 @@ class ChimidanBot(commands.Bot):
     async def close(self):
         if self.http_session:
             await self.http_session.close()
+        await self.discord_request_scheduler.close()
         await close_db()
         await super().close()
 
 bot = ChimidanBot()
+
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    current = error
+    while current is not None:
+        if isinstance(current, discord.HTTPException) and getattr(
+            current, "status", None
+        ) == 429:
+            delay = bot.discord_request_scheduler.report_rate_limit(current)
+            print(
+                f"⚠️ [Discord API] 应用命令触发 429，"
+                f"全局队列暂停 {delay:.1f} 秒。"
+            )
+            return
+        current = current.__cause__ or current.__context__
+
+    import traceback
+
+    print(f"❌ 应用命令执行失败: {error}")
+    traceback.print_exception(type(error), error, error.__traceback__)
+
 
 @bot.event
 async def on_ready():

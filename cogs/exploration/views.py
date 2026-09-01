@@ -7,6 +7,15 @@ import asyncio
 import math
 
 from config import RECOMMEND_TARGET_KEYWORDS, TZ_SHANGHAI
+from ..statistics import db as statistics_db
+
+
+SEARCH_CACHE_TTL_SECONDS = 120
+SEARCH_MAX_RESULTS = 250
+_SEARCH_SEMAPHORE = asyncio.Semaphore(2)
+_SEARCH_STATE_LOCK = asyncio.Lock()
+_SEARCH_CACHE = {}
+_SEARCH_INFLIGHT = {}
 
 # ==========================================
 # Part 1. 核心搜索执行逻辑
@@ -41,95 +50,190 @@ async def collect_forum_threads(
 
     return list(threads_by_id.values())
 
-async def execute_search(interaction: discord.Interaction, search_type: str, query_data, selected_channels, selected_tag_ids=None):
-    # 立即响应，避免超时
+async def _run_cached_search(
+    cache_key,
+    interaction: discord.Interaction,
+    search_type: str,
+    query_data,
+    target_forums,
+    selected_tag_ids,
+    progress: dict,
+):
+    try:
+        progress["stage"] = "等待空闲搜索槽位"
+        async with _SEARCH_SEMAPHORE:
+            progress["stage"] = "读取本地帖子缓存"
+            forum_ids = [forum.id for forum in target_forums]
+            rows = await statistics_db.get_cached_threads_for_forums(forum_ids)
+            forum_names = {forum.id: forum.name for forum in target_forums}
+            tag_names = {
+                tag.name.lower()
+                for forum in target_forums
+                for tag in forum.available_tags
+                if selected_tag_ids and tag.id in set(map(int, selected_tag_ids))
+            }
+
+            progress.update(stage="合并活跃帖子", processed=0, total=len(rows))
+            by_id = {int(row["thread_id"]): row for row in rows}
+            for forum in target_forums:
+                for thread in forum.threads:
+                    if thread.id in by_id:
+                        continue
+                    starter = thread.starter_message
+                    owner = thread.owner
+                    by_id[thread.id] = {
+                        "thread_id": thread.id,
+                        "forum_channel_id": forum.id,
+                        "thread_name": thread.name,
+                        "thread_url": thread.jump_url,
+                        "author_id": thread.owner_id,
+                        "author_name": owner.display_name if owner else "未知作者",
+                        "author_avatar_url": owner.display_avatar.url if owner else None,
+                        "created_at": thread.created_at.isoformat() if thread.created_at else None,
+                        "tags": [tag.name for tag in thread.applied_tags],
+                        "starter_content": (starter.content or "") if starter else "",
+                    }
+
+            candidates = list(by_id.values())
+            progress.update(stage="筛选匹配内容", processed=0, total=len(candidates))
+            keyword = str(query_data).strip().lower() if search_type == "keyword" else ""
+            target_user_id = getattr(query_data, "id", None)
+            results = []
+            for index, row in enumerate(candidates, start=1):
+                row_tags = [str(tag) for tag in row.get("tags", [])]
+                if tag_names and not ({tag.lower() for tag in row_tags} & tag_names):
+                    continue
+                if search_type == "user":
+                    matched = int(row.get("author_id") or 0) == int(target_user_id or 0)
+                else:
+                    haystack = "\n".join(
+                        [
+                            str(row.get("thread_name") or ""),
+                            str(row.get("starter_content") or ""),
+                            " ".join(row_tags),
+                        ]
+                    ).lower()
+                    matched = keyword in haystack
+                if matched:
+                    row = dict(row)
+                    row["forum_name"] = forum_names.get(
+                        int(row.get("forum_channel_id") or 0), "未知分区"
+                    )
+                    results.append(row)
+                if index % 100 == 0:
+                    progress["processed"] = index
+                    await asyncio.sleep(0)
+
+            def created_sort_key(item):
+                try:
+                    return datetime.fromisoformat(item.get("created_at") or "")
+                except (TypeError, ValueError):
+                    return datetime.min
+
+            results.sort(key=created_sort_key, reverse=True)
+            results = results[:SEARCH_MAX_RESULTS]
+            progress.update(stage="整理搜索结果", processed=len(candidates), total=len(candidates))
+            payload = (results, len(candidates))
+            async with _SEARCH_STATE_LOCK:
+                _SEARCH_CACHE[cache_key] = (
+                    asyncio.get_running_loop().time() + SEARCH_CACHE_TTL_SECONDS,
+                    payload,
+                )
+            return payload
+    finally:
+        async with _SEARCH_STATE_LOCK:
+            _SEARCH_INFLIGHT.pop(cache_key, None)
+
+
+async def execute_search(
+    interaction: discord.Interaction,
+    search_type: str,
+    query_data,
+    selected_channels,
+    selected_tag_ids=None,
+):
     await interaction.response.send_message(
-        "🔍 正在全速检索中...",
-        ephemeral=True
+        "⏳ 搜索请求已进入队列，正在准备本地索引……", ephemeral=True
     )
 
-    # 1. 确定搜索范围
-    target_forums = []
     if selected_channels:
-        for ch in selected_channels:
-            full_channel = interaction.guild.get_channel(ch.id)
-            if full_channel and isinstance(full_channel, discord.ForumChannel):
-                target_forums.append(full_channel)
+        target_forums = [
+            interaction.guild.get_channel(channel.id)
+            for channel in selected_channels
+            if isinstance(interaction.guild.get_channel(channel.id), discord.ForumChannel)
+        ]
     else:
-        # 默认搜索所有论坛
-        target_forums = [ch for ch in interaction.guild.forums if isinstance(ch, discord.ForumChannel)]
+        target_forums = list(interaction.guild.forums)
 
-    # 2. 收集所有帖子（活跃 + 已归档公开帖子）
-    all_threads = await collect_forum_threads(target_forums, include_archived=True)
+    if not target_forums:
+        return await interaction.edit_original_response(content="当前范围内没有可搜索的论坛。")
 
-    if not all_threads:
-        return await interaction.edit_original_response(content="呜呜，当前范围内没有帖子可以搜捏...")
+    query_key = getattr(query_data, "id", None) or str(query_data).strip().lower()
+    cache_key = (
+        interaction.guild_id,
+        search_type,
+        query_key,
+        tuple(sorted(forum.id for forum in target_forums)),
+        tuple(sorted(map(int, selected_tag_ids or []))),
+    )
+    loop = asyncio.get_running_loop()
+    for expired_key, (expires_at, _payload) in list(_SEARCH_CACHE.items()):
+        if expires_at <= loop.time():
+            _SEARCH_CACHE.pop(expired_key, None)
+    cached = _SEARCH_CACHE.get(cache_key)
+    cache_hit = bool(cached and cached[0] > loop.time())
+    progress = {"stage": "检查搜索缓存", "processed": 0, "total": 0}
 
-    # 3. 异步并发过滤
-    sem = asyncio.Semaphore(10) # 稍微提高并发
-    results = []
-    processed_count = 0
-    total_count = len(all_threads)
-    target_tags_set = set(map(int, selected_tag_ids)) if selected_tag_ids else set()
+    if cache_hit:
+        results, total_count = cached[1]
+        await interaction.edit_original_response(content="⚡ 已命中 2 分钟搜索缓存，正在展示结果……")
+    else:
+        async with _SEARCH_STATE_LOCK:
+            task = _SEARCH_INFLIGHT.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(
+                    _run_cached_search(
+                        cache_key,
+                        interaction,
+                        search_type,
+                        query_data,
+                        target_forums,
+                        selected_tag_ids,
+                        progress,
+                    )
+                )
+                _SEARCH_INFLIGHT[cache_key] = task
+                shared = False
+            else:
+                shared = True
 
-    async def check_thread(thread):
-        nonlocal processed_count
-        try:
-            async with sem:
-                # 标签筛选
-                if target_tags_set:
-                    thread_tags = {tag.id for tag in thread.applied_tags}
-                    if not (thread_tags & target_tags_set):
-                        return None
+        last_status = None
+        while not task.done():
+            stage = "复用相同的在途搜索" if shared else progress["stage"]
+            if progress.get("total"):
+                stage += f"（{progress.get('processed', 0)}/{progress['total']}）"
+            if stage != last_status:
+                await interaction.edit_original_response(content=f"🔎 {stage}……")
+                last_status = stage
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
+            except asyncio.TimeoutError:
+                continue
+        results, total_count = await task
 
-                # 核心匹配逻辑
-                if search_type == "user":
-                    if thread.owner_id == query_data.id:
-                        return thread
-                elif search_type == "keyword":
-                    keyword = query_data.lower()
-                    # 匹配标题
-                    if keyword in thread.name.lower():
-                        return thread
-                    # 匹配首楼内容 (需获取消息，较慢)
-                    try:
-                        starter = thread.starter_message
-                        if not starter:
-                            # 尝试获取历史第一条
-                            history = [m async for m in thread.history(limit=1, oldest_first=True)]
-                            if history:
-                                starter = history[0]
-
-                        if starter and starter.content and keyword in starter.content.lower():
-                            return thread
-                    except Exception:
-                        pass
-        except Exception:
-            return None
-        finally:
-            processed_count += 1
-        return None
-
-    tasks_list = [check_thread(t) for t in all_threads]
-
-    for future in asyncio.as_completed(tasks_list):
-        result = await future
-        if result:
-            results.append(result)
-
-    # 4. 结果展示
     if not results:
-        return await interaction.edit_original_response(content=f"呜呜，翻遍了 {total_count} 个帖子也没找到符合条件的内容捏...")
+        return await interaction.edit_original_response(
+            content=f"没有找到符合条件的内容；本次从本地索引检查了 {total_count} 个帖子。",
+            view=None,
+        )
 
-    # 按时间倒序排列
-    results.sort(key=lambda t: t.created_at or datetime.min, reverse=True)
-
-    # 构建 Container 视图
-    extra_info = f" (含标签筛选)" if selected_tag_ids else ""
-    title = f"🔍 搜索结果: {len(results)}条{extra_info}"
-
-    view = SearchResultContainer(results, title, interaction.user)
-    await interaction.edit_original_response(content="", view=view)
+    extra_info = " · 含标签筛选" if selected_tag_ids else ""
+    cache_text = " · 缓存命中" if cache_hit else ""
+    title = f"🔍 搜索结果：{len(results)} 条{extra_info}{cache_text}"
+    await interaction.edit_original_response(
+        content="",
+        view=SearchResultContainer(results, title, interaction.user),
+    )
 
 
 # ==========================================
@@ -199,24 +303,27 @@ class SearchResultContainer(ui.LayoutView):
              ))
         else:
             for thread in current_items:
-                author = thread.owner
-                author_name = author.display_name if author else "未知作者"
-                author_avatar = author.display_avatar.url if author else None
+                if isinstance(thread, dict):
+                    thread_name = thread.get("thread_name") or "未命名帖子"
+                    author_name = thread.get("author_name") or "未知作者"
+                    category_name = thread.get("forum_name") or "未知分区"
+                    tags = list(thread.get("tags") or [])[:3]
+                    jump_url = thread.get("thread_url") or (
+                        f"https://discord.com/channels/{thread.get('guild_id')}/{thread.get('thread_id')}"
+                    )
+                else:
+                    author = thread.owner
+                    thread_name = thread.name
+                    author_name = author.display_name if author else "未知作者"
+                    category_name = thread.parent.name if thread.parent else "未知分区"
+                    tags = [tag.name for tag in thread.applied_tags[:3]]
+                    jump_url = thread.jump_url
 
-                # 处理标签
-                tags_str = ""
-                if thread.applied_tags:
-                    tags = [t.name for t in thread.applied_tags[:3]]
-                    tags_str = "🏷️ " + " ".join(tags)
-
-                category_name = thread.parent.name if thread.parent else "未知分区"
-
-                # 每个帖子一个 Section
-                # Accessory 放跳转按钮
-                jump_btn = ui.Button(label="传送", url=thread.jump_url, style=discord.ButtonStyle.link)
+                tags_str = "🏷️ " + " ".join(tags) if tags else ""
+                jump_btn = ui.Button(label="传送", url=jump_url, style=discord.ButtonStyle.link)
 
                 section_content = [
-                    ui.TextDisplay(content=f"**{thread.name}**"),
+                    ui.TextDisplay(content=f"**{thread_name}**"),
                     ui.TextDisplay(content=f"👤 {author_name} · 📂 {category_name}"),
                 ]
                 if tags_str:

@@ -84,6 +84,9 @@ class RecommendCog(commands.Cog):
 
     @tasks.loop(time=time(hour=0, minute=1, tzinfo=TZ_SHANGHAI))
     async def daily_recommend_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"⏰ [Recommend] Starting daily recommendation task...")
         for channel_id in RECOMMEND_DAILY_CHANNEL_IDS:
             channel = self.bot.get_channel(channel_id)

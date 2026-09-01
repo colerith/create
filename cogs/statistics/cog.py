@@ -282,13 +282,12 @@ class StatisticsCog(commands.Cog):
     async def _build_thread_snapshot(self, thread: discord.Thread) -> dict:
         starter = await self._get_thread_starter(thread)
 
-        last_message_at = None
-        try:
-            recent_messages = [msg async for msg in thread.history(limit=1)]
-            if recent_messages:
-                last_message_at = recent_messages[0].created_at
-        except discord.errors.Forbidden:
-            last_message_at = thread.created_at
+        # Discord snowflake 已包含时间，无需再为每个帖子请求最后一条消息。
+        last_message_at = (
+            discord.utils.snowflake_time(thread.last_message_id)
+            if thread.last_message_id
+            else thread.created_at
+        )
 
         likes = sum(r.count for r in starter.reactions) if starter else 0
         comments = thread.message_count - 1 if thread.message_count > 0 else 0
@@ -309,6 +308,7 @@ class StatisticsCog(commands.Cog):
             "score": likes * 1.5 + comments,
             "tags": [tag.name for tag in thread.applied_tags],
             "starter_image_url": self._get_message_image_url(starter),
+            "starter_content": (starter.content or "")[:12000] if starter else "",
             "is_pinned": bool(getattr(thread.flags, "pinned", False)),
             "is_archived": thread.archived,
             "last_synced_at": datetime.now(TZ_SHANGHAI).isoformat(),
@@ -667,6 +667,9 @@ class StatisticsCog(commands.Cog):
     # ==========================================
     @tasks.loop(time=time(hour=0, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_stats_refresh(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动每日统计刷新任务...")
         panels = await statistics_db.get_all_statistics_panels()
 
@@ -721,6 +724,9 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(hours=3)
     async def bumping_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动帖子顶帖任务...")
 
         forums_to_scan = []
@@ -819,6 +825,9 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(minutes=30)
     async def keepalive_pinned_threads_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动置顶标注帖保活任务...")
         forums_to_scan = {}
         for guild in self.bot.guilds:
@@ -885,6 +894,9 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(minutes=30)
     async def thread_cache_sync_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动论坛帖子缓存同步任务...")
 
         forums_to_sync = {}
@@ -912,6 +924,9 @@ class StatisticsCog(commands.Cog):
 
     @tasks.loop(hours=SCAN_INTERVAL_HOURS)
     async def like_role_reward_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print(f"[{datetime.now(TZ_SHANGHAI)}] 启动点赞身份组扫描任务...")
         result = await self.process_like_role_rewards(
             max_role_grants=MAX_ROLE_GRANTS_PER_AUTO_RUN

@@ -59,6 +59,7 @@ async def init_statistics_db():
                 score REAL NOT NULL DEFAULT 0,
                 tags_json TEXT NOT NULL DEFAULT '[]',
                 starter_image_url TEXT,
+                starter_content TEXT,
                 is_pinned INTEGER NOT NULL DEFAULT 0,
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 last_synced_at TEXT NOT NULL
@@ -73,6 +74,12 @@ async def init_statistics_db():
         try:
             await db.execute(
                 "ALTER TABLE forum_thread_cache ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE forum_thread_cache ADD COLUMN starter_content TEXT"
             )
         except Exception:
             pass
@@ -179,8 +186,9 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
             INSERT INTO forum_thread_cache (
                 thread_id, guild_id, forum_channel_id, thread_name, thread_url,
                 author_id, author_name, created_at, last_message_at, likes,
-                comments, score, tags_json, starter_image_url, is_pinned, is_archived, last_synced_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                comments, score, tags_json, starter_image_url, starter_content,
+                is_pinned, is_archived, last_synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET
                 guild_id = excluded.guild_id,
                 forum_channel_id = excluded.forum_channel_id,
@@ -195,6 +203,7 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
                 score = excluded.score,
                 tags_json = excluded.tags_json,
                 starter_image_url = excluded.starter_image_url,
+                starter_content = excluded.starter_content,
                 is_pinned = excluded.is_pinned,
                 is_archived = excluded.is_archived,
                 last_synced_at = excluded.last_synced_at
@@ -214,6 +223,7 @@ async def upsert_forum_thread_snapshot(snapshot: dict):
                 snapshot.get("score", 0),
                 json.dumps(snapshot.get("tags", []), ensure_ascii=False),
                 snapshot.get("starter_image_url"),
+                snapshot.get("starter_content"),
                 1 if snapshot.get("is_pinned") else 0,
                 1 if snapshot.get("is_archived") else 0,
                 snapshot["last_synced_at"],
@@ -335,6 +345,26 @@ async def get_cached_forum_threads(
             item["tags"] = json.loads(item.get("tags_json") or "[]")
             result.append(item)
         return result
+
+
+async def get_cached_threads_for_forums(forum_channel_ids: list[int]) -> list[dict]:
+    """一次查询返回多个论坛的全部缓存帖子，供本地搜索使用。"""
+    if not forum_channel_ids:
+        return []
+    placeholders = ", ".join("?" for _ in forum_channel_ids)
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT * FROM forum_thread_cache WHERE forum_channel_id IN ({placeholders})",
+            forum_channel_ids,
+        )
+        rows = await cursor.fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["tags"] = json.loads(item.get("tags_json") or "[]")
+        result.append(item)
+    return result
 
 
 async def get_cached_pinned_forum_threads(

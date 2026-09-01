@@ -126,6 +126,9 @@ class CoreBackupCog(commands.Cog):
 
     @tasks.loop(time=time(hour=4, minute=0, tzinfo=TZ_SHANGHAI))
     async def daily_core_backup_task(self):
+        scheduler = getattr(self.bot, "discord_request_scheduler", None)
+        if scheduler:
+            scheduler.set_current_priority(20)
         print("⏰ [CoreBackup] 开始执行每日核心数据备份任务...")
         await self.send_core_backup()
 
