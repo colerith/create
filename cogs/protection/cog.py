@@ -59,6 +59,8 @@ class ProtectionCog(commands.Cog):
         # 请求速率，避免 Bot 重启或重连时所有任务一起扫历史。
         self._bump_api_lock = asyncio.Lock()
         self._bump_api_next_at = 0.0
+        self._discord_api_cooldown_until = 0.0
+        self.attachment_delivery_semaphore = asyncio.Semaphore(2)
         self.upload_sessions = {}
 
     maker_group = app_commands.Group(
@@ -146,11 +148,35 @@ class ProtectionCog(commands.Cog):
             self._bump_api_next_at = loop.time() + 0.125
 
     def _cool_down_bump_api(self, seconds: float = 900.0) -> None:
-        """某个置底任务遇到 429 后，让所有置底任务共享冷却时间。"""
+        """某个请求遇到 429 后，让置底与附件功能共享冷却时间。"""
         loop = asyncio.get_running_loop()
-        self._bump_api_next_at = max(
-            self._bump_api_next_at, loop.time() + max(seconds, 60.0)
+        cooldown_until = loop.time() + max(seconds, 60.0)
+        self._discord_api_cooldown_until = max(
+            self._discord_api_cooldown_until, cooldown_until
         )
+        self._bump_api_next_at = max(self._bump_api_next_at, cooldown_until)
+
+    def discord_api_cooldown_remaining(self) -> float:
+        return max(
+            0.0,
+            self._discord_api_cooldown_until - asyncio.get_running_loop().time(),
+        )
+
+    def register_discord_rate_limit(self, error: Exception, source: str) -> bool:
+        """识别 Discord 429 并打开全附件模块共用的熔断。"""
+        current = error
+        while current is not None:
+            if isinstance(current, discord.HTTPException) and getattr(
+                current, "status", None
+            ) == 429:
+                self._cool_down_bump_api()
+                print(
+                    f"⚠️ [Discord API] {source} 触发全局 429，"
+                    "置底与附件请求已共同冷却 15 分钟。"
+                )
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     def _is_bump_message(self, message: discord.Message) -> bool:
         if message.author.id != self.bot.user.id or not message.components:
@@ -631,22 +657,30 @@ class ProtectionCog(commands.Cog):
 
     @user_group.command(name="获取附件", description="显示本频道最近的受保护附件列表")
     async def get_attachments_list(self, interaction: discord.Interaction):
-        rows = await protection_db.get_items_in_channel(
-            interaction.channel.id, limit=25
-        )  # 下拉菜单最多25个
-        if not rows:
-            return await interaction.response.send_message(
-                "❌ 本频道没有任何受保护的附件记录。", ephemeral=True
+        # 全局封锁期内不再尝试回复：回复本身也会继续累加 429。
+        if self.discord_api_cooldown_remaining() > 0:
+            return
+        try:
+            rows = await protection_db.get_items_in_channel(
+                interaction.channel.id, limit=25
+            )  # 下拉菜单最多25个
+            if not rows:
+                return await interaction.response.send_message(
+                    "❌ 本频道没有任何受保护的附件记录。", ephemeral=True
+                )
+            view = PostListView(self.bot, rows)
+            embed = discord.Embed(
+                title="📂 附件获取列表",
+                description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个下载。",
+                color=0x87CEEB,
             )
-        view = PostListView(self.bot, rows)
-        embed = discord.Embed(
-            title="📂 附件获取列表",
-            description=f"发现本频道有 **{len(rows)}** 个最近的附件包。\n请在下方下拉菜单中选择一个下载。",
-            color=0x87CEEB,
-        )
-        await interaction.response.send_message(
-            **view.to_message_kwargs(embed=embed, ephemeral=True)
-        )
+            await interaction.response.send_message(
+                **view.to_message_kwargs(embed=embed, ephemeral=True)
+            )
+        except discord.HTTPException as exc:
+            if self.register_discord_rate_limit(exc, "/保护附件 获取附件"):
+                return
+            raise
 
     # --- 贴主命令 ---
     @maker_group.command(name="管理附件", description="管理我在此讨论串中发布的附件")
@@ -1029,12 +1063,7 @@ class ProtectionCog(commands.Cog):
                         del self.bump_tasks[channel.id]
                     break  # 没权限了直接退出循环
                 except discord.HTTPException as e:
-                    if getattr(e, "status", None) == 429:
-                        self._cool_down_bump_api()
-                        print(
-                            f"⚠️ [置底任务] Discord 全局限流，所有置底请求已冷却 15 分钟: "
-                            f"{channel.name}"
-                        )
+                    if self.register_discord_rate_limit(e, f"置底任务: {channel.name}"):
                         continue
                     if getattr(e, "code", None) == 50083:
                         await protection_db.remove_bump_config(channel.id)

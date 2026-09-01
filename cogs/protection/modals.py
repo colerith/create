@@ -215,6 +215,13 @@ class PasswordUnlockModal(ui.Modal, title="请输入口令"):
         self.bot = bot
         self.ut = unlock_type
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        from .views import register_discord_rate_limit
+
+        if register_discord_rate_limit(self.bot, error, "附件口令验证"):
+            return
+        await super().on_error(interaction, error)
+
     async def on_submit(self, i: discord.Interaction):
         user_input = self.password_input.value.strip()
         if user_input != self.c:

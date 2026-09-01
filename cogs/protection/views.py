@@ -90,6 +90,16 @@ class _LayoutItemCallback:
         return self.callback(self.parent, interaction, self.item)
 
 
+def register_discord_rate_limit(bot, error: Exception, source: str) -> bool:
+    cog = bot.get_cog("ProtectionCog") if bot else None
+    return bool(cog and cog.register_discord_rate_limit(error, source))
+
+
+def discord_api_is_cooling_down(bot) -> bool:
+    cog = bot.get_cog("ProtectionCog") if bot else None
+    return bool(cog and cog.discord_api_cooldown_remaining() > 0)
+
+
 class ProtectionLayoutView(ui.LayoutView):
     """LayoutView that keeps legacy controls inside Components v2 containers."""
 
@@ -114,6 +124,17 @@ class ProtectionLayoutView(ui.LayoutView):
         self._layout_accent_colour = accent_colour or PALETTE_SKY_BLUE
         self._init_decorated_items()
         self._rebuild_layout_containers()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Discord 全局封锁期内不再尝试回复交互，避免延长封锁。
+        return not discord_api_is_cooling_down(interaction.client)
+
+    async def on_error(self, interaction, error, item) -> None:
+        if register_discord_rate_limit(
+            interaction.client, error, f"附件组件 {type(self).__name__}"
+        ):
+            return
+        await super().on_error(interaction, error, item)
 
     def set_message_content(
         self,
@@ -1052,7 +1073,13 @@ async def deliver_protected_content(
     if file_results:
         send_kwargs["files"] = make_discord_files_common(file_results)
 
-    sent_message = await interaction.followup.send(**send_kwargs, wait=True)
+    cog = bot.get_cog("ProtectionCog") if bot else None
+    semaphore = getattr(cog, "attachment_delivery_semaphore", None)
+    if semaphore:
+        async with semaphore:
+            sent_message = await interaction.followup.send(**send_kwargs, wait=True)
+    else:
+        sent_message = await interaction.followup.send(**send_kwargs, wait=True)
 
     image_archive_notice = None
     image_archive_file = None
@@ -1108,8 +1135,8 @@ async def deliver_protected_content(
 
     try:
         await sent_message.edit(embed=result_embed)
-    except discord.HTTPException:
-        pass
+    except discord.HTTPException as exc:
+        register_discord_rate_limit(bot, exc, "更新附件下载指引")
 
     if image_archive_file:
         try:
@@ -1118,8 +1145,8 @@ async def deliver_protected_content(
                 file=image_archive_file,
                 ephemeral=True,
             )
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as exc:
+            register_discord_rate_limit(bot, exc, "发送图片压缩包")
 
 
 async def check_rate_limit_and_report(
@@ -1235,11 +1262,18 @@ class AuthorNoteView(ProtectionLayoutView):
             # 记录普通下载日志
             await record_download_common(interaction.user, self.row)
             await deliver_protected_content(interaction, self.bot, self.row)
+        except discord.HTTPException as exc:
+            if register_discord_rate_limit(self.bot, exc, "交付附件文件"):
+                return
+            raise
         except Exception as e:
             import traceback
 
             traceback.print_exc()
-            await interaction.followup.send(f"❌ 发生未知错误: {e}", ephemeral=True)
+            try:
+                await interaction.followup.send(f"❌ 发生未知错误: {e}", ephemeral=True)
+            except discord.HTTPException as exc:
+                register_discord_rate_limit(self.bot, exc, "附件错误回复")
 
 
 async def start_download_flow(interaction: discord.Interaction, bot, row):
@@ -3513,6 +3547,8 @@ class BumpButtonView(ProtectionLayoutView):
         """
 
         bot = interaction.client
+        if discord_api_is_cooling_down(bot):
+            return
         rows = await protection_db.get_items_in_channel(
             interaction.channel_id, limit=25
         )
