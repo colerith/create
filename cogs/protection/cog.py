@@ -55,6 +55,10 @@ class ProtectionCog(commands.Cog):
         self.bot.tree.add_command(self.bump_disable_ctx_menu)
         self.bot.tree.add_command(self.bump_refresh_ctx_menu)
         self.bump_tasks = {}
+        # 置底任务可能同时维护数百个频道。统一限制它们的 Discord API
+        # 请求速率，避免 Bot 重启或重连时所有任务一起扫历史。
+        self._bump_api_lock = asyncio.Lock()
+        self._bump_api_next_at = 0.0
         self.upload_sessions = {}
 
     maker_group = app_commands.Group(
@@ -128,6 +132,26 @@ class ProtectionCog(commands.Cog):
             channel, "archived", False
         )
 
+    async def _wait_for_bump_api_slot(self) -> None:
+        """将置底功能的 REST 请求限制在约 8 次/秒。
+
+        Discord 客户端会处理普通的路由限流，这里还需要避免大量独立置底
+        任务在进程启动时制造全局请求峰值。
+        """
+        loop = asyncio.get_running_loop()
+        async with self._bump_api_lock:
+            delay = self._bump_api_next_at - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._bump_api_next_at = loop.time() + 0.125
+
+    def _cool_down_bump_api(self, seconds: float = 900.0) -> None:
+        """某个置底任务遇到 429 后，让所有置底任务共享冷却时间。"""
+        loop = asyncio.get_running_loop()
+        self._bump_api_next_at = max(
+            self._bump_api_next_at, loop.time() + max(seconds, 60.0)
+        )
+
     def _is_bump_message(self, message: discord.Message) -> bool:
         if message.author.id != self.bot.user.id or not message.components:
             return False
@@ -164,6 +188,7 @@ class ProtectionCog(commands.Cog):
         latest_message = None
         old_bump_message = None
 
+        await self._wait_for_bump_api_slot()
         async for msg in channel.history(limit=limit):
             if latest_message is None:
                 latest_message = msg
@@ -188,11 +213,14 @@ class ProtectionCog(commands.Cog):
             return None
 
         try:
+            await self._wait_for_bump_api_slot()
             message = await channel.fetch_message(message_id)
         except discord.NotFound:
             await protection_db.remove_sticky_message(channel.id)
             return None
-        except discord.HTTPException:
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                raise
             return None
 
         if not self._is_bump_message(message):
@@ -207,9 +235,12 @@ class ProtectionCog(commands.Cog):
             starter_message = channel.starter_message
             if not starter_message:
                 try:
+                    await self._wait_for_bump_api_slot()
                     history = [msg async for msg in channel.history(limit=1, oldest_first=True)]
                     starter_message = history[0] if history else None
-                except (discord.Forbidden, discord.HTTPException):
+                except discord.HTTPException as exc:
+                    if getattr(exc, "status", None) == 429:
+                        raise
                     starter_message = None
 
             if starter_message:
@@ -220,9 +251,12 @@ class ProtectionCog(commands.Cog):
             return None
 
         try:
+            await self._wait_for_bump_api_slot()
             history = [msg async for msg in channel.history(limit=1, oldest_first=True)]
             first_message = history[0] if history else None
-        except (discord.Forbidden, discord.HTTPException):
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                raise
             first_message = None
 
         if first_message:
@@ -234,6 +268,7 @@ class ProtectionCog(commands.Cog):
     async def _send_bump_message(self, channel: discord.TextChannel | discord.Thread):
         top_url = await self._get_channel_top_message_url(channel)
         view = BumpButtonView(self.bot, top_url=top_url)
+        await self._wait_for_bump_api_slot()
         message = await channel.send(**view.create_layout())
         await protection_db.set_sticky_message(channel.id, message.id)
         return message
@@ -242,15 +277,19 @@ class ProtectionCog(commands.Cog):
         try:
             top_url = await self._get_channel_top_message_url(message.channel)
             view = BumpButtonView(self.bot, top_url=top_url)
+            await self._wait_for_bump_api_slot()
             await message.edit(**view.create_layout())
             return True
         except discord.NotFound:
             return False
-        except discord.HTTPException:
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                raise
             return False
 
     async def _safe_delete_message(self, message: discord.Message) -> bool:
         try:
+            await self._wait_for_bump_api_slot()
             await message.delete()
             return True
         except discord.HTTPException as e:
@@ -915,8 +954,8 @@ class ProtectionCog(commands.Cog):
 
     async def _bump_loop(self, channel: discord.TextChannel | discord.Thread):
         try:
-            # 在循环开始前等待一小段时间，确保cog完全加载
-            await asyncio.sleep(5 + random.uniform(0, 8))
+            # 把恢复的任务均匀摊开到一个检查周期，避免重启时产生洪峰。
+            await asyncio.sleep(5 + random.uniform(0, 300))
             while not self.bot.is_closed():
                 try:
                     if self._is_thread_archived(channel):
@@ -940,9 +979,10 @@ class ProtectionCog(commands.Cog):
                     if should_have_bump:
                         if not tracked_bump_message:
                             await self._send_bump_message(channel)
-                        elif self._should_refresh_in_place(nearby_bump_message):
-                            await self._refresh_bump_message(tracked_bump_message)
-                        elif self._should_repost_stale_bump(tracked_bump_message):
+                        # 面板仍在最近 10 条时无需每 5 分钟重复编辑。
+                        elif not self._should_refresh_in_place(
+                            nearby_bump_message
+                        ) and self._should_repost_stale_bump(tracked_bump_message):
                             deleted = await self._safe_delete_message(tracked_bump_message)
                             if not deleted:
                                 await protection_db.remove_bump_config(channel.id)
@@ -989,6 +1029,13 @@ class ProtectionCog(commands.Cog):
                         del self.bump_tasks[channel.id]
                     break  # 没权限了直接退出循环
                 except discord.HTTPException as e:
+                    if getattr(e, "status", None) == 429:
+                        self._cool_down_bump_api()
+                        print(
+                            f"⚠️ [置底任务] Discord 全局限流，所有置底请求已冷却 15 分钟: "
+                            f"{channel.name}"
+                        )
+                        continue
                     if getattr(e, "code", None) == 50083:
                         await protection_db.remove_bump_config(channel.id)
                         await protection_db.remove_sticky_message(channel.id)
