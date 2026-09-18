@@ -401,13 +401,13 @@ class ProtectionCog(commands.Cog):
             f"[ProtectionDebug] upload-session-collected: user={message.author.id} channel={message.channel.id} message={message.id} items={count_collectible_message_items(message)} attachments={len(message.attachments)} text={bool((message.content or '').strip())}"
         )
 
+        # 普通消息不能发送 ephemeral 回复，改为更新原有的私密收集面板。
         try:
-            await message.reply(
-                "🔒 已收纳到保护附件草稿，待贴主确认发布后才会转为正式保护附件。",
-                mention_author=False,
-                delete_after=20,
-            )
-        except Exception:
+            panel = session.get("panel_message")
+            view = session.get("panel_view")
+            if panel and view:
+                await panel.edit(**view.to_message_kwargs(embed=view._build_embed()))
+        except discord.HTTPException:
             pass
 
     async def _expire_upload_session(
@@ -776,6 +776,11 @@ class ProtectionCog(commands.Cog):
         await interaction.response.send_message(
             **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
+        session = self.get_upload_session(interaction.user.id, interaction.channel.id)
+        if session is not None:
+            session["panel_view"] = view
+            session["panel_message"] = await interaction.original_response()
+
 
     @maker_group.command(
         name="置底附件列表", description="开启/关闭本频道附件列表的自动置底"

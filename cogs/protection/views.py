@@ -870,6 +870,25 @@ async def build_reusable_metadata_from_row(bot, row):
         "draft_password": row["password"],
     }
 
+    async with get_db() as db:
+        cursor = await db.execute("SELECT entries_json FROM protected_update_logs WHERE protected_message_id = ?", (row["message_id"],))
+        saved = await cursor.fetchone()
+    if saved is not None:
+        metadata["draft_update_logs"] = []
+        for entry in json.loads(saved[0]):
+            cached = []
+            metadata["draft_update_logs"].append({"text": entry["text"], "attachments": cached})
+            for message_id in entry["message_ids"][:1]:
+                try:
+                    channel = bot.get_channel(row["channel_id"]) or await bot.fetch_channel(row["channel_id"])
+                    message = await channel.fetch_message(message_id)
+                    for attachment in message.attachments:
+                        cached.append(DraftUpdateLogAttachment(attachment.filename, await attachment.read(), getattr(attachment, "description", None), attachment.is_spoiler()))
+                except Exception as exc:
+                    metadata["update_attachment_reuse_warning"] = str(exc)
+        metadata["draft_update_attachments"] = [a for entry in metadata["draft_update_logs"] for a in entry["attachments"]]
+        return metadata
+
     # 更新附件本体仍保存在原 Discord 更新消息中。复用时读取为草稿缓存，
     # 从而兼容本功能上线前已经发布且数据库没有附件 JSON 的旧记录。
     metadata["draft_update_attachments"] = []
@@ -896,6 +915,20 @@ async def build_reusable_metadata_from_row(bot, row):
     except Exception as exc:
         metadata["update_attachment_reuse_warning"] = str(exc)
     return metadata
+
+
+def split_update_content(content, limit=2000):
+    # Discord 的文本长度按 UTF-16 计数，保留完整字符和原文。
+    chunk, size = "", 0
+    for char in content:
+        width = len(char.encode("utf-16-le")) // 2
+        if size + width > limit:
+            yield chunk
+            chunk, size = "", 0
+        chunk += char
+        size += width
+    if chunk:
+        yield chunk
 
 
 def chunk_file_entries(file_entries, page_index, page_size=FILE_EDIT_PAGE_SIZE):
@@ -1877,6 +1910,8 @@ class UploadSessionControlView(ProtectionLayoutView):
             color=0x87CEEB,
             description=description,
         )
+        if msg_count:
+            embed.description += "\n🔒 已收纳到保护附件草稿，待贴主确认发布后才会转为正式保护附件。"
         embed.add_field(name="已收集消息", value=str(msg_count), inline=True)
         embed.add_field(name="已收集项目", value=str(attachment_count), inline=True)
         embed.add_field(name="截止时间", value=expire_text, inline=True)
@@ -1907,6 +1942,7 @@ class UploadSessionControlView(ProtectionLayoutView):
                 "❌ 你的附件库里还没有已发布内容可复用。",
                 ephemeral=True,
             )
+        self.panel_message = interaction.message
         view = UploadSessionReusePublishedView(self, rows)
         await interaction.response.send_message(
             **view.to_message_kwargs(
@@ -2014,7 +2050,7 @@ class UploadSessionReusePublishedView(ProtectionLayoutView):
         )
         warning = reusable_metadata.get("update_attachment_reuse_warning")
         try:
-            await interaction.edit_original_response(
+            await self.session_view.panel_message.edit(
                 **self.session_view.to_message_kwargs(embed=self.session_view._build_embed())
             )
         except Exception:
@@ -2027,10 +2063,7 @@ class UploadSessionReusePublishedView(ProtectionLayoutView):
             result_text += f"\n🗒️ 同时复用了 **{update_attachment_count}** 个更新日志附件。"
         if warning:
             result_text += "\n⚠️ 原更新日志消息或附件已不可访问，更新日志附件未能复用。"
-        await interaction.followup.send(
-            result_text,
-            ephemeral=True,
-        )
+        await interaction.edit_original_response(view=build_status_view(result_text, accent_colour=PALETTE_HONEYDEW))
 
 
 class DraftReusePublishedView(ProtectionLayoutView):
@@ -2115,6 +2148,64 @@ class DraftReusePublishedView(ProtectionLayoutView):
         )
 
 
+class DraftUpdateLogsView(ProtectionLayoutView):
+    def __init__(self, draft):
+        super().__init__(timeout=600, accent_colour=PALETTE_SKY_BLUE)
+        self.draft = draft
+        self.selected = 0
+        self.rebuild()
+
+    def rebuild(self):
+        if hasattr(self, "select_menu"):
+            self._layout_items.remove(self.select_menu)
+        logs = self.draft.draft_update_logs
+        self.selected = min(self.selected, max(0, len(logs) - 1))
+        self.select_menu = ui.Select(placeholder="选择要修改或删除的日志", options=[discord.SelectOption(label=f"{n + 1}. {entry['text'] or '仅附件'}"[:100], value=str(n), default=n == self.selected, description=f"{len(entry['attachments'])} 个附件") for n, entry in enumerate(logs)] or [discord.SelectOption(label="尚未设置更新日志", value="0")], disabled=not logs, row=0)
+        self.select_menu.callback = self.select_log
+        self.add_item(self.select_menu)
+        self.add_log.disabled = len(logs) >= 25
+        self.edit_log.disabled = self.delete_log.disabled = self.clear_files.disabled = not logs
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.draft.user.id and await super().interaction_check(interaction)
+
+    async def select_log(self, interaction):
+        self.selected = int(self.select_menu.values[0])
+        await self.refresh(interaction)
+
+    async def refresh(self, interaction):
+        self.rebuild()
+        kwargs = self.to_message_kwargs(content=f"更新日志共 {len(self.draft.draft_update_logs)} 条；按顺序发布，开启艾特后仅第一条艾特全员。")
+        if interaction.response.is_done():
+            await interaction.edit_original_response(**kwargs)
+        else:
+            await interaction.response.edit_message(**kwargs)
+        await self.draft.refresh_dashboard_message()
+
+    @ui.button(label="新增日志", style=discord.ButtonStyle.success, row=1)
+    async def add_log(self, i, b):
+        await i.response.send_modal(DraftUpdateLogModal(self))
+
+    @ui.button(label="修改日志", style=discord.ButtonStyle.secondary, row=1)
+    async def edit_log(self, i, b):
+        await i.response.send_modal(DraftUpdateLogModal(self, self.selected))
+
+    @ui.button(label="删除日志", style=discord.ButtonStyle.danger, row=1)
+    async def delete_log(self, i, b):
+        if self.draft.draft_update_logs:
+            self.draft.draft_update_logs.pop(self.selected)
+        await self.refresh(i)
+
+    @ui.button(label="清除日志附件", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_files(self, i, b):
+        if self.draft.draft_update_logs:
+            entry = self.draft.draft_update_logs[self.selected]
+            entry["attachments"] = []
+            if not entry["text"]:
+                self.draft.draft_update_logs.pop(self.selected)
+        await self.refresh(i)
+
+
 class ProtectionDraftView(ProtectionLayoutView):
     def __init__(
         self,
@@ -2132,8 +2223,7 @@ class ProtectionDraftView(ProtectionLayoutView):
         self.target_message = target_message
         self.draft_title = f"{user.display_name} 的保护附件"
         self.draft_log = default_log
-        self.draft_update_log = None
-        self.draft_update_attachments = []
+        self.draft_update_logs = []
         self.mention_users = False
         self.draft_password = None
         self.draft_mode = "like"
@@ -2148,6 +2238,14 @@ class ProtectionDraftView(ProtectionLayoutView):
         }
         self.apply_draft_defaults(draft_defaults)
 
+    @property
+    def draft_update_log(self):
+        return "\n\n".join(entry["text"] for entry in self.draft_update_logs if entry["text"]) or None
+
+    @property
+    def draft_update_attachments(self):
+        return [attachment for entry in self.draft_update_logs for attachment in entry["attachments"]]
+
     def apply_draft_defaults(self, draft_defaults):
         if not draft_defaults:
             return
@@ -2155,12 +2253,12 @@ class ProtectionDraftView(ProtectionLayoutView):
             self.draft_title = draft_defaults["draft_title"]
         if "draft_log" in draft_defaults:
             self.draft_log = draft_defaults.get("draft_log")
-        if "draft_update_log" in draft_defaults:
-            self.draft_update_log = draft_defaults.get("draft_update_log")
-        if "draft_update_attachments" in draft_defaults:
-            self.draft_update_attachments = list(
-                draft_defaults.get("draft_update_attachments") or []
-            )
+        if "draft_update_logs" in draft_defaults:
+            self.draft_update_logs = draft_defaults["draft_update_logs"]
+        elif "draft_update_log" in draft_defaults:
+            text = draft_defaults.get("draft_update_log")
+            attachments = list(draft_defaults.get("draft_update_attachments") or [])
+            self.draft_update_logs = [{"text": text or "", "attachments": attachments}] if text or attachments else []
         if draft_defaults.get("draft_mode"):
             self.draft_mode = draft_defaults["draft_mode"]
         if "mention_users" in draft_defaults:
@@ -2275,6 +2373,11 @@ class ProtectionDraftView(ProtectionLayoutView):
         await interaction.response.send_message(
             **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
+        session = cog.get_upload_session(interaction.user.id, interaction.channel.id)
+        if session is not None:
+            session["panel_view"] = view
+            session["panel_message"] = await interaction.original_response()
+
 
     def sync_custom_names_from_entries(self):
         self.custom_names = {
@@ -2371,7 +2474,7 @@ class ProtectionDraftView(ProtectionLayoutView):
             ui.Separator(),
             ui.TextDisplay(content="**基础信息**\n设置作品标题、作者声明和更新日志。"),
             ui.ActionRow(self.btn_set_title, self.btn_set_note, self.btn_set_update_log),
-            ui.TextDisplay(content=f"**更新日志:** {update_log_text}"),
+            ui.TextDisplay(content=f"**更新日志（{len(self.draft_update_logs)} 条）:** {update_log_text}"),
             ui.ActionRow(self.btn_view_files),
             ui.Separator(),
             ui.TextDisplay(
@@ -2477,7 +2580,7 @@ class ProtectionDraftView(ProtectionLayoutView):
 
     @ui.button(label="更新日志", style=discord.ButtonStyle.secondary, row=0, emoji="🗒️")
     async def btn_set_update_log(self, i: discord.Interaction, b: ui.Button):
-        await i.response.send_modal(DraftUpdateLogModal(self))
+        await i.response.send_message(**DraftUpdateLogsView(self).to_message_kwargs(content="管理更新日志：可新增、修改或删除；每条最多 4000 字，发布时自动分段。", ephemeral=True))
 
     @ui.button(label="单文件操作", style=discord.ButtonStyle.secondary, row=1, emoji="✏️")
     async def btn_rename_files(self, i: discord.Interaction, b: ui.Button):
@@ -2646,58 +2749,44 @@ class ProtectionDraftView(ProtectionLayoutView):
         except Exception:
             pass
 
-        # 发布更新通知（若配置）
-        has_update_log = bool(
-            self.draft_update_log or self.draft_update_attachments
-        )
+        # 每条日志单独发送；超长正文分段，只有第一条消息允许艾特。
         update_publish_error = None
-        if self.mention_users or has_update_log:
-            mention_text = "@everyone" if self.mention_users else ""
-
-            if mention_text:
-                await interaction.channel.send(f"📣 **更新通知** {mention_text}")
-
-            if has_update_log:
-                update_header = f"🗒️ **{self.draft_title} 更新日志**"
-                update_content = update_header
-                if self.draft_update_log:
-                    update_content += f"\n{self.draft_update_log}"
-                update_files = [
-                    attachment.to_file()
-                    for attachment in self.draft_update_attachments
-                ]
+        saved_entries = []
+        for index, entry in enumerate(self.draft_update_logs):
+            refs = []
+            saved_entries.append({"text": entry["text"], "message_ids": refs})
+            content = f"🗒️ **{self.draft_title} 更新日志 {index + 1}**\n{entry['text']}"
+            if index == 0 and self.mention_users:
+                content = "@everyone\n" + content
+            for part_index, chunk in enumerate(split_update_content(content)):
                 try:
                     update_msg = await interaction.channel.send(
-                        update_content,
-                        files=update_files,
+                        chunk,
+                        files=[a.to_file() for a in entry["attachments"]] if part_index == 0 else [],
+                        allowed_mentions=discord.AllowedMentions(everyone=self.mention_users and index == 0 and part_index == 0, users=False, roles=False),
+                    )
+                    refs.append(update_msg.id)
+                    await protection_db.record_attachment_update_publish_log(
+                        owner_id=self.user.id, guild_id=getattr(interaction.guild, "id", None),
+                        channel_id=interaction.channel.id, protected_message_id=final_msg.id,
+                        update_message_id=update_msg.id, title=self.draft_title,
+                        update_log=chunk, timestamp=datetime.now(TZ_SHANGHAI).isoformat(),
+                        mention_users=self.mention_users and index == 0 and part_index == 0,
                     )
                 except Exception as exc:
                     update_publish_error = exc
-                    update_msg = None
-
-                if update_msg is None:
-                    await interaction.followup.send(
-                        f"⚠️ 保护附件已发布，但更新日志或其附件发送失败：{update_publish_error}",
-                        ephemeral=True,
-                    )
-                else:
-                    await protection_db.record_attachment_update_publish_log(
-                        owner_id=self.user.id,
-                        guild_id=getattr(interaction.guild, "id", None),
-                        channel_id=interaction.channel.id,
-                        protected_message_id=final_msg.id,
-                        update_message_id=update_msg.id,
-                        title=self.draft_title,
-                        update_log=self.draft_update_log or "",
-                        timestamp=datetime.now(TZ_SHANGHAI).isoformat(),
-                        mention_users=self.mention_users,
-                    )
+                    await interaction.followup.send(f"⚠️ 保护附件已发布，但第 {index + 1} 条更新日志发送失败：{exc}", ephemeral=True)
+                    break
+                if part_index == 0:
                     try:
                         await update_msg.pin(reason="附件更新日志标注")
-                    except:
-                        await interaction.followup.send(
-                            "提示：我没有置顶权限，更新日志未能自动标注。", ephemeral=True
-                        )
+                    except discord.HTTPException:
+                        pass
+        async with get_db() as db:
+            await db.execute("INSERT OR REPLACE INTO protected_update_logs VALUES (?, ?)", (final_msg.id, json.dumps(saved_entries, ensure_ascii=False)))
+            await db.commit()
+        if self.mention_users and not self.draft_update_logs:
+            await interaction.channel.send("📣 **更新通知** @everyone", allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
 
         if update_publish_error is None:
             await interaction.followup.send(
@@ -3309,6 +3398,11 @@ class PostManagementView(ProtectionLayoutView):
         await interaction.response.send_message(
             **view.to_message_kwargs(embed=view._build_embed(), ephemeral=True)
         )
+        session = cog.get_upload_session(interaction.user.id, interaction.channel.id)
+        if session is not None:
+            session["panel_view"] = view
+            session["panel_message"] = await interaction.original_response()
+
 
     # 第二排：逻辑修改与删除
     @ui.button(label="⚙️ 修改验证方式", style=discord.ButtonStyle.primary, row=2)

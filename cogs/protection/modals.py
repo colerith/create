@@ -87,7 +87,7 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
     )
     attachment_input = ui.Label(
         text="更新日志附件",
-        description="可选，最多上传 10 个文件；新上传的文件会替换草稿中已有的更新日志附件。",
+        description="可选，最多上传 10 个文件；新上传的文件会替换当前这条日志的附件；不上传则保留。",
         component=ui.FileUpload(
             custom_id="draft_update_log_attachments",
             required=False,
@@ -96,41 +96,39 @@ class DraftUpdateLogModal(ui.Modal, title="配置更新日志"):
         ),
     )
 
-    def __init__(self, view):
+    def __init__(self, manager, index=None):
         super().__init__()
-        self.view_ref = view
-        self.update_log_input.default = (
-            view.draft_update_log[:4000] if view.draft_update_log else None
-        )
+        self.manager = manager
+        self.index = index
+        self.entry = manager.draft.draft_update_logs[index] if index is not None else None
+        self.update_log_input.default = self.entry["text"] if self.entry else None
 
     async def on_submit(self, i: discord.Interaction):
-        update_log = self.update_log_input.value.strip()
-        uploaded_attachments = list(self.attachment_input.component.values)
-
-        if uploaded_attachments:
-            await i.response.defer()
-            cached_attachments = []
+        await i.response.defer()
+        text = self.update_log_input.value.strip()
+        attachments = list(self.entry["attachments"]) if self.entry else []
+        uploaded = list(self.attachment_input.component.values)
+        if uploaded:
             try:
-                for attachment in uploaded_attachments:
-                    cached_attachments.append(
-                        DraftUpdateLogAttachment(
-                            filename=attachment.filename,
-                            data=await attachment.read(),
-                            description=getattr(attachment, "description", None),
-                            spoiler=attachment.is_spoiler(),
-                        )
-                    )
+                attachments = [DraftUpdateLogAttachment(a.filename, await a.read(), getattr(a, "description", None), a.is_spoiler()) for a in uploaded]
             except Exception as exc:
-                return await i.followup.send(
-                    f"读取更新日志附件失败：{exc}", ephemeral=True
-                )
-            self.view_ref.draft_update_attachments = cached_attachments
-        elif not update_log:
-            # 文本与本次上传均为空时，视为关闭整条更新日志。
-            self.view_ref.draft_update_attachments = []
-
-        self.view_ref.draft_update_log = update_log or None
-        await self.view_ref.update_dashboard(i)
+                return await i.followup.send(f"读取更新日志附件失败：{exc}", ephemeral=True)
+        if not text and not attachments:
+            return await i.followup.send("请填写日志或上传附件；删除日志请使用删除按钮。", ephemeral=True)
+        entry = {"text": text, "attachments": attachments}
+        logs = self.manager.draft.draft_update_logs
+        if self.entry is None:
+            if len(logs) >= 25:
+                return await i.followup.send("单次最多设置 25 条更新日志。", ephemeral=True)
+            logs.append(entry)
+            self.manager.selected = len(logs) - 1
+        else:
+            index = next((n for n, item in enumerate(logs) if item is self.entry), None)
+            if index is None:
+                return await i.followup.send("该日志已被删除或修改，请重新打开管理面板。", ephemeral=True)
+            logs[index] = entry
+            self.manager.selected = index
+        await self.manager.refresh(i)
 
 
 class DraftUpdateLogAttachment:

@@ -43,6 +43,11 @@ MIGRATIONS = (
             "CREATE INDEX IF NOT EXISTS idx_exploration_pushes_updated ON exploration_panel_pushes (updated_at)",
         ),
     ),
+    (
+        2,
+        "multiple_attachment_update_logs",
+        ("CREATE TABLE IF NOT EXISTS protected_update_logs (protected_message_id INTEGER PRIMARY KEY, entries_json TEXT NOT NULL)",),
+    ),
 )
 
 
