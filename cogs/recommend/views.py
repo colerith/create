@@ -110,21 +110,17 @@ class GachaContainerView(ui.LayoutView):
         await interaction.response.edit_message(view=self)
 
     async def execute_draw(self, interaction: discord.Interaction, count: int):
+        await interaction.response.defer()
         is_tester = isinstance(interaction.user, discord.Member) and bool(interaction.user.get_role(TEST_ROLE_ID))
 
         if not is_tester and await db.check_user_drawn_today(interaction.user.id):
-            return await interaction.response.send_message("🔮 您今天已经感应过缘分啦，明天再来吧！", ephemeral=True)
-
-        await interaction.response.defer()
+            return await interaction.followup.send("🔮 您今天已经感应过缘分啦，明天再来吧！", ephemeral=True)
 
         threads = await utils.get_random_thread_pool(interaction.guild, self.selected_channel_id)
         if not threads:
             return await interaction.followup.send("🏜️ 卡池里空空如也...", ephemeral=True)
 
         drawn_threads = random.sample(threads, min(count, len(threads)))
-
-        if not is_tester:
-            await db.mark_user_drawn(interaction.user.id)
 
         result_lines = []
         if len(drawn_threads) == 1:
@@ -138,7 +134,9 @@ class GachaContainerView(ui.LayoutView):
                 result_lines.append(f"{i+1}. [{t.name}]({t.jump_url})")
 
         self.update_container(result_content=result_lines)
-        await interaction.edit_original_response(view=self)
+        await interaction.edit_original_response(view=self, allowed_mentions=discord.AllowedMentions.none())
+        if not is_tester:
+            await db.mark_user_drawn(interaction.user.id)
 
 
 # =================================================================
@@ -160,7 +158,7 @@ class DailyRecommendContainer(ui.LayoutView):
         btn_gacha.callback = self.open_gacha
 
         if is_empty:
-             empty_accessory = ui.Button(label="暂无", disabled=True)
+             empty_accessory = ui.Button(label="暂无", disabled=True, custom_id="daily_recommend_empty_status")
              container = ui.Container(
                 ui.Section(
                     ui.TextDisplay(content="### 📅 每日推荐"),

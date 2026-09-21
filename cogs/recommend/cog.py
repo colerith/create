@@ -14,11 +14,18 @@ from config import TZ_SHANGHAI, RECOMMEND_DAILY_CHANNEL_IDS, TEST_ROLE_ID
 class RecommendCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.bot.loop.create_task(db.init_recommend_db())
         self.daily_recommend_task.start()
+
+    async def cog_load(self):
+        await db.init_recommend_db()
+        # 恢复旧消息的按钮回调，无需重新发送或刷新每日精选面板。
+        self.persistent_view = DailyRecommendContainer({}, is_empty=True)
+        self.bot.add_view(self.persistent_view)
 
     async def cog_unload(self):
         self.daily_recommend_task.cancel()
+        if getattr(self, "persistent_view", None):
+            self.persistent_view.stop()
 
     async def refresh_recommendation_panel(self, channel: discord.TextChannel):
         """
