@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from cogs.core import db as core_db
 from cogs.protection.views import (
-    DraftUpdateLogsView, ProtectionDraftView,
+    DraftUpdateLogsView, DraftPublishPreviewView, ProtectionDraftView,
     build_reusable_metadata_from_row, split_update_content,
 )
 
@@ -30,6 +30,44 @@ class UpdateLogsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sum(type(item).__name__ == 'Select' for item in view._layout_items), 1)
             self.assertEqual(view.add_log.disabled, count == 25)
             self.assertEqual(view.edit_log.disabled, count == 0)
+
+    async def test_private_preview_matches_publication_and_keeps_snapshot(self):
+        from cogs.protection.modals import DraftUpdateLogAttachment
+        avatar = SimpleNamespace(url="https://example.com/avatar.png")
+        user = SimpleNamespace(id=1, display_name="测试", display_avatar=avatar)
+        bot = SimpleNamespace(user=user)
+        draft = ProtectionDraftView(bot, user, [])
+        draft.mention_users = True
+        attachment = DraftUpdateLogAttachment("log.txt", b"preview")
+        draft.draft_update_logs = [
+            {"text": "😀" * 2500, "attachments": [attachment]},
+            {"text": "第二条", "attachments": []},
+        ]
+        preview = DraftPublishPreviewView(draft)
+        expected = [text for index, entry in enumerate(draft.draft_update_logs) for text in draft.build_update_chunks(index, entry)]
+        self.assertEqual([page['content'] for page in preview.pages[1:]], expected)
+        self.assertEqual(preview.pages[0]['embed'].title, f"✨ {draft.draft_title}")
+        self.assertEqual(sum(len(page['attachments']) for page in preview.pages), 1)
+        draft.draft_update_logs.clear()
+        self.assertEqual([page['content'] for page in preview.pages[1:]], expected)
+        interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock(), edit_message=AsyncMock()))
+        await draft.btn_preview.callback(interaction)
+        self.assertTrue(interaction.response.send_message.call_args.kwargs['ephemeral'])
+        self.assertFalse(interaction.response.send_message.call_args.kwargs['allowed_mentions'].everyone)
+        await preview.next_page.callback(interaction)
+        payload = interaction.response.edit_message.call_args.kwargs
+        self.assertEqual(payload['content'], expected[0])
+        self.assertEqual(len(payload['attachments']), 1)
+        self.assertFalse(payload['allowed_mentions'].everyone)
+        payload['attachments'][0].close()
+        await preview.next_page.callback(interaction)
+        self.assertEqual(interaction.response.edit_message.call_args.kwargs['attachments'], [])
+        preview.to_components()
+        draft.to_components()
+        # Mention-only and no-log drafts still have a useful preview.
+        self.assertEqual(len(DraftPublishPreviewView(draft).pages), 2)
+        draft.mention_users = False
+        self.assertEqual(len(DraftPublishPreviewView(draft).pages), 1)
 
     async def test_database_migration_and_reuse_all_logs(self):
         previous = core_db.DB_NAME

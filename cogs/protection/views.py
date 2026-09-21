@@ -2206,6 +2206,50 @@ class DraftUpdateLogsView(ProtectionLayoutView):
         await self.refresh(i)
 
 
+class DraftPublishPreviewView(ui.View):
+    """Private snapshot of the messages that this draft would publish."""
+
+    def __init__(self, draft):
+        super().__init__(timeout=600)
+        self.user_id = draft.user.id
+        self.page = 0
+        self.pages = [{"embed": draft.build_publish_embed(len(draft.attachments)), "content": None, "attachments": []}]
+        for index, entry in enumerate(draft.draft_update_logs):
+            for part_index, content in enumerate(draft.build_update_chunks(index, entry)):
+                self.pages.append({"embed": None, "content": content, "attachments": list(entry["attachments"]) if part_index == 0 else []})
+        if draft.mention_users and not draft.draft_update_logs:
+            self.pages.append({"embed": None, "content": "📣 **更新通知** @everyone", "attachments": []})
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    def message_kwargs(self, *, editing=False):
+        page = self.pages[self.page]
+        self.previous.disabled = self.page == 0
+        self.next_page.disabled = self.page == len(self.pages) - 1
+        self.position.label = f"{self.page + 1} / {len(self.pages)} · 仅自己可见"
+        files = [attachment.to_file() for attachment in page["attachments"]]
+        return {
+            "content": page["content"], "embed": page["embed"], "view": self,
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "attachments" if editing else "files": files,
+        }
+
+    @ui.button(label="上一条", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, button):
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(**self.message_kwargs(editing=True))
+
+    @ui.button(label="预览", style=discord.ButtonStyle.secondary, disabled=True)
+    async def position(self, interaction, button):
+        pass
+
+    @ui.button(label="下一条", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction, button):
+        self.page = min(len(self.pages) - 1, self.page + 1)
+        await interaction.response.edit_message(**self.message_kwargs(editing=True))
+
+
 class ProtectionDraftView(ProtectionLayoutView):
     def __init__(
         self,
@@ -2492,8 +2536,8 @@ class ProtectionDraftView(ProtectionLayoutView):
             ui.TextDisplay(content=f"**贴内提醒:** {mention_text}"),
             ui.ActionRow(self.toggle_mention_users),
             ui.Separator(),
-            ui.TextDisplay(content="**发布区**\n确认无误后发布作品；取消会关闭当前草稿面板。\n-# 只有你可以看到此面板。"),
-            ui.ActionRow(self.btn_confirm, self.btn_cancel),
+            ui.TextDisplay(content="**发布区**\n可先预览发布效果，确认无误后发布作品；取消会关闭当前草稿面板。\n-# 只有你可以看到此面板。"),
+            ui.ActionRow(self.btn_preview, self.btn_confirm, self.btn_cancel),
         ]
 
     def build_dashboard_embed(self):
@@ -2680,6 +2724,28 @@ class ProtectionDraftView(ProtectionLayoutView):
         )
         self.stop()
 
+    @ui.button(label="预览发布效果", style=discord.ButtonStyle.secondary, row=4, emoji="👁️")
+    async def btn_preview(self, interaction, button):
+        preview = DraftPublishPreviewView(self)
+        await interaction.response.send_message(**preview.message_kwargs(), ephemeral=True)
+
+    def build_update_chunks(self, index, entry):
+        content = f"🗒️ **{self.draft_title} 更新日志 {index + 1}**\n{entry['text']}"
+        if index == 0 and self.mention_users:
+            content = "@everyone\n" + content
+        return split_update_content(content)
+
+    def build_publish_embed(self, file_count):
+        return build_protected_post_embed(
+            title=self.draft_title,
+            unlock_type=self.draft_mode,
+            file_count=file_count,
+            author_name=f"由 {self.user.display_name} 发布",
+            author_icon_url=self.user.display_avatar.url,
+            publish_time_text=discord.utils.format_dt(datetime.now(TZ_SHANGHAI)),
+            bot_avatar_url=self.bot.user.display_avatar.url,
+        )
+
     async def publish(self, interaction: discord.Interaction):
         try:
             stored_data = await build_storage_entries_from_attachments(
@@ -2698,16 +2764,7 @@ class ProtectionDraftView(ProtectionLayoutView):
             except:
                 pass
 
-        now_ts = discord.utils.format_dt(datetime.now(TZ_SHANGHAI))
-        embed = build_protected_post_embed(
-            title=self.draft_title,
-            unlock_type=self.draft_mode,
-            file_count=len(stored_data),
-            author_name=f"由 {self.user.display_name} 发布",
-            author_icon_url=self.user.display_avatar.url,
-            publish_time_text=now_ts,
-            bot_avatar_url=self.bot.user.display_avatar.url,
-        )
+        embed = self.build_publish_embed(len(stored_data))
 
         final_msg = await interaction.channel.send(embed=embed)
         try:
@@ -2755,10 +2812,7 @@ class ProtectionDraftView(ProtectionLayoutView):
         for index, entry in enumerate(self.draft_update_logs):
             refs = []
             saved_entries.append({"text": entry["text"], "message_ids": refs})
-            content = f"🗒️ **{self.draft_title} 更新日志 {index + 1}**\n{entry['text']}"
-            if index == 0 and self.mention_users:
-                content = "@everyone\n" + content
-            for part_index, chunk in enumerate(split_update_content(content)):
+            for part_index, chunk in enumerate(self.build_update_chunks(index, entry)):
                 try:
                     update_msg = await interaction.channel.send(
                         chunk,
