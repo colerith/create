@@ -98,14 +98,22 @@ class UpdateLogsTests(unittest.IsolatedAsyncioTestCase):
             draft.draft_update_logs[0]["text"] = "😀" * 4000
             draft.draft_update_logs[1]["text"] = "第二条 @everyone"
             sent = []
+            pinned = []
             async def send(*args, **kwargs):
                 sent.append((args, kwargs))
-                return SimpleNamespace(id=100 + len(sent), channel=SimpleNamespace(id=2), pin=AsyncMock())
+                message_id = 100 + len(sent)
+                async def pin(**kwargs):
+                    pinned.append((message_id, len(sent)))
+                return SimpleNamespace(id=message_id, channel=SimpleNamespace(id=2), pin=pin)
             interaction = SimpleNamespace(channel=SimpleNamespace(id=2, send=send), guild=None, followup=SimpleNamespace(send=AsyncMock()))
             with patch('cogs.protection.views.build_storage_entries_from_attachments', AsyncMock(return_value=[])):
                 await draft.publish(interaction)
             updates = [(args[0], kwargs) for args, kwargs in sent if args]
             self.assertGreater(len(updates), 2)
+            # Protected card is pinned first; every update part is then pinned
+            # in reverse order only after all update messages have been sent.
+            self.assertEqual([message_id for message_id, _ in pinned[1:]], list(range(100 + len(sent), 101, -1)))
+            self.assertTrue(all(sent_count == len(sent) for _, sent_count in pinned[1:]))
             self.assertTrue(updates[0][1]["allowed_mentions"].everyone)
             self.assertTrue(all(not kwargs["allowed_mentions"].everyone for _, kwargs in updates[1:]))
             self.assertEqual(sum(len(kwargs['files']) for _, kwargs in updates), 2)

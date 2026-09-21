@@ -2809,6 +2809,7 @@ class ProtectionDraftView(ProtectionLayoutView):
         # 每条日志单独发送；超长正文分段，只有第一条消息允许艾特。
         update_publish_error = None
         saved_entries = []
+        published_update_messages = []
         for index, entry in enumerate(self.draft_update_logs):
             refs = []
             saved_entries.append({"text": entry["text"], "message_ids": refs})
@@ -2819,6 +2820,7 @@ class ProtectionDraftView(ProtectionLayoutView):
                         files=[a.to_file() for a in entry["attachments"]] if part_index == 0 else [],
                         allowed_mentions=discord.AllowedMentions(everyone=self.mention_users and index == 0 and part_index == 0, users=False, roles=False),
                     )
+                    published_update_messages.append(update_msg)
                     refs.append(update_msg.id)
                     await protection_db.record_attachment_update_publish_log(
                         owner_id=self.user.id, guild_id=getattr(interaction.guild, "id", None),
@@ -2831,14 +2833,21 @@ class ProtectionDraftView(ProtectionLayoutView):
                     update_publish_error = exc
                     await interaction.followup.send(f"⚠️ 保护附件已发布，但第 {index + 1} 条更新日志发送失败：{exc}", ephemeral=True)
                     break
-                if part_index == 0:
-                    try:
-                        await update_msg.pin(reason="附件更新日志标注")
-                    except discord.HTTPException:
-                        pass
         async with get_db() as db:
             await db.execute("INSERT OR REPLACE INTO protected_update_logs VALUES (?, ?)", (final_msg.id, json.dumps(saved_entries, ensure_ascii=False)))
             await db.commit()
+        # 全部发送并保存后，按消息的逆序标注，包含长日志的所有分段。
+        pin_failures = 0
+        for update_msg in reversed(published_update_messages):
+            try:
+                await update_msg.pin(reason="附件更新日志标注")
+            except discord.HTTPException:
+                pin_failures += 1
+        if pin_failures:
+            await interaction.followup.send(
+                f"⚠️ 更新日志已发送，但有 {pin_failures} 条消息未能标注，请检查标注权限或频道标注数量限制。",
+                ephemeral=True,
+            )
         if self.mention_users and not self.draft_update_logs:
             await interaction.channel.send("📣 **更新通知** @everyone", allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
 
