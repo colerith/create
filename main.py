@@ -24,6 +24,7 @@ COG_EXTENSIONS = (
     "cogs.statistics",
     "cogs.recommend",
     "cogs.exploration",
+    "cogs.broadcast",
 )
 
 
