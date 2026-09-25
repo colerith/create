@@ -1,6 +1,7 @@
 """小时简报的发送记录，以及现有论坛缓存/更新日志的只读查询。"""
 
 import aiosqlite
+import json
 
 from ..core.db import get_db
 
@@ -49,10 +50,12 @@ async def get_inputs(guild_id, start, end):
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute("""
             SELECT thread_id, guild_id, forum_channel_id, thread_name, created_at,
-                   likes, comments, last_synced_at
+                   likes, comments, last_synced_at, author_id, author_name, tags_json, is_pinned
             FROM forum_thread_cache WHERE guild_id = ?
         """, (guild_id,))
         cached = [dict(row) for row in await cursor.fetchall()]
+        for row in cached:
+            row["tags"] = json.loads(row.pop("tags_json") or "[]")
         cursor = await conn.execute("""
             SELECT * FROM hourly_broadcast_threads
             WHERE guild_id = ? AND julianday(created_at) >= julianday(?)
@@ -79,6 +82,17 @@ async def is_processed(guild_id, channel_id, end):
         return await cursor.fetchone() is not None
 
 
+async def get_record(guild_id, channel_id, end):
+    async with get_db() as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute("""
+            SELECT * FROM hourly_broadcasts
+            WHERE guild_id = ? AND channel_id = ? AND window_end = ?
+        """, (guild_id, channel_id, end.isoformat()))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
 async def recommendation_sent(guild_id, channel_id, date):
     async with get_db() as conn:
         cursor = await conn.execute("""
@@ -94,7 +108,10 @@ async def mark_processed(guild_id, channel_id, end, message_id=None, recommendat
             INSERT INTO hourly_broadcasts
             (guild_id, channel_id, window_end, message_id, recommendation_date)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(guild_id, channel_id, window_end) DO NOTHING
+            ON CONFLICT(guild_id, channel_id, window_end) DO UPDATE SET
+                message_id = excluded.message_id,
+                recommendation_date = excluded.recommendation_date
+            WHERE hourly_broadcasts.message_id IS NULL AND excluded.message_id IS NOT NULL
         """, (guild_id, channel_id, end.isoformat(), message_id, recommendation_date))
         # 事件仅用于补齐最近的新帖；历史统计仍由原有缓存负责。
         await conn.execute("""

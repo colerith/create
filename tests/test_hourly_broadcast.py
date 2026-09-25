@@ -12,8 +12,9 @@ from config import HOURLY_BROADCAST_CHANNEL_ID as CHANNEL_ID, HOURLY_BROADCAST_G
 from cogs.broadcast import db
 from cogs.broadcast.cog import BroadcastCog
 from cogs.broadcast.render import (
-    RECOMMENDATION_FIELD, TITLE, build_embed, completed_hour, recent_threads,
+    RANDOM_RECOMMENDATION_FIELD, RECOMMENDATION_FIELD, TITLE, build_embed, completed_hour, recent_threads,
 )
+from cogs.broadcast.recommendations import recommendation_candidates, work_category
 from cogs.core import db as core_db
 from cogs.statistics import db as statistics_db
 
@@ -27,7 +28,14 @@ def thread(thread_id=1, created_at=START, parent_id=10):
         id=thread_id, name=f"作品 {thread_id}", parent_id=parent_id,
         guild=SimpleNamespace(id=GUILD_ID), created_at=created_at,
         jump_url=f"https://discord.com/channels/{GUILD_ID}/{thread_id}",
+        owner=SimpleNamespace(display_name=f"作者 {thread_id}"), owner_id=thread_id + 100,
+        applied_tags=[SimpleNamespace(name="角色卡")], flags=SimpleNamespace(pinned=False),
     )
+
+
+def recommendation(thread_id=1):
+    return dict(thread_id=thread_id, thread_name=f"作品 {thread_id}", forum_name="角色卡分区",
+                category="角色卡", tags=["现代", "日常"], author_id=100 + thread_id, author_name=f"作者 {thread_id}")
 
 
 class BroadcastRenderTests(unittest.TestCase):
@@ -50,9 +58,9 @@ class BroadcastRenderTests(unittest.TestCase):
         malicious_title = "@everyone [标题](https://example.com)\n" + "😀" * 300
         threads = [dict(thread_id=i, thread_name=malicious_title) for i in range(100)]
         updates = [dict(channel_id=i, title=malicious_title, update_message_id=1000 + i) for i in range(100)]
-        recommendation = thread()
-        recommendation.name = malicious_title
-        embed = build_embed(guild, START, END, threads, updates, [], 11, recommendation)
+        pick = recommendation()
+        pick["thread_name"] = malicious_title
+        embed = build_embed(guild, START, END, threads, updates, [], 11, pick)
         self.assertLess(len(embed), 1800)
         self.assertEqual(len(embed.fields), 4)
         for field in embed.fields[:2]:
@@ -70,6 +78,46 @@ class BroadcastRenderTests(unittest.TestCase):
         self.assertIn("作品更新", embed.fields[0].name)
         self.assertIn("缓存", embed.fields[1].name)
         self.assertIn("123", embed.fields[1].value)
+
+    def test_five_recommendations_show_names_categories_tags_and_authors_within_limits(self):
+        guild = SimpleNamespace(id=GUILD_ID, name="社区", icon=None)
+        picks = [recommendation(i) for i in range(5)]
+        embed = build_embed(guild, START, END, [], [], [], 3, random_recommendations=picks)
+        self.assertEqual(embed.fields[0].name, RECOMMENDATION_FIELD)
+        self.assertEqual(len(embed.fields), 7)
+        for index, field in enumerate(embed.fields[1:6]):
+            self.assertIn("角色卡", field.name)
+            self.assertIn(f"作品 {index}", field.value)
+            self.assertIn("角色卡分区", field.value)
+            self.assertIn(f"<@{100 + index}>", field.value)
+            self.assertIn("现代 / 日常", field.value)
+            self.assertLessEqual(len(field.value.encode("utf-16-le")) // 2, 1024)
+        self.assertLess(len(embed), 2000)
+        again = build_embed(guild, START, END, [], [], [], 3,
+                            random_recommendations=picks, daily_recommendation=False)
+        self.assertEqual(again.fields[0].name, RANDOM_RECOMMENDATION_FIELD)
+        self.assertNotIn(RECOMMENDATION_FIELD, [field.name for field in again.fields])
+
+    def test_work_categories_match_my_works_but_exclude_skits(self):
+        for category in ("角色卡", "预设", "美化", "工具", "世界书"):
+            self.assertEqual(work_category(f"创作 · {category}", "帖子", []), category)
+        self.assertEqual(work_category("综合作品", "帖子", ["工具"]), "工具")
+        self.assertIsNone(work_category("角色卡 · 小剧场", "帖子", []))
+        self.assertIsNone(work_category("其他", "小剧场", []))
+        self.assertIsNone(work_category("闲聊", "聊天", []))
+
+    def test_candidates_include_archived_cache_and_live_metadata_without_duplicates(self):
+        forum = SimpleNamespace(id=10, name="角色卡", threads=[thread(1)])
+        guild = SimpleNamespace(id=GUILD_ID)
+        cached = [dict(thread_id=1, guild_id=GUILD_ID, forum_channel_id=10, thread_name="旧名", tags=[]),
+                  dict(thread_id=2, guild_id=GUILD_ID, forum_channel_id=10, thread_name="归档作品", tags=[], is_archived=1),
+                  dict(thread_id=3, guild_id=GUILD_ID, forum_channel_id=10, thread_name="置顶导航", tags=[], is_pinned=1),
+                  dict(thread_id=4, guild_id=GUILD_ID + 1, forum_channel_id=10, thread_name="别服", tags=[])]
+        result = recommendation_candidates(guild, cached, {10: forum})
+        self.assertEqual({row["thread_id"] for row in result}, {1, 2})
+        live = next(row for row in result if row["thread_id"] == 1)
+        self.assertEqual(live["thread_name"], "作品 1")
+        self.assertEqual(live["author_name"], "作者 1")
 
 
 class BroadcastDatabaseTests(unittest.IsolatedAsyncioTestCase):
@@ -113,6 +161,16 @@ class BroadcastDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await db.recommendation_sent(GUILD_ID, CHANNEL_ID, "2026-09-26"))
         self.assertFalse(await db.is_processed(GUILD_ID, CHANNEL_ID + 1, END))
 
+    async def test_makeup_replaces_skipped_record_but_cannot_overwrite_sent_message(self):
+        await db.mark_processed(GUILD_ID, CHANNEL_ID, END)
+        self.assertIsNone((await db.get_record(GUILD_ID, CHANNEL_ID, END))["message_id"])
+        await db.mark_processed(GUILD_ID, CHANNEL_ID, END, 99, END.date().isoformat())
+        self.assertTrue(await db.recommendation_sent(GUILD_ID, CHANNEL_ID, END.date().isoformat()))
+        await db.mark_processed(GUILD_ID, CHANNEL_ID, END, 100)
+        record = await db.get_record(GUILD_ID, CHANNEL_ID, END)
+        self.assertEqual(record["message_id"], 99)
+        self.assertEqual(record["recommendation_date"], END.date().isoformat())
+
 
 class BroadcastDeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -147,7 +205,7 @@ class BroadcastDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mentions["parse"], [])
         self.mark.assert_awaited_once_with(GUILD_ID, CHANNEL_ID, END, 123, END.date().isoformat())
 
-    async def test_empty_hour_does_not_send_or_consume_daily_recommendation(self):
+    async def test_no_content_or_candidates_does_not_send_or_consume_daily_recommendation(self):
         self.cog.prepare_embed.return_value = None, False
         await self.cog.send_window(START, END)
         self.channel.send.assert_not_awaited()
@@ -194,26 +252,79 @@ class BroadcastDeliveryTests(unittest.IsolatedAsyncioTestCase):
             dict(thread_id=1, thread_name="新帖")], [], [], {10: object()}))
         self.cog.daily_report_url = AsyncMock(return_value=None)
         with patch("cogs.broadcast.db.recommendation_sent", AsyncMock(return_value=True)), \
-                patch("cogs.broadcast.cog.get_random_thread_pool", AsyncMock()) as pool:
+                patch.object(self.cog, "choose_recommendations", AsyncMock()) as pool:
             embed, included = await BroadcastCog.prepare_embed(self.cog, self.guild, START, END)
         self.assertFalse(included)
         self.assertNotIn(RECOMMENDATION_FIELD, [field.name for field in embed.fields])
         pool.assert_not_awaited()
 
-    async def test_first_active_hour_includes_daily_recommendation_but_empty_hour_does_not(self):
+    async def test_first_active_hour_includes_one_daily_recommendation(self):
         self.cog.collect = AsyncMock(return_value=([
             dict(thread_id=1, thread_name="新帖")], [], [], {10: object()}))
         self.cog.daily_report_url = AsyncMock(return_value=None)
         with patch("cogs.broadcast.db.recommendation_sent", AsyncMock(return_value=False)), \
-                patch("cogs.broadcast.cog.get_random_thread_pool", AsyncMock(return_value=[thread()])) as pool, \
-                patch.object(self.cog, "is_public_channel", return_value=True):
+                patch.object(self.cog, "choose_recommendations", AsyncMock(return_value=[recommendation()])) as pool:
             embed, included = await BroadcastCog.prepare_embed(self.cog, self.guild, START, END)
             self.assertTrue(included)
             self.assertIn(RECOMMENDATION_FIELD, [field.name for field in embed.fields])
-            pool.reset_mock()
-            self.cog.collect.return_value = [], [], [], {}
+            self.assertEqual(pool.call_args.args[-1], 1)
+
+    async def test_empty_midnight_and_later_hours_recommend_five_but_daily_allowance_only_once(self):
+        self.cog.collect = AsyncMock(return_value=([], [], [], {10: object()}))
+        self.cog.daily_report_url = AsyncMock(return_value=None)
+        midnight = END.replace(hour=0)
+        for already_sent in (False, True):
+            with self.subTest(already_sent=already_sent), \
+                    patch("cogs.broadcast.db.recommendation_sent", AsyncMock(return_value=already_sent)), \
+                    patch.object(self.cog, "choose_recommendations", AsyncMock(return_value=[recommendation(i) for i in range(5)])) as pool:
+                embed, included = await BroadcastCog.prepare_embed(self.cog, self.guild, midnight - timedelta(hours=1), midnight)
+                self.assertEqual(pool.call_args.args[-1], 5)
+                self.assertEqual(included, not already_sent)
+                self.assertEqual(len(embed.fields), 7)
+                self.assertIn(RECOMMENDATION_FIELD if not already_sent else RANDOM_RECOMMENDATION_FIELD,
+                              [field.name for field in embed.fields])
+
+    async def test_empty_candidate_pool_still_skips_without_consuming_daily_allowance(self):
+        self.cog.collect = AsyncMock(return_value=([], [], [], {}))
+        with patch.object(self.cog, "choose_recommendations", AsyncMock(return_value=[])):
             self.assertEqual(await BroadcastCog.prepare_embed(self.cog, self.guild, START, END), (None, False))
-            pool.assert_not_awaited()
+
+    async def test_random_selection_resolves_archived_posts_replaces_deleted_and_skips_pinned(self):
+        self.guild.default_role = object()
+        forum = SimpleNamespace(id=10, name="角色卡", guild=self.guild, threads=[],
+                                permissions_for=lambda _: SimpleNamespace(view_channel=True))
+        real_threads = {}
+        for index in range(1, 8):
+            candidate = Mock(spec=discord.Thread)
+            candidate.id = index
+            candidate.guild = self.guild
+            candidate.parent = forum
+            candidate.parent_id = forum.id
+            candidate.name = f"现名 {index}"
+            candidate.owner_id = 100 + index
+            candidate.owner = None  # 归档帖作者不一定还在成员缓存。
+            candidate.applied_tags = [SimpleNamespace(name="现代")]
+            candidate.flags = SimpleNamespace(pinned=index == 2)
+            candidate.is_private.return_value = False
+            real_threads[index] = candidate
+        self.guild.get_thread = lambda thread_id: real_threads.get(thread_id) if thread_id == 1 else None
+        async def fetch(thread_id):
+            if thread_id == 0:
+                raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "deleted")
+            return real_threads[thread_id]
+        self.bot.fetch_channel = AsyncMock(side_effect=fetch)
+        cached = [dict(thread_id=index, guild_id=GUILD_ID, forum_channel_id=10,
+                       thread_name=f"旧名 {index}", tags=[], is_pinned=0, is_archived=1,
+                       author_name=f"作者 {index}") for index in range(8)]
+        with patch("cogs.broadcast.cog.random.sample", side_effect=lambda values, count: values[:count]):
+            result = await self.cog.choose_recommendations(self.guild, cached, {10: forum}, 5)
+        self.assertEqual([row["thread_id"] for row in result], [1, 3, 4, 5, 6])
+        self.assertEqual(result[0]["thread_name"], "现名 1")
+        self.assertEqual(result[0]["author_id"], 101)
+        self.assertEqual(result[0]["author_name"], "作者 1")
+        self.assertEqual(result[0]["tags"], ["现代"])
+        self.assertEqual(result[0]["forum_name"], "角色卡")
+        self.assertNotIn(1, [call.args[0] for call in self.bot.fetch_channel.await_args_list])
 
     async def test_recovery_matches_own_message_and_exact_window(self):
         old_embed = discord.Embed(title=TITLE, timestamp=START)
@@ -248,7 +359,7 @@ class BroadcastDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 dict(channel_id=2, title="隐藏更新", update_message_id=102)]
         self.bot.fetch_channel = AsyncMock(return_value=hidden_forum)
         with patch("cogs.broadcast.db.get_inputs", AsyncMock(return_value=(cached, [], rows))), \
-                patch.object(self.cog, "is_public_channel", side_effect=lambda channel: channel is public_forum):
+                patch.object(self.cog, "is_source_channel", side_effect=lambda channel: channel is public_forum):
             threads, updates, stats, forums = await self.cog.collect(self.guild, START, END)
         self.assertEqual([row["thread_id"] for row in threads], [1])
         self.assertEqual([row["update_message_id"] for row in updates], [101])
@@ -258,15 +369,58 @@ class BroadcastDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_visibility_rejects_private_threads_and_other_servers(self):
         self.guild.default_role = object()
         channel = SimpleNamespace(guild=self.guild, permissions_for=lambda _: SimpleNamespace(view_channel=True))
-        self.assertTrue(self.cog.is_public_channel(channel))
+        self.assertTrue(self.cog.is_source_channel(channel))
         channel.permissions_for = lambda role: SimpleNamespace(view_channel=role is self.guild.me)
-        self.assertFalse(self.cog.is_public_channel(channel))
+        self.assertTrue(self.cog.is_source_channel(channel))
+        channel.permissions_for = lambda role: SimpleNamespace(view_channel=False)
+        self.assertFalse(self.cog.is_source_channel(channel))
         channel.guild = SimpleNamespace(id=GUILD_ID + 1)
-        self.assertFalse(self.cog.is_public_channel(channel))
+        self.assertFalse(self.cog.is_source_channel(channel))
         private_thread = Mock(spec=discord.Thread)
         private_thread.guild = self.guild
         private_thread.is_private.return_value = True
-        self.assertFalse(self.cog.is_public_channel(private_thread))
+        self.assertFalse(self.cog.is_source_channel(private_thread))
+
+    async def test_makeup_allows_previously_skipped_hour_and_does_not_repeat_sent_hour(self):
+        self.processed.return_value = True
+        with patch("cogs.broadcast.db.get_record", AsyncMock(return_value=dict(message_id=None))):
+            self.assertEqual(await self.cog.send_window(START, END, makeup=True), ("sent", 123))
+        self.channel.send.assert_awaited_once()
+        self.channel.send.reset_mock()
+        with patch("cogs.broadcast.db.get_record", AsyncMock(return_value=dict(message_id=123))):
+            self.assertEqual(await self.cog.send_window(START, END, makeup=True), ("already_sent", 123))
+        self.channel.send.assert_not_awaited()
+
+    async def test_makeup_command_can_target_midnight_in_fixed_channel(self):
+        interaction = SimpleNamespace(
+            guild_id=GUILD_ID, guild=self.guild,
+            user=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        now = END.replace(hour=2, minute=10)
+        with patch("cogs.broadcast.cog.datetime") as clock, \
+                patch.object(self.cog, "send_window", AsyncMock(return_value=("sent", 123))) as send:
+            clock.now.return_value = now
+            await BroadcastCog.makeup.callback(self.cog, interaction, 结束小时=0)
+            midnight = now.replace(hour=0, minute=0)
+            send.assert_awaited_once_with(midnight - timedelta(hours=1), midnight, makeup=True)
+            self.assertIn(str(CHANNEL_ID), interaction.followup.send.call_args.args[0])
+            self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
+            send.reset_mock()
+            await BroadcastCog.makeup.callback(self.cog, interaction, 结束小时=3)
+            send.assert_not_awaited()
+            interaction.user.guild_permissions.administrator = False
+            await BroadcastCog.makeup.callback(self.cog, interaction)
+            send.assert_not_awaited()
+
+    async def test_late_makeup_recovery_is_not_limited_to_original_hour_message_times(self):
+        recovered_embed = discord.Embed(title=TITLE, timestamp=END)
+        async def history(**kwargs):
+            self.assertNotIn("before", kwargs)
+            yield SimpleNamespace(id=999, author=self.bot.user, embeds=[recovered_embed])
+        self.channel.history = history
+        self.assertEqual(await BroadcastCog.find_sent_message(self.cog, self.channel, END), (999, False))
 
     async def test_preview_never_sends_publicly_or_marks_processed(self):
         interaction = SimpleNamespace(

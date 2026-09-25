@@ -8,6 +8,7 @@ from config import TZ_SHANGHAI
 
 TITLE = "📣 创作之蛋 · 整点速递"
 RECOMMENDATION_FIELD = "🌟 今日推荐"
+RANDOM_RECOMMENDATION_FIELD = "🎁 随机逛逛"
 MAX_ITEMS = 3
 
 # 沿用统计里程碑里的「奇米蛋 / 小喇叭 / 香香作品蛋」口吻，开场保持简短。
@@ -24,6 +25,10 @@ INTRO_LINES = {
     "updates": (
         "奇米蛋滚来递更新啦！这一小时有 **{updates}** 份作品更新，快去看看作者添了什么新惊喜捏～",
         "叮咚——收到 **{updates}** 份作品更新！奇米蛋已经收进小篮子，戳开就能看啦～",
+    ),
+    "random": (
+        "这一小时静悄悄的，奇米蛋从作品小书架捧来 **{count}** 颗宝藏蛋，陪你随便逛逛捏～",
+        "没有新帖和更新也不空手来！奇米蛋装好 **{count}** 份随机推荐，看看有没有你的心头好咯～",
     ),
 }
 
@@ -64,10 +69,29 @@ def safe_label(value, limit=42):
     return text.replace("[", "\\[").replace("]", "\\]")
 
 
+def recommendation_text(guild_id, row):
+    url = f"https://discord.com/channels/{guild_id}/{row['thread_id']}"
+    author_id = row.get("author_id")
+    author_name = row.get("author_name")
+    author = safe_label(author_name, 24) if author_name else "作者暂未缓存"
+    if author_id:
+        author = f"<@{author_id}>" + (f"（{safe_label(author_name, 24)}）" if author_name else "")
+    tags = " / ".join(row.get("tags") or []) or "无标签"
+    return (
+        f"**[{safe_label(row['thread_name'], 48)}]({url})**\n"
+        f"👤 {author} · 📂 {safe_label(row['forum_name'], 28)}\n"
+        f"🏷️ {safe_label(tags, 68)}"
+    )
+
+
 def build_embed(guild, start, end, threads, updates, cached, forum_count,
-                recommendation=None, daily_url=None):
-    intro_kind = "both" if threads and updates else "threads" if threads else "updates"
-    description = random.choice(INTRO_LINES[intro_kind]).format(new=len(threads), updates=len(updates))
+                recommendation=None, daily_url=None, random_recommendations=None,
+                daily_recommendation=True):
+    intro_kind = ("random" if random_recommendations else "both" if threads and updates
+                  else "threads" if threads else "updates")
+    description = random.choice(INTRO_LINES[intro_kind]).format(
+        new=len(threads), updates=len(updates), count=len(random_recommendations or []),
+    )
     embed = discord.Embed(
         title=TITLE,
         description=description,
@@ -94,11 +118,24 @@ def build_embed(guild, start, end, threads, updates, cached, forum_count,
 
     add_entries("🌱 新帖", threads, "thread_name", "thread_id")
     add_entries("✨ 作品更新", updates, "title", "channel_id", "update_message_id")
-    if recommendation:
+    if random_recommendations:
+        embed.add_field(
+            name=RECOMMENDATION_FIELD if daily_recommendation else RANDOM_RECOMMENDATION_FIELD,
+            value="奇米蛋的作品小篮子 · 不含小剧场 · 点击帖名直达原帖",
+            inline=False,
+        )
+        for index, row in enumerate(random_recommendations, start=1):
+            embed.add_field(
+                name=f"{index}. {safe_label(row['category'], 12)}",
+                value=recommendation_text(guild.id, row),
+                inline=False,
+            )
+    elif recommendation:
         embed.add_field(
             name=RECOMMENDATION_FIELD,
             value=("奇米蛋今天捧来这颗宝藏作品蛋，戳开看看捏～\n"
-                   f"• [{safe_label(recommendation.name)}]({recommendation.jump_url})"),
+                   + f"📂 {safe_label(recommendation['category'], 12)}\n"
+                   + recommendation_text(guild.id, recommendation)),
             inline=False,
         )
     likes = sum(max(0, row.get("likes") or 0) for row in cached)
