@@ -1,4 +1,7 @@
-discord.py>=2.7.1
+# Do not install py-cord in this environment: both provide the discord package.
+discord.py>=2.7.1,<3
 python-dotenv
 aiosqlite
 aiohttp
+# ZoneInfo("Asia/Shanghai") fallback when the OS has no IANA timezone database.
+tzdata

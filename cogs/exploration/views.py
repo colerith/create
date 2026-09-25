@@ -459,15 +459,17 @@ class DailyReportContainer(ui.LayoutView):
                 if thread.applied_tags:
                     tags_str = "🏷️ " + " ".join(t.name for t in thread.applied_tags[:3])
                 category_name = thread.parent.name if thread.parent else "未知分区"
-                section_content = [
-                    ui.TextDisplay(content=f"**{self._clip(thread.name, 52)}**"),
-                    ui.TextDisplay(content=f"👤 {author_name} · 📂 {category_name}"),
+                # 两个容器共用每条消息 40 个组件的额度（包含嵌套组件）。
+                # 每帖合并成一个文本组件，保留 4 条新帖、5 条更新及两组分页时共 35 个。
+                section_lines = [
+                    f"**{self._clip(thread.name, 52)}**",
+                    f"👤 {author_name} · 📂 {category_name}",
                 ]
                 if tags_str:
-                    section_content.append(ui.TextDisplay(content=f"-# {tags_str}"))
+                    section_lines.append(f"-# {tags_str}")
                 elements.append(
                     ui.Section(
-                        *section_content,
+                        ui.TextDisplay(content="\n".join(section_lines)),
                         accessory=ui.Button(label="传送", url=thread.jump_url, style=discord.ButtonStyle.link),
                     )
                 )

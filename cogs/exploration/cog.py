@@ -429,6 +429,11 @@ class ExplorationCog(commands.Cog):
         if include_recommend is None:
             include_recommend = channel.id in RECOMMEND_DAILY_CHANNEL_IDS
 
+        # 先构建所有新面板，避免组件超限或数据读取失败时已经删除旧面板。
+        search_view = SearchPanelContainer(self.bot)
+        daily_view = await self._build_daily_report_view(channel)
+        recommend_view = await self._build_daily_recommend_view(channel) if include_recommend else None
+
         search_id = await get_panel_message_id(channel.id, "search_panel")
         daily_id = await get_panel_message_id(channel.id, "daily_report")
         old_summary_id = await get_panel_message_id(channel.id, "daily_update_summary")
@@ -444,12 +449,12 @@ class ExplorationCog(commands.Cog):
         await remove_panel_record(channel.id, "daily_update_summary")
         await recommend_db.remove_panel_message(channel.id)
 
-        search_msg = await channel.send(view=SearchPanelContainer(self.bot))
+        search_msg = await channel.send(view=search_view)
         await set_panel_message_id(channel.id, search_msg.id, "search_panel")
         await asyncio.sleep(1)
 
         daily_msg = await channel.send(
-            view=await self._build_daily_report_view(channel),
+            view=daily_view,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         await set_panel_message_id(channel.id, daily_msg.id, "daily_report")
@@ -457,7 +462,7 @@ class ExplorationCog(commands.Cog):
 
         if include_recommend:
             recommend_msg = await channel.send(
-                view=await self._build_daily_recommend_view(channel),
+                view=recommend_view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             await recommend_db.set_panel_message(channel.id, recommend_msg.id)

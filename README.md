@@ -131,7 +131,7 @@ cd CREATE
 所有必需的 Python 库都记录在 `requirements.txt` 中。
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 4. 配置机器人
@@ -163,6 +163,50 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
+
+### Linux / PM2 部署与依赖修复
+
+如果启动时报 `ImportError: cannot import name 'AppCommandOptionType' from 'discord.enums'`，
+说明加载到的 `discord` 包内部不一致，常见原因是 `discord.py` 与 `py-cord` 混装，
+或安装/升级后留下了不匹配的文件。本项目使用 `discord.py`，不要在同一环境安装 `py-cord`。
+直接修改业务代码或只执行 `pm2 restart create` 无法修复已损坏的依赖。
+
+`ecosystem.config.js` 将解释器固定到项目的 `.venv`，并将工作目录固定到项目根目录，
+确保 PM2 使用正确的依赖、`.env` 和数据库。将更新后的项目文件同步到服务器后，执行：
+
+```bash
+cd /root/create
+# 任一步失败就停止，不要继续切换 PM2。
+(
+set -e
+python3 -m venv .venv
+# 只修复项目虚拟环境，不修改其他机器人的全局依赖。
+.venv/bin/python -m pip uninstall -y py-cord discord discord.py
+.venv/bin/python -m pip install --no-cache-dir --force-reinstall -r requirements.txt
+.venv/bin/python -m pip check
+.venv/bin/python -c "import discord; from discord import app_commands; from discord.enums import AppCommandOptionType; from discord.ui import LayoutView; import cogs.backup, cogs.protection, cogs.statistics, cogs.recommend, cogs.exploration; print('Import OK:', discord.__version__, discord.__file__)"
+
+# 首次迁移：重建 create 的 PM2 登记，避免沿用旧的系统 Python 解释器。
+# 新部署时没有旧进程，跳过 delete。
+if pm2 describe create >/dev/null 2>&1; then
+    pm2 delete create
+fi
+pm2 start ecosystem.config.js --only create
+pm2 save
+)
+pm2 logs create --lines 30
+```
+
+如果 `python3 -m venv` 提示缺少 `ensurepip`，在 Debian/Ubuntu 安装与 Python 版本对应的
+venv 包（例如 Python 3.10 使用 `apt install python3.10-venv`），然后重新执行。
+导入检查输出的 `discord.__file__` 应位于 `/root/create/.venv/` 内。
+上述检查不会登录 Discord；启动后还需确认新日志中出现 `Logged in as`。
+PM2 会保留历史报错，应根据新日志时间判断是否仍有问题。
+
+后续更新依赖继续使用 `.venv/bin/python -m pip install -r requirements.txt`，
+再执行 `pm2 restart ecosystem.config.js --only create`，不要切回全局 `pip`。
+首次切换前，如果原 PM2 进程配置了 `.env` 之外的环境变量（如 `CHIMIDAN_DB_PATH`），
+请将这些配置保留在项目 `.env` 中。
 
 ### SQLite 数据库与性能配置
 
