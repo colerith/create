@@ -26,6 +26,36 @@ ZIP_SCAN_MAX_FILES = 200
 ZIP_SCAN_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 JSON_WS_PREFIX = "\n\t \t\t  "
 JSON_WS_SUFFIX = " \t\t \n"
+CARD_TRACE_KEY = 'nova_protection'
+
+
+def _card_trace_id(card):
+    if not isinstance(card, dict):
+        return None
+    data = card.get('data')
+    extensions = data.get('extensions') if isinstance(data, dict) else None
+    marker = extensions.get(CARD_TRACE_KEY) if isinstance(extensions, dict) else None
+    if isinstance(marker, dict) and marker.get('version') == 1:
+        tid = marker.get('id')
+        if isinstance(tid, str) and re.fullmatch(r'[a-f0-9]{12}', tid):
+            return tid
+    return None
+
+
+def _add_persistent_card_trace(raw, trace_id):
+    """Only add our namespaced extension to V2/V3 cards; preserve other data."""
+    card = json.loads(raw)
+    if card.get('spec') not in ('chara_card_v2', 'chara_card_v3'):
+        return raw
+    data = card.get('data')
+    if not isinstance(data, dict):
+        return raw
+    extensions = data.get('extensions', {})
+    if not isinstance(extensions, dict):
+        return raw
+    extensions[CARD_TRACE_KEY] = {'version': 1, 'id': trace_id}
+    data['extensions'] = extensions
+    return json.dumps(card, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
 
 ZW_ZERO = '\u200b'
@@ -159,10 +189,7 @@ def _png_card_json(kind, payload):
 
 
 def _inject_png_card_trace(data, trace_id):
-    """Reuse JSON whitespace fingerprints inside chara/ccv3, without dumping JSON.
-
-    JSON parse/serialize operations can remove this fingerprint.
-    """
+    """Add a persistent V2/V3 extension plus the legacy whitespace fingerprint."""
     try:
         chunks = list(_png_chunks(data))
     except ValueError:
@@ -178,6 +205,7 @@ def _inject_png_card_trace(data, trace_id):
         while (len(raw) >= marker_size
                and _extract_trace_from_json_whitespace(raw[-marker_size:])):
             raw = raw[:-marker_size]
+        raw = _add_persistent_card_trace(raw, trace_id)
         payload = key + b'\x00' + base64.b64encode(raw + _encode_trace_to_ws(trace_id))
         crc = binascii.crc32(kind + payload) & 0xffffffff
         parts.append(struct.pack('!I', len(payload)) + kind + payload + struct.pack('!I', crc))
@@ -192,7 +220,7 @@ def _extract_png_card_trace(data):
                  if (card := _png_card_json(kind, payload)) is not None]
         cards.sort(key=lambda card: card[0].lower() != b'ccv3')
         for _, raw in cards:
-            trace_id = _extract_trace_from_json_whitespace(raw)
+            trace_id = _card_trace_id(json.loads(raw)) or _extract_trace_from_json_whitespace(raw)
             if trace_id:
                 return trace_id
     except ValueError:
@@ -318,6 +346,9 @@ def extract_trace_from_bytes(file_bytes, filename):
 
         if ext == '.json':
             try:
+                card_tid = _card_trace_id(json.loads(file_bytes))
+                if card_tid:
+                    return card_tid
                 ws_tid = _extract_trace_from_json_whitespace(file_bytes)
                 if ws_tid:
                     return ws_tid
