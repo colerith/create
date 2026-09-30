@@ -8,6 +8,7 @@ import discord
 import aiosqlite
 import struct
 import binascii
+import base64
 import os
 import uuid
 import random
@@ -118,6 +119,87 @@ def _inject_png_text_chunk(data, key, text):
     if iend_pos == -1: return data + chunk
     return data[:iend_pos] + chunk + data[iend_pos:]
 
+def _png_chunks(data):
+    """Validate PNG structure and CRCs before rewriting card metadata."""
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('Not a PNG')
+    offset = 8
+    while offset + 12 <= len(data):
+        length = struct.unpack_from('!I', data, offset)[0]
+        end = offset + length + 12
+        if end > len(data):
+            raise ValueError('Truncated PNG chunk')
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:end - 4]
+        crc = struct.unpack_from('!I', data, end - 4)[0]
+        if binascii.crc32(kind + payload) & 0xffffffff != crc:
+            raise ValueError('Invalid PNG CRC')
+        yield offset, end, kind, payload
+        offset = end
+        if kind == b'IEND':
+            if length:
+                raise ValueError('Invalid IEND')
+            return
+    raise ValueError('Missing IEND')
+
+
+def _png_card_json(kind, payload):
+    if kind != b'tEXt' or b'\x00' not in payload:
+        return None
+    key, encoded = payload.split(b'\x00', 1)
+    if key.lower() not in (b'chara', b'ccv3'):
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if not isinstance(json.loads(raw.decode('utf-8')), dict):
+            return None
+        return key, raw
+    except (ValueError, UnicodeError):
+        return None
+
+
+def _inject_png_card_trace(data, trace_id):
+    """Reuse JSON whitespace fingerprints inside chara/ccv3, without dumping JSON.
+
+    JSON parse/serialize operations can remove this fingerprint.
+    """
+    try:
+        chunks = list(_png_chunks(data))
+    except ValueError:
+        return data
+    parts = [data[:8]]
+    for start, end, kind, payload in chunks:
+        card = _png_card_json(kind, payload)
+        if card is None:
+            parts.append(data[start:end])
+            continue
+        key, raw = card
+        marker_size = len(_encode_trace_to_ws(trace_id))
+        while (len(raw) >= marker_size
+               and _extract_trace_from_json_whitespace(raw[-marker_size:])):
+            raw = raw[:-marker_size]
+        payload = key + b'\x00' + base64.b64encode(raw + _encode_trace_to_ws(trace_id))
+        crc = binascii.crc32(kind + payload) & 0xffffffff
+        parts.append(struct.pack('!I', len(payload)) + kind + payload + struct.pack('!I', crc))
+    parts.append(data[chunks[-1][1]:])
+    return b''.join(parts)
+
+
+def _extract_png_card_trace(data):
+    try:
+        chunks = list(_png_chunks(data))
+        cards = [card for _, _, kind, payload in chunks
+                 if (card := _png_card_json(kind, payload)) is not None]
+        cards.sort(key=lambda card: card[0].lower() != b'ccv3')
+        for _, raw in cards:
+            trace_id = _extract_trace_from_json_whitespace(raw)
+            if trace_id:
+                return trace_id
+    except ValueError:
+        pass
+    return None
+
+
 def _inject_zip_trace(file_bytes, trace_id):
     try:
         src = io.BytesIO(file_bytes)
@@ -206,6 +288,7 @@ def inject_smart_trace(file_bytes, filename, trace_id):
             return _inject_zip_trace(file_bytes, trace_id)
         if ext == '.png':
             print(f"Injecting PNG Trace: {trace_id}")
+            file_bytes = _inject_png_card_trace(file_bytes, trace_id)
             return _inject_png_text_chunk(file_bytes, "Software", f"ProtectionBot | ID:{trace_id}")
 
         elif ext == '.json':
@@ -224,6 +307,10 @@ def extract_trace_from_bytes(file_bytes, filename):
     try:
         ext = os.path.splitext(filename)[1].lower()
         trace_id = None
+        if ext == '.png':
+            trace_id = _extract_png_card_trace(file_bytes)
+            if trace_id:
+                return trace_id
         if ext == '.zip':
             zip_tid = _extract_trace_from_zip_bytes(file_bytes)
             if zip_tid:
